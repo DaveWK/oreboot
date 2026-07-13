@@ -1,0 +1,13 @@
+[package]
+name = "arm-ppu"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "GPL-2.0-only"
+description = "Arm Power Policy Unit (DEN0051) power-on and status, as in a PCK-600, over regio"
+
+[dependencies]
+regio = { path = "../regio" }
+
+[dev-dependencies]
+regio = { path = "../regio", features = ["mock"] }

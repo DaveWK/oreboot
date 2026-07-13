@@ -1,0 +1,22 @@
+[package]
+name = "ci-udc"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "GPL-2.0-only"
+description = "Polled USB 2.0 device on a ChipIdea dQH/dTD controller, SoC bring-up behind a platform trait (no_std)"
+
+[features]
+# fastboot::Transport for Udc.
+fastboot = ["dep:fastboot"]
+
+[dependencies]
+regio = { path = "../regio" }
+usb-device = { path = "../usb-device" }
+fastboot = { path = "../fastboot", optional = true }
+
+[dev-dependencies]
+regio = { path = "../regio", features = ["mock"] }
+
+[profile.test]
+opt-level = 3

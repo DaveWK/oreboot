@@ -1,0 +1,20 @@
+[package]
+name = "dram-ctrl"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "GPL-2.0-only"
+description = "Controller-neutral DRAM controller init scaffolding: JEDEC timings in controller cycles, register-field packing tables, a bounded init-step runner, rank/address-map layout"
+
+[dependencies]
+regio = { path = "../regio" }
+jedec-lpddr = { path = "../jedec-lpddr" }
+dwc-ddrctl = { path = "../dwc-ddrctl" }
+
+[dev-dependencies]
+regio = { path = "../regio", features = ["mock"] }
+regtrace = { path = "../regtrace" }
+
+[lints.rust]
+# Kani proofs (P3-A7) are under cfg(kani).
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }

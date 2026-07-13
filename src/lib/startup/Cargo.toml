@@ -1,0 +1,9 @@
+[package]
+name = "startup"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "GPL-2.0-only"
+description = "First-stage start-up: BSS/data initialisation, const build-environment parsing, RISC-V ids and counters"
+
+[dependencies]

@@ -1,0 +1,20 @@
+[package]
+name = "regio"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "GPL-2.0-only"
+description = "One register-access trait (MMIO, delay, clock, log, watchdog), bounded polling and a host register model"
+
+[features]
+# mock::Mock, a small register model for host tests of board code.
+mock = []
+
+[dependencies]
+
+[dev-dependencies]
+regio = { path = ".", features = ["mock"] }
+
+[lints.rust]
+# Kani proofs (P3-A7) are under cfg(kani).
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }

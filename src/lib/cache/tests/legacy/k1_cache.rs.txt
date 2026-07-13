@@ -1,0 +1,38 @@
+// Verbatim copy of ore-edk-boot-opi 78479e21ba
+// oreboot/src/mainboard/spacemit/k1x/bt0/src/cache.rs (RISC-V asm; not compiled on
+// the host). The equivalence test runs its block walk, written out below.
+
+//! Data cache maintenance for DMA on the SpacemiT K1.
+//!
+//! K1 peripherals are not cache coherent. The X60 cores implement Zicbom;
+//! these helpers clean or invalidate every 64-byte block of a range so that a
+//! DMA master (the USB controller) and the CPU see the same bytes.
+
+use core::arch::asm;
+
+const BLOCK: usize = 64;
+
+/// Write back and invalidate: call before a device reads the range, or
+/// before it writes the range (so no dirty line is evicted over its data).
+pub fn flush(addr: usize, len: usize) {
+    let mut a = addr & !(BLOCK - 1);
+    while a < addr + len {
+        // cbo.flush 0(a)
+        unsafe { asm!(".insn i 0x0f, 2, x0, {0}, 2", in(reg) a) };
+        a += BLOCK;
+    }
+    unsafe { asm!("fence rw, rw") };
+}
+
+/// Discard cached copies: call after a device wrote the range, before the
+/// CPU reads it.
+pub fn invalidate(addr: usize, len: usize) {
+    unsafe { asm!("fence rw, rw") };
+    let mut a = addr & !(BLOCK - 1);
+    while a < addr + len {
+        // cbo.inval 0(a)
+        unsafe { asm!(".insn i 0x0f, 2, x0, {0}, 0", in(reg) a) };
+        a += BLOCK;
+    }
+    unsafe { asm!("fence rw, rw") };
+}

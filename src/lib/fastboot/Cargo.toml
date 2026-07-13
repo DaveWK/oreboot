@@ -1,0 +1,10 @@
+[package]
+name = "fastboot"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "GPL-2.0-only"
+description = "fastboot protocol over an abstract USB transport and flash target (no_std), with sparse images"
+
+[dependencies]
+sparse = { path = "../sparse" }

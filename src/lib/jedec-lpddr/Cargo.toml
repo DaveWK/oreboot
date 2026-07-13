@@ -1,0 +1,9 @@
+[package]
+name = "jedec-lpddr"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "GPL-2.0-only"
+description = "JEDEC LPDDR4/4X and LPDDR5 mode-register, Vref, timing and geometry helpers; no hardware access"
+
+[dependencies]

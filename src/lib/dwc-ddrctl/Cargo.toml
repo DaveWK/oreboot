@@ -1,0 +1,14 @@
+[package]
+name = "dwc-ddrctl"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "GPL-2.0-only"
+description = "Synopsys DesignWare DDR controller (DDRCTL/uMCTL2) helpers: register map, quasi-dynamic writes, ADDRMAP, DRAMSET timing packing, DFI init handshake, post-training timing fold, mode-register access"
+
+[dependencies]
+regio = { path = "../regio" }
+dram-train = { path = "../dram-train" }
+
+[dev-dependencies]
+regio = { path = "../regio", features = ["mock"] }

@@ -1,0 +1,9 @@
+[package]
+name = "bakery"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "GPL-2.0-only"
+description = "Bounded Lamport bakery lock over an abstract slot access (no_std), for MMU-off EL3 / M-mode code"
+
+[dependencies]

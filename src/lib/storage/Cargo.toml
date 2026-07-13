@@ -1,0 +1,9 @@
+[package]
+name = "storage"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "GPL-2.0-only"
+description = "Bounded primary-GPT lookup and SD CSD capacity decoding (no_std)"
+
+[dependencies]

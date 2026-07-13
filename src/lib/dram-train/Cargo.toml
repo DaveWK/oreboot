@@ -1,0 +1,23 @@
+[package]
+name = "dram-train"
+version = "0.2.0"
+edition = "2021"
+publish = false
+license = "GPL-2.0-only"
+description = "Generic DRAM training algorithms (windows, eyes, edges, bounded launches, search sessions) behind one register-access trait"
+
+[dependencies]
+jedec-lpddr = { path = "../jedec-lpddr" }
+regio = { path = "../regio" }
+
+[features]
+# io::mock::Mock, a small register model for host tests of board code.
+mock = ["regio/mock"]
+
+[dev-dependencies]
+# The integration tests use io::mock.
+dram-train = { path = ".", features = ["mock"] }
+
+[lints.rust]
+# Kani proofs (P3-A7) are under cfg(kani).
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }

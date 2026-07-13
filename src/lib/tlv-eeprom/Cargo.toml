@@ -1,0 +1,10 @@
+[package]
+name = "tlv-eeprom"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "GPL-2.0-only"
+description = "ONIE TlvInfo EEPROM records: bounded validation (header, length, CRC-32), TLV walk, writer"
+
+[dependencies]
+storage = { path = "../storage" }

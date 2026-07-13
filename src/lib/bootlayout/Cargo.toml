@@ -1,0 +1,10 @@
+[package]
+name = "bootlayout"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "GPL-2.0-only"
+description = "CRC'd boot-stage layout table on a raw boot medium: decode, validate against a board contract, ordered load (no_std)"
+
+[dependencies]
+storage = { path = "../storage" }

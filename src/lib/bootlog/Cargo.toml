@@ -1,0 +1,9 @@
+[package]
+name = "bootlog"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "GPL-2.0-only"
+description = "RAM boot log ring (writer and reader) and boot-progress/recovery markers (no_std)"
+
+[dependencies]

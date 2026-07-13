@@ -1,0 +1,9 @@
+[package]
+name = "usb-device"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "GPL-2.0-only"
+description = "USB 2.0 device chapter 9: setup requests and the descriptors of a one-interface bulk function (no_std)"
+
+[dependencies]

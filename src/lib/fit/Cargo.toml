@@ -1,0 +1,11 @@
+[package]
+name = "fit"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "GPL-2.0-only"
+description = "Checked external-data FIT planning, verification and DT memory fixup, with the board layout as a parameter (no_std)"
+
+[dependencies]
+fdt-checked = { path = "../fdt-checked" }
+sha256 = { path = "../sha256" }

@@ -1,0 +1,13 @@
+[package]
+name = "uart-16550"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "GPL-2.0-only"
+description = "16550/DesignWare 8250 UART over regio: register stride, clock, baud and divisor rounding as parameters"
+
+[dependencies]
+regio = { path = "../regio" }
+
+[dev-dependencies]
+regio = { path = "../regio", features = ["mock"] }

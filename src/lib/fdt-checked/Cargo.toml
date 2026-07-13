@@ -1,0 +1,9 @@
+[package]
+name = "fdt-checked"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "GPL-2.0-only"
+description = "Bounded flattened device tree reader: every offset, string and token checked (no_std)"
+
+[dependencies]

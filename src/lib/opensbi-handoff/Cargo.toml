@@ -1,0 +1,9 @@
+[package]
+name = "opensbi-handoff"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "GPL-2.0-only"
+description = "OpenSBI fw_dynamic hand-off: the info structure, the jump and a physical copy that may target address zero (no_std)"
+
+[dependencies]

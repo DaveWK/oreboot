@@ -1,0 +1,9 @@
+[package]
+name = "cache"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "GPL-2.0-only"
+description = "Data-cache maintenance for DMA on non-coherent SoCs: RISC-V Zicbom flush/invalidate by cache block"
+
+[dependencies]

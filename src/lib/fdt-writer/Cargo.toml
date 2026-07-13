@@ -1,0 +1,12 @@
+[package]
+name = "fdt-writer"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "GPL-2.0-only"
+description = "Minimal flattened device tree (FDT v17) writer with fixed-capacity blocks, no allocation"
+
+[dependencies]
+
+[dev-dependencies]
+fdt-checked = { path = "../fdt-checked" }

@@ -1,0 +1,17 @@
+[package]
+name = "sdhci"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "GPL-2.0-only"
+description = "Polled SD/eMMC driver for an SDHCI v3 host, with the SoC behind a platform trait (no_std)"
+
+[dependencies]
+regio = { path = "../regio" }
+storage = { path = "../storage" }
+
+[dev-dependencies]
+regio = { path = "../regio", features = ["mock"] }
+
+[profile.test]
+opt-level = 3
