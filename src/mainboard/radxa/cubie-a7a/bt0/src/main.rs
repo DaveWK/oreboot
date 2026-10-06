@@ -196,7 +196,10 @@ fn init_pmic() -> Option<axp::Axp<'static>> {
     };
     let pmic = axp::Axp::new(twi);
     match pmic.init() {
-        Ok(()) => Some(pmic),
+        Ok(()) => {
+            pmic.enable_board_ldos();
+            Some(pmic)
+        }
         Err(e) => {
             println!("[bt0] PMIC init failed: {e:?}; continuing without it");
             None

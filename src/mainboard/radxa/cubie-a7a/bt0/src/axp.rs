@@ -1,5 +1,6 @@
 //! X-Powers AXP8191 PMIC (as used with the A733), runtime address 0x36.
-//! Register map and voltage step tables follow SyterKit's axp8191.c.
+//! Register map and voltage step tables follow SyterKit's axp8191.c; the
+//! LDO enable bits agree with mainline's AXP318W regulator description.
 
 use crate::twi::{Error, Twi};
 
@@ -13,6 +14,8 @@ const DCDC_ON_OFF_CTL1: u8 = 0x10;
 const DCDC_ON_OFF_CTL2: u8 = 0x11;
 const DC2OUT_VOL: u8 = 0x13;
 const DC9OUT_VOL: u8 = 0x1a;
+const LDO_ON_OFF_CTL1: u8 = 0x20;
+const LDO_ON_OFF_CTL2: u8 = 0x21;
 
 /// (min mV, max mV, step mV)
 type Range = (u32, u32, u32);
@@ -26,7 +29,7 @@ struct Rail {
     ranges: &'static [Range],
 }
 
-const fn dcdc(
+const fn rail(
     name: &'static str,
     vol_reg: u8,
     vol_mask: u8,
@@ -44,15 +47,17 @@ const fn dcdc(
     }
 }
 
+const LDO: &[Range] = &[(500, 3400, 100)];
+
 const LOW: Range = (500, 1200, 10);
 const MID: Range = (1220, 1540, 20);
 
 static RAILS: &[Rail] = &[
-    dcdc("dcdc1", 0x12, 0x1f, DCDC_ON_OFF_CTL1, 0, &[(1000, 3800, 100)]),
-    dcdc("dcdc2", 0x13, 0x7f, DCDC_ON_OFF_CTL1, 1, &[LOW, MID]),
-    dcdc("dcdc3", 0x14, 0x7f, DCDC_ON_OFF_CTL1, 2, &[LOW, MID]),
-    dcdc("dcdc4", 0x15, 0x7f, DCDC_ON_OFF_CTL1, 3, &[LOW, MID]),
-    dcdc(
+    rail("dcdc1", 0x12, 0x1f, DCDC_ON_OFF_CTL1, 0, &[(1000, 3800, 100)]),
+    rail("dcdc2", 0x13, 0x7f, DCDC_ON_OFF_CTL1, 1, &[LOW, MID]),
+    rail("dcdc3", 0x14, 0x7f, DCDC_ON_OFF_CTL1, 2, &[LOW, MID]),
+    rail("dcdc4", 0x15, 0x7f, DCDC_ON_OFF_CTL1, 3, &[LOW, MID]),
+    rail(
         "dcdc5",
         0x16,
         0x7f,
@@ -60,7 +65,7 @@ static RAILS: &[Rail] = &[
         4,
         &[LOW, MID, (1800, 2400, 20), (2440, 2760, 100)],
     ),
-    dcdc(
+    rail(
         "dcdc6",
         0x17,
         0x7f,
@@ -68,9 +73,22 @@ static RAILS: &[Rail] = &[
         5,
         &[LOW, MID, (1800, 2400, 20), (2440, 2760, 40)],
     ),
-    dcdc("dcdc7", 0x18, 0x7f, DCDC_ON_OFF_CTL1, 6, &[LOW, (1220, 1840, 20)]),
-    dcdc("dcdc8", 0x19, 0x7f, DCDC_ON_OFF_CTL1, 7, &[LOW, MID, (1900, 3400, 100)]),
-    dcdc("dcdc9", 0x1a, 0x7f, DCDC_ON_OFF_CTL2, 0, &[LOW, MID, (1900, 3400, 100)]),
+    rail("dcdc7", 0x18, 0x7f, DCDC_ON_OFF_CTL1, 6, &[LOW, (1220, 1840, 20)]),
+    rail("dcdc8", 0x19, 0x7f, DCDC_ON_OFF_CTL1, 7, &[LOW, MID, (1900, 3400, 100)]),
+    rail("dcdc9", 0x1a, 0x7f, DCDC_ON_OFF_CTL2, 0, &[LOW, MID, (1900, 3400, 100)]),
+    rail("bldo1", 0x2a, 0x1f, LDO_ON_OFF_CTL1, 6, LDO),
+    rail("cldo2", 0x30, 0x1f, LDO_ON_OFF_CTL2, 4, LDO),
+    rail("cldo5", 0x33, 0x1f, LDO_ON_OFF_CTL2, 7, LDO),
+];
+
+/// LDOs the vendor configuration expects on for EDK2's devices. Radxa's
+/// device trees and U-Boot `[power_sply]` set no voltage for them (the
+/// rails run at the PMIC's factory setting), so these are only switched on,
+/// and only when the programmed voltage is the one the consumers need.
+const BOARD_LDOS: [(&str, u32, &str); 3] = [
+    ("bldo1", 1800, "PCIe 1.8 V, PE bank I/O"),
+    ("cldo2", 1800, "HDMI 1.8 V"),
+    ("cldo5", 1800, "SERDES 1.8 V, SD 1.8 V signalling"),
 ];
 
 /// Selector value for `mv` in a piecewise-linear step table. Values in a
@@ -91,6 +109,20 @@ fn selector(ranges: &[Range], mv: u32) -> u32 {
         }
     }
     base - 1
+}
+
+/// Inverse of `selector`: millivolts for selector value `sel`.
+fn millivolts(ranges: &[Range], sel: u32) -> u32 {
+    let mut base = 0;
+    for &(min, max, step) in ranges {
+        let n = (max - min) / step + 1;
+        if sel < base + n {
+            return min + (sel - base) * step;
+        }
+        base += n;
+    }
+    let &(_, max, _) = ranges.last().unwrap();
+    max
 }
 
 pub struct Axp<'a> {
@@ -117,6 +149,44 @@ impl<'a> Axp<'a> {
             self.twi.write_reg(ADDR, reg, v | 0x80)?;
         }
         Ok(())
+    }
+
+    /// Switch on the LDOs in `BOARD_LDOS` without changing their voltage.
+    /// A rail whose programmed voltage differs from the expected one is
+    /// reported and left alone rather than driven into its consumers.
+    pub fn enable_board_ldos(&self) {
+        for (name, want_mv, what) in BOARD_LDOS {
+            let rail = RAILS.iter().find(|r| r.name == name).unwrap();
+            let regs = (
+                self.twi.read_reg(ADDR, rail.vol_reg),
+                self.twi.read_reg(ADDR, rail.en_reg),
+            );
+            let (Ok(vol), Ok(en)) = regs else {
+                println!("[bt0] PMIC: {name}: register read failed");
+                continue;
+            };
+            let mv = millivolts(rail.ranges, (vol & rail.vol_mask) as u32);
+            let on = en & (1 << rail.en_bit) != 0;
+            if mv != want_mv {
+                println!(
+                    "[bt0] PMIC: {name} ({what}) is set to {mv} mV, expected {want_mv} mV; left {}",
+                    if on { "on" } else { "off" }
+                );
+                continue;
+            }
+            if on {
+                println!("[bt0] PMIC: {name} ({what}) on at {mv} mV");
+                continue;
+            }
+            match self.twi.write_reg(ADDR, rail.en_reg, en | 1 << rail.en_bit) {
+                Ok(()) => {
+                    println!("[bt0] PMIC: {name} ({what}) switched on at {mv} mV");
+                }
+                Err(e) => {
+                    println!("[bt0] PMIC: {name}: enable failed: {e:?}");
+                }
+            }
+        }
     }
 
     /// Set rail `name` to `mv` (0 = leave voltage) and switch it on/off
