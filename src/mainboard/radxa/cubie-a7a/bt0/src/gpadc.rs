@@ -16,8 +16,10 @@ const GPADC_BASE: usize = 0x0252_1000;
 const GP_SR_CON: usize = GPADC_BASE + 0x00;
 const GP_CTRL: usize = GPADC_BASE + 0x04;
 const GP_CS_EN: usize = GPADC_BASE + 0x08;
-const GP_DATAL_INTC: usize = GPADC_BASE + 0x28;
-const GP_DATAL_INTS: usize = GPADC_BASE + 0x38;
+/// Data-ready interrupt enable/status (GP_DATA_INTC/INTS; 0x20/0x30 are
+/// the low-threshold compare registers).
+const GP_DATA_INTC: usize = GPADC_BASE + 0x28;
+const GP_DATA_INTS: usize = GPADC_BASE + 0x38;
 const GP_CH_DATA: usize = GPADC_BASE + 0x80;
 
 const GPADC0_24M_CLK: usize = CCU_BASE + 0xfc0;
@@ -35,19 +37,19 @@ pub fn read_mv(channel: u32) -> Option<u32> {
 
     // acquire time and sample-rate divider as in the vendor sequence
     clr_set_bits(GP_SR_CON, 0xffff_ffff, (0x1df << 16) | 0x164);
-    // continuous mode (2) with auto calibration, then enable
+    // GP_MODE 0b10 = continuous conversion, auto calibration, then ADC_EN
     clr_set_bits(GP_CTRL, 0x3 << 18, (0x2 << 18) | (1 << 23));
     set_bits(GP_CTRL, 1 << 16);
     set_bits(GP_CS_EN, 1 << channel);
     udelay(50);
-    set_bits(GP_DATAL_INTC, 1 << channel);
+    set_bits(GP_DATA_INTC, 1 << channel);
 
     const SAMPLES: u32 = 8;
     let mut sum = 0;
     for _ in 0..SAMPLES {
-        write32(GP_DATAL_INTS, 1 << channel);
+        write32(GP_DATA_INTS, 1 << channel);
         let t0 = time_us();
-        while read32(GP_DATAL_INTS) & (1 << channel) == 0 {
+        while read32(GP_DATA_INTS) & (1 << channel) == 0 {
             if time_us() - t0 > 10_000 {
                 return None;
             }

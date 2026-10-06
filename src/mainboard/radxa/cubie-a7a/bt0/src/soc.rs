@@ -21,12 +21,14 @@ pub const CPU_SUBSYS_CTRL_BASE: usize = 0x0800_0000;
 pub const CPU_PLL_CFG_BASE: usize = 0x0887_0000;
 
 /// Reset vector base address for CPU n after a (warm) reset, low/high word:
-/// CPUCFG + 0x4/0x8 + (n + 1) * 0x1000. U-Boot's A733 support uses
-/// SUNXI_RVBAR_ADDRESS = 0x0800_1004 for CPU0 and dlan17's A733 TF-A the
-/// same per-core layout. (SyterKit's old sun60iw2 header said 0x0800_0040,
-/// copied from the A523; that is not used.)
+/// CPUCFG + 0x4/0x8 + (n + 1) * 0x1000 (A733 user manual 5.1.6:
+/// CLU0_RVBARADDRn_L/H; same in U-Boot's SUNXI_RVBAR_ADDRESS and dlan17's
+/// TF-A). SyterKit's old sun60iw2 header said 0x0800_0040, copied from the
+/// A523; that is not used.
 pub const RVBAR_LO_CPU0: usize = CPU_SUBSYS_CTRL_BASE + 0x1004;
 pub const RVBAR_HI_CPU0: usize = CPU_SUBSYS_CTRL_BASE + 0x1008;
+/// CLU0_CPU0_CTRL_REG: bit 0 AA64nAA32, sampled at CPU0 reset.
+pub const CPU0_CTRL: usize = CPU_SUBSYS_CTRL_BASE + 0x1000;
 
 const SOC_VER_REG: usize = SYSCTRL_BASE + 0x24;
 const PLL_LDO_REG: usize = CPU_SUBSYS_CTRL_BASE + 0x144;
@@ -87,20 +89,26 @@ pub fn soc_version() -> u32 {
     read32(SOC_VER_REG) & 0x7
 }
 
-/// Raw DCXO frequency field, XO_CTRL0_REG[15:14] (24 / 19.2 / 26 MHz).
+/// Raw DCXO status field, XO_CTRL0_REG[15:14].
 pub fn xo_freq_field() -> u32 {
     (read32(RTC_BASE + 0x160) >> 14) & 0x3
 }
 
-/// The A733 runs from either a 24 MHz or a 26 MHz crystal (26 MHz on the
-/// Cubie A7A). Only the CPU PLLs are computed from it; peripherals use the
-/// fixed 24 MHz REFPLL. Decoded like SyterKit (bit 15).
-pub fn hosc_mhz() -> u32 {
-    if read32(RTC_BASE + 0x160) & (1 << 15) != 0 {
-        26
-    } else {
-        24
+/// DCXO frequency in kHz from XO_CTRL0_REG[15:14] (A733 user manual
+/// 9.1.7.16: 00 = 24M, 01 = 19.2M, 10 = 26M, 11 = 24M). The Cubie A7A has a
+/// 26 MHz crystal. Only the CPU PLLs are computed from it; peripherals use
+/// the fixed 24 MHz REFPLL. (SyterKit tested bit 15 alone, which reads the
+/// 0b11 = 24 MHz encoding as 26 MHz.)
+pub fn hosc_khz() -> u32 {
+    match xo_freq_field() {
+        0b01 => 19_200,
+        0b10 => 26_000,
+        _ => 24_000,
     }
+}
+
+pub fn hosc_mhz() -> u32 {
+    hosc_khz() / 1000
 }
 
 /// Port of SyterKit's `board_common_init()` for the Cubie A7A.

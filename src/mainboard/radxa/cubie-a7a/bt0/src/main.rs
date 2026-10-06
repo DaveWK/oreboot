@@ -265,6 +265,9 @@ fn load_entry(sd: &smhc::Smhc, e: &layout::Entry, dram_end: usize) {
 fn rmr_switch(entry: u32) -> ! {
     write32(soc::RVBAR_LO_CPU0, entry);
     write32(soc::RVBAR_HI_CPU0, 0);
+    // Also select AArch64 in CPU0's reset configuration, as TF-A does for
+    // each core it powers on; RMR.AA64 below requests the same.
+    write32(soc::CPU0_CTRL, 1);
     unsafe {
         asm!(
             "dsb sy",
@@ -296,8 +299,9 @@ extern "C" fn main() -> ! {
     println!("oreboot 🦀 bt0 | Radxa Cubie A7A | Allwinner A733");
     let sid = soc::chip_sid();
     println!(
-        "[bt0] SoC rev {}, DCXO {hosc} MHz (XO_CTRL0[15:14] = {}), SID {:08x}{:08x}{:08x}{:08x}",
+        "[bt0] SoC rev {}, DCXO {} kHz (XO_CTRL0[15:14] = {}), SID {:08x}{:08x}{:08x}{:08x}",
         (b'A' + version as u8) as char,
+        soc::hosc_khz(),
         soc::xo_freq_field(),
         sid[0],
         sid[1],

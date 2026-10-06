@@ -4,7 +4,7 @@
 use util::mmio::read32;
 
 use crate::soc::{
-    clr_bits, clr_set_bits, hosc_mhz, set_bits, udelay, CCU_BASE, CPU_PLL_CFG_BASE, R_PRCM_BASE,
+    clr_bits, clr_set_bits, hosc_khz, set_bits, udelay, CCU_BASE, CPU_PLL_CFG_BASE, R_PRCM_BASE,
 };
 
 // PLL control registers whose reference select (bit 24) is switched over.
@@ -88,9 +88,10 @@ fn set_pll(addr: usize, m0: u32, n: u32, m1: u32, p: u32) {
 
 /// CPU_L (A55), CPU_B (A76) and DSU PLLs to ~1 GHz / ~750 MHz, then switch
 /// the clusters over to them.
-fn set_pll_cpux(hosc: u32) {
-    let n = |mhz: u32| mhz.div_ceil(hosc);
-    let (cpu, dsu) = if hosc == 24 { (1008, 744) } else { (1014, 780) };
+fn set_pll_cpux(hosc_khz: u32) {
+    let n = |mhz: u32| (mhz * 1000).div_ceil(hosc_khz);
+    // SyterKit's targets: multiples of 24 MHz, or of 26 MHz otherwise.
+    let (cpu, dsu) = if hosc_khz == 26_000 { (1014, 780) } else { (1008, 744) };
     for (off, mhz) in [(0x1000, cpu), (0x2000, cpu), (0x3000, dsu)] {
         let addr = CPU_PLL_CFG_BASE + off;
         enable_pll(addr, 0, n(480), 0, 0);
@@ -111,7 +112,7 @@ pub fn init() {
     for r in PLL_REGS {
         set_bits(CCU_BASE + r, PLL_FREF_SEL);
     }
-    set_pll_cpux(hosc_mhz());
+    set_pll_cpux(hosc_khz());
     // APB1 from the 24 MHz oscillator, M = 1.
     clr_set_bits(APB1_CLK_REG, (0x3 << 24) | 0x1f, 0);
     // NSI (bus interconnect): divider 6 first, then source PERI0 600M.

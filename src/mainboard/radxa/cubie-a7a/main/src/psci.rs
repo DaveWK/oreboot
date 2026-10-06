@@ -129,8 +129,20 @@ fn affinity_info(target: u64, lowest_level: u64) -> i64 {
     }
 }
 
+/// CPU_SUSPEND: every requested state is entered as standby (WFI in EL3,
+/// woken by any pending interrupt) and the call returns. The vendor device
+/// trees request power-down states (power_state 0x0010000 / 0x1010000);
+/// returning from those is allowed when the core keeps its context, and
+/// Linux then counts the idle entry as failed without side effects.
+fn cpu_suspend(_power_state: u64) -> i64 {
+    unsafe { core::arch::asm!("dsb sy", "wfi") };
+    SUCCESS
+}
+
 fn features(fid: u32) -> i64 {
     match fid & !SMC64 {
+        // bit 1 clear: original power_state format
+        CPU_SUSPEND => 0,
         PSCI_VERSION | CPU_OFF | CPU_ON | AFFINITY_INFO | MIGRATE_INFO_TYPE | SYSTEM_OFF
         | SYSTEM_RESET | PSCI_FEATURES => SUCCESS,
         SMCCC_VERSION => SUCCESS,
@@ -153,7 +165,7 @@ pub fn handle_smc(ctx: &mut Context) {
         SMCCC_VERSION => 0x1_0001,
         SMCCC_ARCH_FEATURES => NOT_SUPPORTED,
         PSCI_VERSION => 0x1_0000,
-        CPU_SUSPEND => NOT_SUPPORTED,
+        CPU_SUSPEND => cpu_suspend(arg(1)),
         CPU_OFF => crate::cpu_off(),
         CPU_ON => cpu_on(arg(1), arg(2), arg(3)),
         AFFINITY_INFO => affinity_info(arg(1), arg(2)),

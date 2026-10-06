@@ -52,11 +52,14 @@ const fn lpddr5(
 }
 
 /// The Cubie A7A DRAM sets from Radxa's `configs/cubie_a7a/sys_config.fex`
-/// (radxa/allwinner-device 6d911d15, sha256 d0764c8b...). Vendor boot0
+/// (radxa/allwinner-device 6d911d15, sha256 d0764c8b..., the revision
+/// radxa-pkg/u-boot-aw2501 builds boot0 from). The 4 GB sets are unchanged
+/// at the newest device-a733-v1.4.6 tip (79d54f4), which retunes 8/12 GB to
+/// 2040 MHz together with boot0 v0.6034; those are not taken here. Vendor boot0
 /// picks one at run time (`select_mode = 3`: PH16/PH17 + GPADC channel 1).
 /// SyterKit's single A7A set is not used: it mixes the CXMT and SK hynix
 /// values and its tpr2 (0x0170b070) is the vendor value shifted by 4 bits.
-pub static PARAM_SETS: [ParamSet; 5] = [
+pub static PARAM_SETS: [ParamSet; 6] = [
     // [dram_para]  "cxmt 4g ddr"
     lpddr5("CXMT 4GB", 2400, 0xa0fa, 0x1001, 0x13, 0x2e, 0x06, 0x170b_0703, 0x325f_0000, 0x65),
     // [dram_para1] "cxmt 6g ddr"
@@ -67,9 +70,14 @@ pub static PARAM_SETS: [ParamSet; 5] = [
     lpddr5("CXMT 12GB", 1800, 0xa11a, 0x1001, 0x12, 0x34, 0x86, 0x1108_0503, 0xb25f_0000, 0x1_0065),
     // [dram_para7] "skhnix 4g ddr"
     lpddr5("SK hynix 4GB", 2400, 0xa10a, 0x0001, 0x12, 0x34, 0x06, 0x170b_0703, 0x325f_0000, 0x65),
+    // Last resort for 4 GB boards: [dram_para] of device-a733-v1.4.8
+    // (Nov 2025 release, "stock DRAM 1800 MHz" per linux-sunxi). Not
+    // selected by the strap; only tried if both 2400 MHz sets fail.
+    lpddr5("4GB @1800 (v1.4.8)", 1800, 0xa10a, 0x1001, 0x12, 0x34, 0x86, 0x1108_0503, 0x325f_0000, 0x1_0065),
 ];
 const CXMT_4G: usize = 0;
 const HYNIX_4G: usize = 4;
+const SAFE_4G: usize = 5;
 
 /// DDR-PARA-SEL-ADC strap voltages from the A7A V1.10 schematic (sheet 6)
 /// and the set each one selects. The SK hynix 4 GB board leaves the
@@ -115,18 +123,19 @@ static mut DRAM_PARA: [u32; 32] = [0; 32];
 
 static mut PMIC: Option<Axp<'static>> = None;
 
-/// Run the vendor DRAM init with `set`, retrying with the other 4 GB set
-/// if training fails. Returns the DRAM size in MiB (0 on failure).
+/// Run the vendor DRAM init with `set`. For the 4 GB sets, retry with the
+/// other vendor's set and then the conservative 1800 MHz set if training
+/// fails. Returns the DRAM size in MiB (0 on failure).
 pub fn init(pmic: Option<Axp<'static>>, set: &'static ParamSet) -> u32 {
     unsafe { *core::ptr::addr_of_mut!(PMIC) = pmic };
-    let fallback = if core::ptr::eq(set, &PARAM_SETS[CXMT_4G]) {
-        Some(&PARAM_SETS[HYNIX_4G])
+    let fallback: &[&'static ParamSet] = if core::ptr::eq(set, &PARAM_SETS[CXMT_4G]) {
+        &[&PARAM_SETS[HYNIX_4G], &PARAM_SETS[SAFE_4G]]
     } else if core::ptr::eq(set, &PARAM_SETS[HYNIX_4G]) {
-        Some(&PARAM_SETS[CXMT_4G])
+        &[&PARAM_SETS[CXMT_4G], &PARAM_SETS[SAFE_4G]]
     } else {
-        None
+        &[]
     };
-    for s in core::iter::once(set).chain(fallback) {
+    for s in core::iter::once(set).chain(fallback.iter().copied()) {
         println!("[bt0] DRAM: init with {} parameters ({} MHz)", s.name, s.para[0]);
         let size = unsafe {
             let para = core::ptr::addr_of_mut!(DRAM_PARA);
