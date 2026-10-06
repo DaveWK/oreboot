@@ -351,6 +351,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "cubie-a7a-common"
+version = "0.1.0"
+dependencies = [
+ "embedded-hal-nb",
+ "log 0.1.0",
+ "nb 1.1.0",
+ "util",
+]
+
+[[package]]
 name = "d1-pac"
 version = "0.0.31"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -798,6 +808,24 @@ version = "0.1.0"
 dependencies = [
  "oreboot-arch",
  "raw-cpuid",
+]
+
+[[package]]
+name = "oreboot-cubie-a7a-bt0"
+version = "0.1.0"
+dependencies = [
+ "cubie-a7a-common",
+ "log 0.1.0",
+ "util",
+]
+
+[[package]]
+name = "oreboot-cubie-a7a-main"
+version = "0.1.0"
+dependencies = [
+ "cubie-a7a-common",
+ "log 0.1.0",
+ "util",
 ]
 
 [[package]]

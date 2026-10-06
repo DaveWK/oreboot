@@ -1,0 +1,10 @@
+[package]
+name = "oreboot-cubie-a7a-bt0"
+version = "0.1.0"
+authors = ["oreboot authors"]
+edition = "2021"
+
+[dependencies]
+log = { path = "../../../../lib/log" }
+util = { path = "../../../../lib/util" }
+cubie-a7a-common = { path = "../common" }

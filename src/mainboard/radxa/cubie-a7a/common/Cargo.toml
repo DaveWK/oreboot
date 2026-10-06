@@ -1,0 +1,12 @@
+[package]
+name = "cubie-a7a-common"
+version = "0.1.0"
+authors = ["oreboot authors"]
+edition = "2021"
+
+[dependencies]
+embedded-hal-nb.workspace = true
+nb = "1"
+
+log = { path = "../../../../lib/log" }
+util = { path = "../../../../lib/util" }
