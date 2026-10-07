@@ -2,7 +2,7 @@
 //! Register map and voltage step tables follow SyterKit's axp8191.c; the
 //! LDO enable bits agree with mainline's AXP318W regulator description.
 
-use crate::twi::{Error, Twi};
+use cubie_a7a_common::twi::{Error, Twi};
 
 pub const ADDR: u8 = 0x36;
 
@@ -16,6 +16,8 @@ const DC2OUT_VOL: u8 = 0x13;
 const DC9OUT_VOL: u8 = 0x1a;
 const LDO_ON_OFF_CTL1: u8 = 0x20;
 const LDO_ON_OFF_CTL2: u8 = 0x21;
+const LDO_ON_OFF_CTL3: u8 = 0x22;
+const LDO_ON_OFF_CTL4: u8 = 0x23;
 
 /// (min mV, max mV, step mV)
 type Range = (u32, u32, u32);
@@ -48,6 +50,8 @@ const fn rail(
 }
 
 const LDO: &[Range] = &[(500, 3400, 100)];
+/// ELDO1..6: 0.5-1.5 V in 25 mV steps (datasheet REG 3AH..3FH).
+const ELDO: &[Range] = &[(500, 1500, 25)];
 
 const LOW: Range = (500, 1200, 10);
 const MID: Range = (1220, 1540, 20);
@@ -79,6 +83,15 @@ static RAILS: &[Rail] = &[
     rail("bldo1", 0x2a, 0x1f, LDO_ON_OFF_CTL1, 6, LDO),
     rail("cldo2", 0x30, 0x1f, LDO_ON_OFF_CTL2, 4, LDO),
     rail("cldo5", 0x33, 0x1f, LDO_ON_OFF_CTL2, 7, LDO),
+    // The DRAM library sets eldo1 (1080 mV, the vendor system reads back
+    // 1075 mV). Enable bits per the AXP318W datasheet REG 22H/23H; SyterKit
+    // puts ELDO3/4 on REG 22H bits 0/1, which are DLDO1/2.
+    rail("eldo1", 0x3a, 0x3f, LDO_ON_OFF_CTL3, 6, ELDO),
+    rail("eldo2", 0x3b, 0x3f, LDO_ON_OFF_CTL3, 7, ELDO),
+    rail("eldo3", 0x3c, 0x3f, LDO_ON_OFF_CTL4, 0, ELDO),
+    rail("eldo4", 0x3d, 0x3f, LDO_ON_OFF_CTL4, 1, ELDO),
+    rail("eldo5", 0x3e, 0x3f, LDO_ON_OFF_CTL4, 2, ELDO),
+    rail("eldo6", 0x3f, 0x3f, LDO_ON_OFF_CTL4, 3, ELDO),
 ];
 
 /// LDOs the vendor configuration expects on for EDK2's devices. Radxa's
@@ -89,6 +102,14 @@ const BOARD_LDOS: [(&str, u32, &str); 3] = [
     ("bldo1", 1800, "PCIe 1.8 V, PE bank I/O"),
     ("cldo2", 1800, "HDMI 1.8 V"),
     ("cldo5", 1800, "SERDES 1.8 V, SD 1.8 V signalling"),
+];
+
+/// DCDC1-fed 3.3 V load switches the vendor device tree uses for GMAC0
+/// (REG 11H bits 3/4, as the BSP's axp2101-regulator.c describes AXP8191
+/// DC1SW1/DC1SW2). They have no voltage of their own.
+const BOARD_SWITCHES: [(&str, u8, &str); 2] = [
+    ("dc1sw1", 3, "Ethernet PHY 3.3 V"),
+    ("dc1sw2", 4, "VCC-PH, GMAC0 pins"),
 ];
 
 /// Selector value for `mv` in a piecewise-linear step table. Values in a
@@ -153,7 +174,8 @@ impl<'a> Axp<'a> {
 
     /// Switch on the LDOs in `BOARD_LDOS` without changing their voltage.
     /// A rail whose programmed voltage differs from the expected one is
-    /// reported and left alone rather than driven into its consumers.
+    /// reported and left alone rather than driven into its consumers. Then
+    /// switch on `BOARD_SWITCHES`.
     pub fn enable_board_ldos(&self) {
         for (name, want_mv, what) in BOARD_LDOS {
             let rail = RAILS.iter().find(|r| r.name == name).unwrap();
@@ -181,6 +203,27 @@ impl<'a> Axp<'a> {
             match self.twi.write_reg(ADDR, rail.en_reg, en | 1 << rail.en_bit) {
                 Ok(()) => {
                     println!("[bt0] PMIC: {name} ({what}) switched on at {mv} mV");
+                }
+                Err(e) => {
+                    println!("[bt0] PMIC: {name}: enable failed: {e:?}");
+                }
+            }
+        }
+        for (name, bit, what) in BOARD_SWITCHES {
+            let res = self.twi.read_reg(ADDR, DCDC_ON_OFF_CTL2).and_then(|en| {
+                if en & (1 << bit) != 0 {
+                    return Ok(false);
+                }
+                self.twi
+                    .write_reg(ADDR, DCDC_ON_OFF_CTL2, en | 1 << bit)
+                    .map(|()| true)
+            });
+            match res {
+                Ok(false) => {
+                    println!("[bt0] PMIC: {name} ({what}) on");
+                }
+                Ok(true) => {
+                    println!("[bt0] PMIC: {name} ({what}) switched on");
                 }
                 Err(e) => {
                     println!("[bt0] PMIC: {name}: enable failed: {e:?}");

@@ -1,9 +1,11 @@
 //! Allwinner TWI (Marvell mv64xxx-style I2C), polled, register-at-a-time.
-//! Used on R_TWI0 (PL0 = SCK, PL1 = SDA) to reach the AXP8191 PMIC.
+//! Used on R_TWI0 (PL0 = SCK, PL1 = SDA) to reach the AXP8191 PMIC: by bt0
+//! for setup and by main for power-off. bt0 muxes the pins and ungates the
+//! bus clock; [`Twi::new`] only resets and programs the controller.
 
 use util::mmio::{read32, write32};
 
-use crate::soc::udelay;
+use crate::time::udelay;
 
 const DATA: usize = 0x08;
 const CNTR: usize = 0x0c;

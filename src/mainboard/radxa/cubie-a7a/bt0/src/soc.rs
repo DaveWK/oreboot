@@ -15,7 +15,6 @@ pub const SID_BASE: usize = 0x0300_6000;
 pub const SMHC0_BASE: usize = 0x0402_0000;
 pub const R_PRCM_BASE: usize = 0x0701_0000;
 pub const R_PIO_BASE: usize = 0x0702_5000;
-pub const R_TWI0_BASE: usize = 0x0708_3000;
 pub const RTC_BASE: usize = 0x0709_0000;
 pub const CPU_SUBSYS_CTRL_BASE: usize = 0x0800_0000;
 pub const CPU_PLL_CFG_BASE: usize = 0x0887_0000;
@@ -32,7 +31,6 @@ pub const CPU0_CTRL: usize = CPU_SUBSYS_CTRL_BASE + 0x1000;
 
 const SOC_VER_REG: usize = SYSCTRL_BASE + 0x24;
 const PLL_LDO_REG: usize = CPU_SUBSYS_CTRL_BASE + 0x144;
-const GPIO_POW_MODE_REG: usize = PIO_BASE + 0x340;
 
 #[inline]
 pub fn set_bits(addr: usize, bits: u32) {
@@ -52,24 +50,10 @@ pub fn clr_set_bits(addr: usize, clr: u32, set: u32) {
 // ---------------------------------------------------------------------------
 // Arch timer. The generic counter runs from the 24 MHz oscillator domain.
 
-pub const TIMER_HZ: u64 = 24_000_000;
-
-#[inline]
-pub fn ticks() -> u64 {
-    let lo: u32;
-    let hi: u32;
-    // CNTPCT
-    unsafe { asm!("isb", "mrrc p15, 0, {}, {}, c14", out(reg) lo, out(reg) hi) };
-    ((hi as u64) << 32) | lo as u64
-}
+pub use cubie_a7a_common::time::{ticks, udelay, TIMER_HZ};
 
 pub fn time_us() -> u64 {
     ticks() / (TIMER_HZ / 1_000_000)
-}
-
-pub fn udelay(us: u64) {
-    let t1 = ticks() + us * (TIMER_HZ / 1_000_000);
-    while ticks() < t1 {}
 }
 
 pub fn mdelay(ms: u64) {
@@ -83,6 +67,26 @@ pub fn set_cntfrq() {
 }
 
 // ---------------------------------------------------------------------------
+
+/// RTC general purpose registers 0..3 as a diagnostic channel: they keep
+/// their value across a watchdog reset, and the vendor firmware leaves all
+/// eight at 0, so a boot whose UART never worked can be read back from the
+/// next OS (devmem 0x07090100..0x0709010c). 0: PLL_REF_CTRL as the BROM left
+/// it, 1: APB_UART_CLK as the BROM left it, 2: XO_CTRL0, 3: progress.
+const DIAG_GPR: usize = RTC_BASE + 0x100;
+
+pub fn diag(idx: usize, v: u32) {
+    write32(DIAG_GPR + 4 * idx, v);
+}
+
+/// Progress marker in diagnostic register 3: 0xa7a0_00NN.
+pub fn stage(n: u32) {
+    diag(3, 0xa7a0_0000 | n);
+}
+
+pub fn xo_ctrl0() -> u32 {
+    read32(RTC_BASE + 0x160)
+}
 
 /// Silicon revision: 0 = A, 1 = B, ...
 pub fn soc_version() -> u32 {
@@ -111,22 +115,17 @@ pub fn hosc_mhz() -> u32 {
     hosc_khz() / 1000
 }
 
-/// Port of SyterKit's `board_common_init()` for the Cubie A7A.
-pub fn board_common_init(version: u32) {
-    // Revision B: GPIO bank power mode (IO voltage selection).
-    if version == 1 {
-        write32(GPIO_POW_MODE_REG, 0x0115_5550);
-    }
-    // PLL LDO voltage per silicon revision; written twice like the vendor.
-    let ldo = match version {
-        0 => Some(0xa707_0025),
-        1 => Some(0xa706_0025),
-        _ => None,
-    };
-    if let Some(v) = ldo {
-        write32(PLL_LDO_REG, v);
-        write32(PLL_LDO_REG, v);
-    }
+/// Early SoC setup, as the vendor SPL leaves it on the Cubie A7A.
+///
+/// SyterKit's `board_common_init()` treats SYS_CFG 0x24 = 1 as revision B and
+/// then lowers the PLL LDO to 0xa706_0025 and rewrites the GPIO power mode
+/// (0x0115_5550). This board's chip reads 0x101 there, yet the vendor SPL
+/// only ever writes 0xa707_0025 (it has no other value) and leaves the power
+/// mode to Linux. Do the same.
+pub fn board_common_init(_version: u32) {
+    // Written twice like the vendor.
+    write32(PLL_LDO_REG, 0xa707_0025);
+    write32(PLL_LDO_REG, 0xa707_0025);
 }
 
 /// Read the 128-bit chip SID from the eFuse SRAM mirror.

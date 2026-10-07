@@ -125,8 +125,14 @@ static mut PMIC: Option<Axp<'static>> = None;
 
 /// Run the vendor DRAM init with `set`. For the 4 GB sets, retry with the
 /// other vendor's set and then the conservative 1800 MHz set if training
-/// fails. Returns the DRAM size in MiB (0 on failure).
-pub fn init(pmic: Option<Axp<'static>>, set: &'static ParamSet) -> u32 {
+/// fails. Returns the DRAM size in MiB and the clock in MHz of the set that
+/// trained, or `None`.
+/// The PMIC handed to [`init`], for whatever runs after DRAM.
+pub fn pmic() -> Option<&'static Axp<'static>> {
+    unsafe { (*core::ptr::addr_of!(PMIC)).as_ref() }
+}
+
+pub fn init(pmic: Option<Axp<'static>>, set: &'static ParamSet) -> Option<(u32, u32)> {
     unsafe { *core::ptr::addr_of_mut!(PMIC) = pmic };
     let fallback: &[&'static ParamSet] = if core::ptr::eq(set, &PARAM_SETS[CXMT_4G]) {
         &[&PARAM_SETS[HYNIX_4G], &PARAM_SETS[SAFE_4G]]
@@ -143,11 +149,11 @@ pub fn init(pmic: Option<Axp<'static>>, set: &'static ParamSet) -> u32 {
             init_DRAM(0, para as *mut c_void)
         };
         if size > 0 {
-            return size as u32;
+            return Some((size as u32, s.para[0]));
         }
         println!("[bt0] DRAM: {} failed", s.name);
     }
-    0
+    None
 }
 
 /// Quick sanity check: unique pattern at power-of-two strides, then read

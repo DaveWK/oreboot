@@ -5,9 +5,9 @@
 //! R_PIO (ports L..N): bank N at R_PIO_BASE + N * 0x30 (CFG at +0x00, DRV at
 //! +0x14, PULL at +0x24).
 
-use util::mmio::read32;
+use util::mmio::{read32, write32};
 
-use crate::soc::{clr_set_bits, PIO_BASE, R_PIO_BASE};
+use crate::soc::{clr_set_bits, mdelay, PIO_BASE, R_PIO_BASE};
 
 #[allow(dead_code)] // full port list of the SoC
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -90,4 +90,30 @@ pub fn set_drive(port: Port, pin: u32, level: u32) {
 pub fn read(port: Port, pin: u32) -> bool {
     assert!((port as usize) < Port::L as usize);
     read32(bank(port).dat) & (1 << pin) != 0
+}
+
+// Green power LED: PJ26, active low (vendor DT "radxa:green:power"). Port J
+// is bank 9: CFG3 holds pins 24..31.
+pub const POWER_LED_PIN: u32 = 26;
+pub const POWER_LED_CFG: usize = PIO_BASE + 9 * 0x80 + 0x80 + 0x0c;
+pub const POWER_LED_DAT: usize = PIO_BASE + 9 * 0x80 + 0x80 + 0x10;
+pub const POWER_LED_CFG_SHIFT: u32 = (POWER_LED_PIN & 7) * 4;
+
+pub fn power_led(on: bool) {
+    let d = read32(POWER_LED_DAT) & !(1 << POWER_LED_PIN);
+    write32(POWER_LED_DAT, if on { d } else { d | 1 << POWER_LED_PIN });
+}
+
+/// Blink `n` times, pause, repeat: a fault code for when no UART is up yet.
+pub fn blink_forever(n: u32) -> ! {
+    loop {
+        for _ in 0..n {
+            power_led(false);
+            mdelay(300);
+            power_led(true);
+            mdelay(300);
+        }
+        power_led(false);
+        mdelay(1500);
+    }
 }

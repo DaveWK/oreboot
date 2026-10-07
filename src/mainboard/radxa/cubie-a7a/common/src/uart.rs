@@ -52,6 +52,7 @@ impl Uart {
     pub fn putc(&mut self, c: u8) {
         while read32(self.base + LSR) & LSR_THRE == 0 {}
         write32(self.base + RBR_THR_DLL, c as u32);
+        crate::fwlog::putc(c);
     }
 
     /// Wait until the transmitter is completely idle, e.g. before a reset.
@@ -72,6 +73,7 @@ impl embedded_hal_nb::serial::Write<u8> for Uart {
             return Err(nb::Error::WouldBlock);
         }
         write32(self.base + RBR_THR_DLL, c as u32);
+        crate::fwlog::putc(c);
         Ok(())
     }
 

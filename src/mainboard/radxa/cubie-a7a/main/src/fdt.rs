@@ -97,6 +97,16 @@ impl Fdt {
         self.prop(name, &v.to_be_bytes());
     }
 
+    /// A list of up to 16 u32 cells.
+    pub fn prop_u32_cells(&mut self, name: &str, vals: &[u32]) {
+        let mut buf = [0u8; 64];
+        let n = vals.len().min(16);
+        for (o, v) in buf.chunks_exact_mut(4).zip(&vals[..n]) {
+            o.copy_from_slice(&v.to_be_bytes());
+        }
+        self.prop(name, &buf[..4 * n]);
+    }
+
     /// A list of cells, each u64 split into two big-endian u32 cells.
     pub fn prop_u64_cells(&mut self, name: &str, vals: &[u64]) {
         let mut buf = [0u8; 64];

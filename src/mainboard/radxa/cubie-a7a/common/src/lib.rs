@@ -12,7 +12,15 @@
 //! ```
 #![no_std]
 
+pub mod ethernet;
+pub mod fwlog;
+pub mod sha256;
+pub mod time;
+pub mod twi;
 pub mod uart;
+
+/// R_TWI0, the PMIC's I2C bus.
+pub const R_TWI0_BASE: usize = 0x0708_3000;
 
 /// Memory map. DRAM starts at 0x4000_0000.
 pub mod mem {
@@ -40,9 +48,11 @@ pub mod mem {
 /// Boot media layout table, written by the image tool at a fixed offset on
 /// the SD card. bt0 reads it to find what to load where.
 pub mod layout {
-    /// Byte offset of the table on the boot medium (sector 2040, just below
-    /// 1 MiB, after the room reserved for the bt0 eGON image at 8 KiB).
-    pub const TABLE_OFFSET: u32 = 0x000f_f000;
+    /// Byte offset of the table on the boot medium (sector 4088, just below
+    /// 2 MiB). Everything between bt0 and here stays free so a vendor U-Boot
+    /// FIT (0x6a000..0x18e000 on Radxa's dlan17 cards) can stay in place for
+    /// [`KIND_VENDOR_SPL`] recovery.
+    pub const TABLE_OFFSET: u32 = 0x001f_f000;
     pub const MAGIC: [u8; 8] = *b"A7ABOOT1";
     pub const VERSION: u32 = 1;
     pub const MAX_ENTRIES: usize = 8;
@@ -54,6 +64,9 @@ pub mod layout {
     pub const KIND_PAYLOAD: u32 = 2;
     /// Optional DTB handed to the payload instead of the generated one.
     pub const KIND_DTB: u32 = 3;
+    /// A vendor eGON SPL, loaded to SRAM 0x47000 and run in place of bt0
+    /// when the previous oreboot boot never confirmed ([`super::recovery`]).
+    pub const KIND_VENDOR_SPL: u32 = 4;
 
     #[repr(C)]
     #[derive(Clone, Copy, Debug, Default)]
@@ -88,8 +101,25 @@ pub mod layout {
     const _: () = assert!(TABLE_SIZE <= 512);
 }
 
+/// Boot-attempt tracking, so a broken oreboot/EDK2 build falls back to the
+/// vendor bootloader by itself instead of needing a card reader.
+///
+/// bt0 writes [`ATTEMPT`] to an RTC general purpose register (kept across
+/// watchdog resets while VDD_RTC is up) and arms WDT0. EDK2 confirms from
+/// its boot manager with the [`SIP_BOOT_OK`] SMC; main then clears the
+/// register and stops the watchdog. If bt0 finds [`ATTEMPT`] still set, the
+/// previous boot failed or hung, and it runs the vendor SPL once instead.
+pub mod recovery {
+    /// RTC GP_DATA_REG6 (A733 manual 9.1.7.14).
+    pub const RTC_GPR: usize = 0x0709_0118;
+    pub const ATTEMPT: u32 = u32::from_le_bytes(*b"A7At");
+    /// SMC32 fast call, SiP service range.
+    pub const SIP_BOOT_OK: u32 = 0x8200_0001;
+    pub const WDT0_BASE: usize = 0x0205_0000;
+}
+
 pub const HANDOFF_MAGIC: u32 = u32::from_le_bytes(*b"A7AH");
-pub const HANDOFF_VERSION: u32 = 1;
+pub const HANDOFF_VERSION: u32 = 2;
 
 /// Written by bt0 at [`mem::HANDOFF_ADDR`] before the warm reset, because
 /// no register state survives it.
@@ -111,6 +141,10 @@ pub struct Handoff {
     /// 0 if no DTB was supplied on the medium.
     pub dtb_addr: u64,
     pub dtb_size: u64,
+    /// CPU_L, CPU_B and DSU clocks in MHz as bt0 left them.
+    pub cpu_mhz: [u32; 3],
+    /// DRAM clock in MHz of the parameter set that trained.
+    pub dram_mhz: u32,
 }
 
 /// CRC-32 (IEEE 802.3, reflected, as used by zlib and Python's

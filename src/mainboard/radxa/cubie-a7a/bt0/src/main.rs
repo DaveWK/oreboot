@@ -14,10 +14,13 @@ extern crate log;
 use core::arch::{asm, global_asm, naked_asm};
 use core::panic::PanicInfo;
 use core::ptr::addr_of_mut;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use cubie_a7a_common::{
     crc32, layout, mem,
+    twi::Twi,
     uart::{init_logger, Uart, UART0_BASE},
+    R_TWI0_BASE,
     Handoff, HANDOFF_MAGIC, HANDOFF_VERSION,
 };
 use util::mmio::write32;
@@ -25,11 +28,12 @@ use util::mmio::write32;
 mod axp;
 mod ccu;
 mod dram;
+mod dvfs;
 mod gpadc;
 mod gpio;
+mod recovery;
 mod smhc;
 mod soc;
-mod twi;
 
 use gpio::{Port, Pull};
 
@@ -106,6 +110,17 @@ pub unsafe extern "C" fn start() -> ! {
         "bic    r0, r0, #0x1f",
         "orr    r0, r0, #0xd3",
         "msr    cpsr_c, r0",
+        // Green power LED (PJ26, active low) on: the first sign bt0 runs,
+        // before clocks or UART. Linux keeps it on later.
+        "ldr    r0, ={led_cfg}",
+        "ldr    r1, [r0]",
+        "bic    r1, r1, #(0xf << {led_shift})",
+        "orr    r1, r1, #(0x1 << {led_shift})",
+        "str    r1, [r0]",
+        "ldr    r0, ={led_dat}",
+        "ldr    r1, [r0]",
+        "bic    r1, r1, #(1 << {led_pin})",
+        "str    r1, [r0]",
         // VBAR
         "ldr    r0, =bt0_vectors",
         "mcr    p15, 0, r0, c12, c0, 0",
@@ -132,6 +147,10 @@ pub unsafe extern "C" fn start() -> ! {
         "wfi",
         "b      2b",
         main = sym main,
+        led_cfg = const gpio::POWER_LED_CFG,
+        led_dat = const gpio::POWER_LED_DAT,
+        led_shift = const gpio::POWER_LED_CFG_SHIFT,
+        led_pin = const gpio::POWER_LED_PIN,
     )
 }
 
@@ -155,6 +174,10 @@ extern "C" fn bt0_exception(kind: u32, lr: u32) -> ! {
             out(reg) dfsr, out(reg) dfar, out(reg) ifsr, out(reg) ifar
         )
     };
+    if !UART_UP.load(Ordering::Relaxed) {
+        // Nothing to print on: blink the exception number on the power LED.
+        gpio::blink_forever(kind);
+    }
     println!("[bt0] EXCEPTION: {name}, lr {lr:08x}");
     println!("[bt0]   DFSR {dfsr:08x} DFAR {dfar:08x} IFSR {ifsr:08x} IFAR {ifar:08x}");
     halt()
@@ -178,20 +201,24 @@ fn init_uart() {
     gpio::set_pull(Port::B, 10, Pull::Up);
     ccu::uart_clock_24m();
     ccu::bus_enable(ccu::UART0_BGR);
+    cubie_a7a_common::fwlog::start_early();
     init_logger(Uart::init(UART0_BASE, UART_CLOCK_HZ, 115_200));
+    UART_UP.store(true, Ordering::Relaxed);
 }
 
+static UART_UP: AtomicBool = AtomicBool::new(false);
+
 fn init_pmic() -> Option<axp::Axp<'static>> {
-    static mut TWI: Option<twi::Twi> = None;
+    static mut TWI: Option<Twi> = None;
     // R_TWI0: PL0 = SCK, PL1 = SDA
     gpio::set_function(Port::L, 0, 2);
     gpio::set_function(Port::L, 1, 2);
     gpio::set_pull(Port::L, 0, Pull::Up);
     gpio::set_pull(Port::L, 1, Pull::Up);
     ccu::bus_enable(ccu::R_TWI0_BGR);
-    let twi: &'static twi::Twi = unsafe {
+    let twi: &'static Twi = unsafe {
         let t = &mut *addr_of_mut!(TWI);
-        t.replace(twi::Twi::new(soc::R_TWI0_BASE));
+        t.replace(Twi::new(R_TWI0_BASE));
         t.as_ref().unwrap()
     };
     let pmic = axp::Axp::new(twi);
@@ -292,11 +319,18 @@ fn rmr_switch(entry: u32) -> ! {
 #[unsafe(no_mangle)]
 extern "C" fn main() -> ! {
     soc::set_cntfrq();
+    soc::stage(1);
+    soc::diag(1, ccu::apb_uart_clk());
+    soc::diag(2, soc::xo_ctrl0());
+    recovery::arm_watchdog();
+    soc::diag(0, ccu::ref_pll_init());
+    soc::stage(2);
     let t_start = soc::ticks();
     let version = soc::soc_version();
     let hosc = soc::hosc_mhz();
     soc::board_common_init(version);
     init_uart();
+    soc::stage(3);
 
     println!();
     println!("oreboot 🦀 bt0 | Radxa Cubie A7A | Allwinner A733");
@@ -312,16 +346,35 @@ extern "C" fn main() -> ! {
         sid[3]
     );
 
+    soc::stage(4);
+    if recovery::previous_boot_failed() {
+        println!("[bt0] the previous boot never reached EDK2's boot manager");
+        let mut sd = smhc::Smhc::new_smhc0(soc::SMHC0_BASE);
+        match sd.init_card() {
+            Ok(()) => recovery::boot_vendor_spl(&sd, &read_layout(&sd)),
+            Err(e) => {
+                println!("[bt0] recovery: SD init failed: {e:?}");
+            }
+        }
+        println!("[bt0] recovery not possible; trying oreboot again");
+    }
+    recovery::begin_attempt();
+
     ccu::init();
+
+    soc::stage(5);
+    let pmic = init_pmic();
     ccu::dump();
 
-    let pmic = init_pmic();
-
-    let dram_mb = dram::init(pmic, dram::select());
-    if dram_mb == 0 {
+    soc::stage(6);
+    let Some((dram_mb, dram_mhz)) = dram::init(pmic, dram::select()) else {
         println!("[bt0] DRAM init failed");
         halt();
-    }
+    };
+    // Before anything else writes DRAM: keep the last boot's log, then move
+    // the SRAM log into this boot's (cubie_a7a_common::fwlog).
+    cubie_a7a_common::fwlog::start_dram();
+    soc::stage(7);
     let dram_size = dram_mb as usize * 1024 * 1024;
     println!("[bt0] DRAM: {dram_mb} MiB");
     // Only test what fits the 32-bit address space for now.
@@ -332,11 +385,19 @@ extern "C" fn main() -> ! {
     }
     let dram_end = mem::DRAM_BASE + test_size;
 
+    // Raise the CPU clocks only now: libdram trained at the boot clocks
+    // (as with SyterKit and the vendor SPL) and hung after a boost.
+    if let Some(p) = dram::pmic() {
+        dvfs::boost(p);
+        ccu::dump();
+    }
+
     let mut sd = smhc::Smhc::new_smhc0(soc::SMHC0_BASE);
     if let Err(e) = sd.init_card() {
         println!("[bt0] SD init failed: {e:?}");
         halt();
     }
+    soc::stage(8);
     let table = read_layout(&sd);
 
     let mut handoff = Handoff {
@@ -351,9 +412,14 @@ extern "C" fn main() -> ! {
         payload_size: 0,
         dtb_addr: 0,
         dtb_size: 0,
+        cpu_mhz: ccu::cpu_clocks(),
+        dram_mhz,
     };
     let mut main_entry = None;
     for e in &table.entries[..table.count as usize] {
+        if e.kind == layout::KIND_VENDOR_SPL {
+            continue; // recovery only
+        }
         load_entry(&sd, e, dram_end);
         match e.kind {
             layout::KIND_MAIN => main_entry = Some(e.load_addr as u32),
@@ -382,6 +448,9 @@ extern "C" fn main() -> ! {
         (handoff.bt0_done_ticks - t_start) / (soc::TIMER_HZ / 1000)
     );
     Uart::attach(UART0_BASE).drain();
+    // A full watchdog period for main and EDK2 to reach the boot manager.
+    recovery::kick();
+    soc::stage(9);
     rmr_switch(main_entry)
 }
 

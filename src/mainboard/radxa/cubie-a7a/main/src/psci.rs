@@ -6,12 +6,15 @@
 
 use core::ptr::{addr_of, addr_of_mut, read_volatile, write_volatile};
 
-use cubie_a7a_common::mem;
+use cubie_a7a_common::{mem, recovery};
 
 use crate::{soc, Context};
 
 const SMCCC_VERSION: u32 = 0x8000_0000;
 const SMCCC_ARCH_FEATURES: u32 = 0x8000_0001;
+const SMCCC_ARCH_WORKAROUND_1: u32 = 0x8000_8000;
+const SMCCC_ARCH_WORKAROUND_2: u32 = 0x8000_7fff;
+const SMCCC_ARCH_WORKAROUND_3: u32 = 0x8000_3fff;
 const PSCI_VERSION: u32 = 0x8400_0000;
 const CPU_SUSPEND: u32 = 0x8400_0001;
 const CPU_OFF: u32 = 0x8400_0002;
@@ -26,6 +29,9 @@ const SMC64: u32 = 0x4000_0000;
 
 const SUCCESS: i64 = 0;
 const NOT_SUPPORTED: i64 = -1;
+const NOT_REQUIRED: i64 = -2;
+/// SMCCC_ARCH_FEATURES for a workaround: implemented, not needed on this PE.
+const WA_UNAFFECTED: i64 = 1;
 const INVALID_PARAMETERS: i64 = -2;
 const ALREADY_ON: i64 = -4;
 const ON_PENDING: i64 = -5;
@@ -139,6 +145,23 @@ fn cpu_suspend(_power_state: u64) -> i64 {
     SUCCESS
 }
 
+/// SMCCC_ARCH_FEATURES, answered per calling core as TF-A does
+/// (services/arm_arch_svc). Linux asks each CPU separately.
+fn arch_features(fid: u32) -> i64 {
+    match fid {
+        SMCCC_VERSION | SMCCC_ARCH_FEATURES => SUCCESS,
+        // CVE-2017-5715: neither the A55 nor the A76 is affected.
+        SMCCC_ARCH_WORKAROUND_1 => WA_UNAFFECTED,
+        // CVE-2018-3639: A55 unaffected, the A76 has SSBS.
+        SMCCC_ARCH_WORKAROUND_2 => NOT_REQUIRED,
+        // CVE-2022-23960: the A76 needs the branch history flushed, which
+        // the EL3 entry path does on every SMC (`el3_lower_sync`).
+        SMCCC_ARCH_WORKAROUND_3 if crate::is_cortex_a76() => SUCCESS,
+        SMCCC_ARCH_WORKAROUND_3 => WA_UNAFFECTED,
+        _ => NOT_SUPPORTED,
+    }
+}
+
 fn features(fid: u32) -> i64 {
     match fid & !SMC64 {
         // bit 1 clear: original power_state format
@@ -163,13 +186,17 @@ pub fn handle_smc(ctx: &mut Context) {
     };
     let ret: i64 = match fid & !SMC64 {
         SMCCC_VERSION => 0x1_0001,
-        SMCCC_ARCH_FEATURES => NOT_SUPPORTED,
+        SMCCC_ARCH_FEATURES => arch_features(arg(1) as u32),
+        // The BHB flush already ran on entry; nothing else to do.
+        SMCCC_ARCH_WORKAROUND_1 | SMCCC_ARCH_WORKAROUND_3 => SUCCESS,
         PSCI_VERSION => 0x1_0000,
         CPU_SUSPEND => cpu_suspend(arg(1)),
         CPU_OFF => crate::cpu_off(),
         CPU_ON => cpu_on(arg(1), arg(2), arg(3)),
         AFFINITY_INFO => affinity_info(arg(1), arg(2)),
         MIGRATE_INFO_TYPE => 2, // no Trusted OS
+        recovery::SIP_BOOT_OK => crate::boot_confirmed(),
+        cubie_a7a_common::fwlog::SIP_FWLOG_BASE => cubie_a7a_common::fwlog::CUR_BASE as i64,
         SYSTEM_OFF => crate::system_off(),
         SYSTEM_RESET => crate::system_reset(),
         PSCI_FEATURES => features(arg(1) as u32),

@@ -23,8 +23,13 @@ use cubie_a7a_common::{
 
 mod fdt;
 mod gic;
+mod gmac;
+mod pcie;
+mod pmic;
+mod ppu;
 mod psci;
 mod soc;
+mod usb;
 
 use psci::{Cpu, State};
 
@@ -154,6 +159,15 @@ el3_vectors:
 el3_lower_sync:
     sub     sp, sp, #272
     stp     x0, x1, [sp, #0]
+    // CVE-2022-23960 (Spectre-BHB): overwrite the branch history with 24
+    // taken branches before EL3 code runs (TF-A wa_cve_2022_23960_bhb,
+    // k = 24 for the A76). Harmless on the A55.
+    mov     x0, #24
+1:  b       2f
+2:  subs    x0, x0, #1
+    b.ne    1b
+    dsb     sy
+    isb
     stp     x2, x3, [sp, #16]
     stp     x4, x5, [sp, #32]
     stp     x6, x7, [sp, #48]
@@ -255,8 +269,54 @@ fn current_core() -> usize {
     ((mpidr >> 8) & 0xff) as usize
 }
 
+const MIDR_PARTNUM_A76: u64 = 0xd0b;
+
+fn midr() -> u64 {
+    let v: u64;
+    unsafe { asm!("mrs {}, midr_el1", out(reg) v) };
+    v
+}
+
+pub fn is_cortex_a76() -> bool {
+    (midr() >> 4) & 0xfff == MIDR_PARTNUM_A76
+}
+
+/// Cortex-A76 errata that need EL3 at every core reset, per TF-A
+/// (lib/cpus/aarch64/cortex_a76.S). This board's A76s are r4p1. The A55s
+/// are r2p0, which no A55 erratum handled by TF-A covers.
+fn cpu_errata() {
+    let midr = midr();
+    if (midr >> 4) & 0xfff != MIDR_PARTNUM_A76 {
+        return;
+    }
+    let rev = ((midr >> 16) & 0xf0) | (midr & 0xf); // 0xVR, e.g. 0x41
+    if (0x30..=0x41).contains(&rev) {
+        // Erratum 1946160: IMPDEF instruction patching slots 3, 4 and 5.
+        for (slot, a, b) in [
+            (3u64, 0x10_e390_0002u64, 0x10_fff0_0083u64),
+            (4, 0x10_e380_0082, 0x10_fff0_0083),
+            (5, 0x10_e380_0200, 0x10_fff0_03e0),
+        ] {
+            unsafe {
+                asm!(
+                    "msr S3_6_C15_C8_0, {slot}",
+                    "msr S3_6_C15_C8_2, {a}",
+                    "msr S3_6_C15_C8_3, {b}",
+                    "msr S3_6_C15_C8_1, {c}",
+                    slot = in(reg) slot,
+                    a = in(reg) a,
+                    b = in(reg) b,
+                    c = in(reg) 0x2_0010_03ffu64,
+                )
+            };
+        }
+        unsafe { asm!("isb") };
+    }
+}
+
 /// Per-core EL3 register setup, cold and warm boot.
 fn el3_cpu_init() {
+    cpu_errata();
     unsafe {
         asm!(
             "msr scr_el3, {scr}",
@@ -331,6 +391,35 @@ fn build_dtb(h: &Handoff) -> usize {
     f.prop_str("method", "smc");
     f.end_node();
 
+    // What bt0 set up, for the payload (EDK2's SMBIOS tables). Not a
+    // binding Linux knows; it ignores the node.
+    f.begin_node("firmware");
+    f.begin_node("oreboot");
+    f.prop_str("compatible", "oreboot,cubie-a7a");
+    f.prop_u32_cells("cpu-clock-mhz", &h.cpu_mhz);
+    f.prop_u32("dram-clock-mhz", h.dram_mhz);
+    if let Some(mac) = gmac::mac_address() {
+        // GMAC0's address; EDK2 uses it and copies it into the OS DTB.
+        f.prop("mac-address", &mac);
+    }
+    // Host controllers usb::init() brought up, which EDK2 registers.
+    let usb = usb::ready();
+    let mut list = [0u8; 18];
+    let mut n = 0;
+    for (up, name) in [(usb.ehci0, "ehci0\0"), (usb.ehci1, "ehci1\0"), (usb.xhci, "xhci\0")] {
+        if up {
+            list[n..n + name.len()].copy_from_slice(name.as_bytes());
+            n += name.len();
+        }
+    }
+    if n != 0 {
+        f.prop("usb-ready", &list[..n]);
+    }
+    // Child nodes after all properties: the trained PCIe link, if any.
+    pcie::fdt_node(f);
+    f.end_node();
+    f.end_node();
+
     f.begin_node("serial@2500000");
     f.prop_str("compatible", "snps,dw-apb-uart");
     f.prop_u64_cells("reg", &[soc::UART0_BASE as u64, 0x400]);
@@ -348,6 +437,7 @@ fn build_dtb(h: &Handoff) -> usize {
 }
 
 extern "C" fn primary_main(mpidr: u64, core: usize) -> ! {
+    cubie_a7a_common::fwlog::attach();
     init_logger(Uart::attach(soc::UART0_BASE));
     let t0 = ticks();
     println!();
@@ -391,6 +481,16 @@ extern "C" fn primary_main(mpidr: u64, core: usize) -> ! {
     }
     if h.dtb_addr != 0 {
         println!("[main] note: DTB from boot media is not used yet, generating one");
+    }
+    if cfg!(feature = "gmac") {
+        gmac::init();
+    }
+    // Before usb::init(): sets the shared serdes config clock to 100 MHz.
+    if cfg!(feature = "pcie") {
+        pcie::init();
+    }
+    if cfg!(feature = "usb") {
+        usb::init();
     }
     let dtb_size = build_dtb(&h);
     println!(
@@ -440,6 +540,20 @@ pub fn cpu_off() -> i64 {
     }
 }
 
+/// SiP call from EDK2's boot manager: this boot worked, so clear bt0's
+/// attempt marker and stop the watchdog it armed (see
+/// `cubie_a7a_common::recovery`). Only the first call logs.
+pub fn boot_confirmed() -> i64 {
+    use cubie_a7a_common::recovery::{RTC_GPR, WDT0_BASE};
+    use util::mmio::{read32, write32};
+    if read32(RTC_GPR) != 0 {
+        println!("[main] boot confirmed by the payload; watchdog off");
+    }
+    write32(RTC_GPR, 0);
+    write32(WDT0_BASE + 0x14, 0x16aa_0000); // WDT_MODE: disable
+    0
+}
+
 pub fn system_reset() -> i64 {
     println!("[main] PSCI SYSTEM_RESET");
     Uart::attach(soc::UART0_BASE).drain();
@@ -447,9 +561,18 @@ pub fn system_reset() -> i64 {
 }
 
 pub fn system_off() -> i64 {
-    // TODO: power off through the AXP8191 once main has an I2C driver.
-    println!("[main] PSCI SYSTEM_OFF: PMIC power-off not implemented, halting");
+    println!("[main] PSCI SYSTEM_OFF");
     Uart::attach(soc::UART0_BASE).drain();
+    let why = match pmic::power_off() {
+        // The rails take a moment to drop.
+        Ok(()) => {
+            let t = ticks() + soc::TIMER_HZ;
+            while ticks() < t {}
+            "PMIC still on after 1 s"
+        }
+        Err(e) => e,
+    };
+    println!("[main] power-off failed ({why}), halting");
     halt()
 }
 

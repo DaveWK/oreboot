@@ -8,3 +8,13 @@ edition = "2021"
 log = { path = "../../../../lib/log" }
 util = { path = "../../../../lib/util" }
 cubie-a7a-common = { path = "../common" }
+
+# Peripheral bring-up in main, each one a build option so a first boot on new
+# hardware can leave out what has not run yet (Makefile BRINGUP=...). The
+# modules are always compiled; a disabled one never touches its hardware and
+# reports nothing in the DTB.
+[features]
+default = ["gmac", "pcie", "usb"]
+gmac = []
+pcie = []
+usb = []
