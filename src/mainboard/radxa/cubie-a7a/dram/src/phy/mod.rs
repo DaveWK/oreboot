@@ -13,6 +13,7 @@
 //! drivers/st/ddr/phy/phyinit, BSD-3-Clause).
 
 pub mod acsm;
+pub mod coldinit;
 pub mod freq;
 pub mod fw;
 pub mod init;

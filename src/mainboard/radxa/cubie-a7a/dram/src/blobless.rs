@@ -10,7 +10,9 @@
 use crate::hw::{Error, Hw};
 use crate::para::Para;
 use crate::phy::prog::{self, Kind, Op};
-use crate::phy::{csr, csr_access, freq, init, sequence, tables, MICRO_CONT_MUX_SEL, MICRO_RESET};
+use crate::phy::{
+    coldinit, csr, csr_access, freq, init, sequence, tables, MICRO_CONT_MUX_SEL, MICRO_RESET,
+};
 use crate::{ccu, ctrl, power};
 
 /// MASTER PhyConfig (synthesis configuration word; field layout per the
@@ -142,14 +144,15 @@ pub const ACSM_OUTER_LOOP: u32 = 0x20027;
 pub const MEM_RESET_L: u32 = 0x20060;
 
 /// [`sequence::Port`] on the PHY CSRs for the firmware-free path. Preflight
-/// requires what [`pre_training`] establishes: PMU stalled (MicroReset 1),
-/// DRAM held in reset (MemResetL 2); it then selects host CSR access and
-/// records ACSMLastAddr. The completion witness is ACSMLastAddr reaching
-/// `stop` from a different value.
+/// requires the PMU stalled (MicroReset 1) and MemResetL at `mem_reset`
+/// (2: DRAM held in reset, as [`pre_training`] leaves it; 3: released); it
+/// then selects host CSR access and records ACSMLastAddr. The completion
+/// witness is ACSMLastAddr reaching `stop` from a different value.
 pub struct PhyPort<'a, H: Hw> {
     pub hw: &'a mut H,
     pub stop: u16,
     pub prior_last: u16,
+    pub mem_reset: u16,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -167,7 +170,7 @@ impl<H: Hw> sequence::Port for PhyPort<'_, H> {
         }
         csr_access(self.hw, true);
         let reset = self.hw.read16(csr(MEM_RESET_L));
-        if reset != 2 {
+        if reset != self.mem_reset {
             csr_access(self.hw, false);
             return Err(PortError::DramNotInReset(reset));
         }
@@ -233,6 +236,7 @@ pub fn acsm_delay_probe<H: Hw>(hw: &mut H, out: &mut [Option<AcsmSample>; 8]) {
             hw: &mut *hw,
             stop,
             prior_last: 0,
+            mem_reset: 2,
         });
         let result = run.run(sequence::MAX_POLLS);
         let elapsed_us = hw.now_us().wrapping_sub(t0);
@@ -251,4 +255,91 @@ pub fn acsm_delay_probe<H: Hw>(hw: &mut H, out: &mut [Option<AcsmSample>; 8]) {
             break;
         }
     }
+}
+
+/// ClrPORMemReset: switches the power-on-reset latch (written 1 then 0).
+pub const CLR_POR_MEM_RESET: u32 = 0x20061;
+/// DRAM reset low time before release (JEDEC tINIT1 is 200 us minimum; the
+/// reset has been low since the rails came up much earlier).
+pub const RESET_LOW_US: u32 = 200;
+/// Wait after releasing reset before the first command (tINIT3 >= 2 ms).
+pub const RESET_HIGH_US: u32 = 5_000;
+/// Row bases used alternately so that ACSMLastAddr changes on every launch.
+const ROW_BASES: [u16; 2] = [0, 64];
+
+/// Outcome of [`cold_init_part1`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ColdInitReport {
+    pub launches: u16,
+    pub writes: u16,
+    pub witnessed: u16,
+    pub busy_max: u16,
+    /// First failing launch (1-based) and its failure.
+    pub failure: Option<(u16, sequence::Failure<PortError>)>,
+    pub elapsed_us: u64,
+}
+
+/// Release the DRAM reset and run part 1 of the cold init
+/// ([`phy::coldinit::part1`](crate::phy::coldinit::part1)) through the host
+/// ACSM. Call after [`pre_training`]. Stops at the first failed launch.
+pub fn cold_init_part1<H: Hw>(hw: &mut H, mrs: &coldinit::Mrs) -> ColdInitReport {
+    let t0 = hw.now_us();
+    csr_access(hw, true);
+    hw.write16(csr(CLR_POR_MEM_RESET), 1);
+    hw.write16(csr(CLR_POR_MEM_RESET), 0);
+    hw.udelay(RESET_LOW_US);
+    hw.write16(csr(MEM_RESET_L), 3);
+    hw.udelay(RESET_HIGH_US);
+    let mut report = ColdInitReport {
+        launches: 0,
+        writes: 0,
+        witnessed: 0,
+        busy_max: 0,
+        failure: None,
+        elapsed_us: 0,
+    };
+    coldinit::part1(mrs, &mut |step| {
+        if report.failure.is_some() {
+            return;
+        }
+        match step {
+            coldinit::Step::Write(c, v) => {
+                csr_access(hw, true);
+                hw.write16(csr(c), v);
+                report.writes += 1;
+            }
+            coldinit::Step::Launch { start, rows } => {
+                let base = ROW_BASES[report.launches as usize & 1] + start;
+                let stop = base + rows.len() as u16 - 1;
+                csr_access(hw, true);
+                hw.write16(csr(ACSM_START), base);
+                hw.write16(csr(ACSM_STOP), base);
+                for (i, row) in rows.iter().enumerate() {
+                    for (k, &v) in row.0.iter().enumerate() {
+                        let r = (base as u32 + i as u32) * 4 + k as u32;
+                        hw.write16(csr(ACSM_MEM + r), v);
+                    }
+                }
+                hw.write16(csr(ACSM_OUTER_LOOP), 0);
+                hw.write16(csr(ACSM_STOP), stop);
+                report.launches += 1;
+                let mut run = sequence::DirectRun::new(PhyPort {
+                    hw: &mut *hw,
+                    stop,
+                    prior_last: 0,
+                    mem_reset: 3,
+                });
+                match run.run(sequence::MAX_POLLS) {
+                    Ok(c) => {
+                        report.witnessed += c.witnessed as u16;
+                        report.busy_max = report.busy_max.max(c.busy_polls);
+                    }
+                    Err(f) => report.failure = Some((report.launches, f)),
+                }
+            }
+        }
+    });
+    csr_access(hw, false);
+    report.elapsed_us = hw.now_us().wrapping_sub(t0);
+    report
 }

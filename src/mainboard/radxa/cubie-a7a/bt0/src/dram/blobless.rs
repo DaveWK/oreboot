@@ -54,6 +54,13 @@ pub fn init_one(para: &[u32; 32]) -> Option<u32> {
                     a.ctl, a.stop, a.run, a.last_addr, a.elapsed_us
                 );
             }
+            // DRAM reset released here: cold init part 1 (MRW only, no read).
+            let mrs = cubie_a7a_dram::phy::coldinit::Mrs::ORACLE_PSTATE1_CXMT_4G;
+            let c = blobless::cold_init_part1(&mut Bt0Hw, &mrs);
+            println!(
+                "[dram] blobless: cold init part 1: {} launches ({} witnessed, max {} busy polls), {} CSR writes, {} us, failure {:?}",
+                c.launches, c.witnessed, c.busy_max, c.writes, c.elapsed_us, c.failure
+            );
         }
         Err(e) => {
             println!("[dram] blobless: pre-training failed after {ms} ms: {e:?}");
