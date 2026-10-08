@@ -4,8 +4,8 @@
 //! block), the CA/DQ swizzle, G (run the firmware), I (PIE per pstate);
 //! finally I (the PIE sequencer image).
 
-use crate::ctrl::{ddrc, DFIMISC, DFI_FREQUENCY_MASK, SWCTL};
-use crate::hw::{Error, Hw};
+use crate::ctrl::{ddrc, sw_done, DFIMISC, DFI_FREQUENCY_MASK, SWCTL, SWSTAT};
+use crate::hw::{wait, Error, Hw};
 use crate::para::Para;
 
 use super::prog::{self, Ctx};
@@ -55,11 +55,21 @@ pub fn load_imem<H: Hw>(hw: &mut H, fw: &PhyFirmware) {
 
 /// Step E: the controller's DFI frequency (pstate) and DRAM0_CLK's divider
 /// for `pstate`.
-pub fn set_dfi_clk<H: Hw>(hw: &mut H, p: &Para, pstate: u32) {
-    for ch in 0..2 {
+pub fn set_dfi_clk<H: Hw>(hw: &mut H, p: &Para, pstate: u32) -> Result<(), Error> {
+    if pstate >= 4 {
+        return Err(Error::Config("DFI pstate outside 0..4"));
+    }
+    // Use the same quasi-dynamic SWCTL/SWSTAT handshake as controller
+    // initialization. A stale asserted acknowledgement must clear before
+    // changing DFIMISC; every active controller must then acknowledge the
+    // new value before the shared clock or later PHY training can proceed.
+    for ch in 0..p.channels() {
         hw.write32(ddrc(ch, SWCTL), 0);
+        wait(hw, "DFI frequency SWSTAT clear", 100_000, |hw| {
+            hw.read32(ddrc(ch, SWSTAT)) & 1 == 0
+        })?;
         hw.clrset32(ddrc(ch, DFIMISC), DFI_FREQUENCY_MASK, pstate << 8);
-        hw.write32(ddrc(ch, SWCTL), 1);
+        sw_done(hw, ch)?;
     }
     const DRAM0_CLK: usize = 0x0200_2c00;
     hw.clr32(DRAM0_CLK, 7 << 24);
@@ -72,6 +82,7 @@ pub fn set_dfi_clk<H: Hw>(hw: &mut H, p: &Para, pstate: u32) {
     hw.write32(DRAM0_CLK, v);
     hw.write32(DRAM0_CLK, v | (1 << 27));
     hw.udelay(1000);
+    Ok(())
 }
 
 /// Step F: the message block and the firmware's data image.
@@ -127,7 +138,7 @@ pub fn init<H: Hw>(hw: &mut H, p: &mut Para, fw: &PhyFirmware, rl: u32) -> Resul
     for ps in [1, 2, 3, 0] {
         let c = ctx(p, fw, ps);
         prog::run(hw, tables::C_PSTATE, &c, freq::config);
-        set_dfi_clk(hw, p, ps);
+        set_dfi_clk(hw, p, ps)?;
         load_dmem(hw, p, fw, ps, rl);
         csr_access(hw, true);
         prog::run(hw, tables::CA_REMAP, &c, freq::config);
