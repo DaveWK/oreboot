@@ -836,6 +836,52 @@ pub const fn cbt_pass_bits(echo: [u16; 4], bits: u16) -> u16 {
     pass
 }
 
+/// The run of set bits in a circular `n`-bit map that contains point `pref`,
+/// or else the run whose center is circularly nearest to it (ties: the
+/// longer, then the first found): (start, len); (0, 0) for an empty map.
+/// Used to pick one of several equivalent windows (the CA delay passes once
+/// per 256 units) consistently around a reference point.
+pub fn run_near(map: u128, n: u32, pref: u32) -> (u32, u32) {
+    let full = if n == 128 {
+        u128::MAX
+    } else {
+        (1u128 << n) - 1
+    };
+    let map = map & full;
+    if map == 0 {
+        return (0, 0);
+    }
+    if map == full {
+        return (0, n);
+    }
+    let bit = |i: u32| map >> (i % n) & 1 != 0;
+    // Enumerate runs starting after a zero.
+    let mut best: Option<((u32, u32), u32)> = None;
+    for start in 0..n {
+        if !bit(start) || bit(start + n - 1) {
+            continue;
+        }
+        let mut len = 0;
+        while len < n && bit(start + len) {
+            len += 1;
+        }
+        let contains = (pref + n - start) % n < len;
+        // Doubled coordinates: center = 2 start + len - 1.
+        let c2 = (2 * start + len - 1) % (2 * n);
+        let p2 = 2 * (pref % n);
+        let d = c2.abs_diff(p2);
+        let dist = if contains { 0 } else { d.min(2 * n - d) };
+        let better = match best {
+            None => true,
+            Some(((_, bl), bd)) => dist < bd || (dist == bd && len > bl),
+        };
+        if better {
+            best = Some(((start, len), dist));
+        }
+    }
+    best.map(|b| b.0).unwrap_or((0, 0))
+}
+
 /// Longest run of set bits in a circular `n`-bit window map: (start, len).
 pub fn longest_run(map: u128, n: u32) -> (u32, u32) {
     let full = if n == 128 {

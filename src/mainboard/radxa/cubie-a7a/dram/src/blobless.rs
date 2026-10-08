@@ -11,7 +11,8 @@ use crate::hw::{Error, Hw};
 use crate::para::Para;
 use crate::phy::prog::{self, Kind, Op};
 use crate::phy::{
-    coldinit, csr, csr_access, freq, init, sequence, tables, MICRO_CONT_MUX_SEL, MICRO_RESET,
+    coldinit, csr, csr_access, devinit, freq, init, sequence, tables, MICRO_CONT_MUX_SEL,
+    MICRO_RESET,
 };
 use crate::{ccu, ctrl, power};
 
@@ -276,6 +277,8 @@ pub enum ExecFailure {
     LoopBusy(u16),
     /// A loop did not report Done within the poll budget after OLRC cleared.
     LoopEnd(u16),
+    /// DevInit before reset release failed.
+    Devinit(devinit::DevinitError),
 }
 
 /// Outcome of a cold-init execution.
@@ -448,9 +451,9 @@ pub fn cold_init_cbt<H: Hw>(
 /// Diagnostic run: AsyncDbyteRxData of all four DBYTEs is sampled before the
 /// DevInit prefix, after it (DRAM still in reset), after reset release and
 /// part 1, after part 2 (CBT entered), and after every CBT pattern at each of
-/// `delays`. The provisional [`prefix`](crate::phy::prefix) (impedance and DLL
-/// set-up, DBYTE calibration runs, CKE control) runs first, then the
-/// firmware's pre-release delay launch. Call after [`pre_training`].
+/// `delays`. [`devinit::pre_release`] (impedance and DLL set-up, RxReplica
+/// calibration, CKE control) runs first, then the firmware's pre-release
+/// delay launch. Call after [`pre_training`].
 pub fn cold_init_diag<H: Hw>(
     hw: &mut H,
     m1: &coldinit::Mrs,
@@ -470,7 +473,8 @@ pub fn cold_init_diag<H: Hw>(
         loop_run: 0,
         mem_reset: 3,
     };
-    bring_up_to_cbt(&mut ex, m1, m2, &mut |ex| sample(ex));
+    let mut dev = devinit::DevinitReport::default();
+    bring_up_to_cbt(&mut ex, m1, m2, &mut dev, &mut |ex| sample(ex));
     for &d in delays {
         coldinit::cbt_point_bytes(d, &ALL, &mut |s| ex.step(s));
     }
@@ -486,23 +490,23 @@ pub fn cold_init_part1<H: Hw>(hw: &mut H, mrs: &coldinit::Mrs) -> ColdInitReport
 }
 
 /// Bring the DRAM from reset to command bus training on channel A, rank 0:
-/// provisional DevInit prefix, pre-release delay launch, reset release,
+/// DevInit before reset release ([`devinit::pre_release`]), pre-release
+/// delay launch, reset release,
 /// parts 1 and 2. `checkpoint` runs before the prefix, after it, after part 1
 /// and after part 2.
 fn bring_up_to_cbt<H: Hw>(
     ex: &mut Executor<H>,
     m1: &coldinit::Mrs,
     m2: &coldinit::Mrs2,
+    dev: &mut devinit::DevinitReport,
     checkpoint: &mut impl FnMut(&mut Executor<H>),
 ) {
-    use crate::phy::prefix::{PrefixOp, PREFIX};
     ex.mem_reset = 2;
     checkpoint(ex);
-    for op in PREFIX {
-        match *op {
-            PrefixOp::Write(c, v) => ex.step(coldinit::Step::Write(c, v)),
-            PrefixOp::Wait(us) => ex.hw.udelay(us),
-        }
+    devinit::pre_release(ex.hw, dev);
+    if let Some(e) = dev.failure {
+        ex.r.failure = Some(ExecFailure::Devinit(e));
+        return;
     }
     let delay_row = [coldinit::Row::nop(0x1b00), coldinit::Row::EMPTY];
     ex.step(coldinit::Step::Launch {
@@ -608,7 +612,11 @@ impl<H: Hw> Executor<'_, H> {
                 let bit = moved.trailing_zeros() as usize;
                 out.lane_bit[lane] = bit as u8;
                 out.lane_maps[lane] = maps[bit];
-                out.lane_runs[lane] = coldinit::longest_run(maps[bit] as u128, LANE_SWEEP_POINTS);
+                // The window at the same period as the common center (the CA
+                // delay passes once per 256 units).
+                let pref = out.common_center as u32 / LANE_SWEEP_STEP as u32;
+                out.lane_runs[lane] =
+                    coldinit::run_near(maps[bit] as u128, LANE_SWEEP_POINTS, pref);
                 let (s, l) = out.lane_runs[lane];
                 out.lane_delay[lane] = (((s + l / 2) % LANE_SWEEP_POINTS) as u16) * LANE_SWEEP_STEP;
             } else {
@@ -705,6 +713,8 @@ pub struct CaTrainReport {
     pub done: u8,
     /// Per channel (A, B); applied to the AC blocks after the last block.
     pub channels: [ChannelCa; 2],
+    /// DevInit before reset release.
+    pub devinit: devinit::DevinitReport,
 }
 
 impl CaTrainReport {
@@ -713,6 +723,7 @@ impl CaTrainReport {
         blocks: [BlockTrain::EMPTY; 8],
         done: 0,
         channels: [ChannelCa::EMPTY; 2],
+        devinit: devinit::DevinitReport::EMPTY,
     };
 }
 
@@ -733,7 +744,8 @@ pub fn combine_channel(blocks: &[BlockTrain; 8], ch: usize) -> ChannelCa {
             }
             map &= b.lane_maps[lane];
         }
-        out.runs[lane] = coldinit::longest_run(map as u128, LANE_SWEEP_POINTS);
+        let pref = set[0].lane_delay[lane] as u32 / LANE_SWEEP_STEP as u32;
+        out.runs[lane] = coldinit::run_near(map as u128, LANE_SWEEP_POINTS, pref);
         let (s, l) = out.runs[lane];
         out.delay[lane] = if l == 0 {
             set[0].lane_delay[lane]
@@ -765,7 +777,7 @@ pub fn cold_init_ca_train<H: Hw>(
         loop_run: 0,
         mem_reset: 3,
     };
-    bring_up_to_cbt(&mut ex, m1, m2, &mut |_| {});
+    bring_up_to_cbt(&mut ex, m1, m2, &mut out.devinit, &mut |_| {});
     for (i, b) in coldinit::CBT_BLOCKS.iter().enumerate() {
         if ex.r.failure.is_some() {
             break;

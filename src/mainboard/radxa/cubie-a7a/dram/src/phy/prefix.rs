@@ -10,6 +10,10 @@
 //! 0x1n0d0..d5 reads) is omitted; values it derived under the emulator's
 //! synthetic inputs (0x1n0d9) are replayed as recorded. To be replaced by
 //! understood, parameterized code group by group.
+//!
+//! Superseded on the blobless path by [`devinit`](super::devinit), which
+//! writes the same values under the oracle's inputs; kept as the recorded
+//! reference until hardware has confirmed it.
 
 /// One prefix operation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

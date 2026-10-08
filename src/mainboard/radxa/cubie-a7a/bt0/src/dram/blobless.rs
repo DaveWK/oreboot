@@ -111,6 +111,21 @@ pub fn init_one(para: &[u32; 32]) -> Option<u32> {
                 "[dram] blobless: CA train: {} blocks, {} launches ({} witnessed, max {} busy polls), {} us, failure {:?}",
                 t.done, e.launches, e.witnessed, e.busy_max, e.elapsed_us, e.failure
             );
+            let d = &t.devinit;
+            println!(
+                "[dram] blobless: devinit: failure {:?}, ZCalRate {:04x}, ZCalBusy {:04x} -> {:04x} after wait, {} polls",
+                d.failure, d.zcal_rate, d.zcal_busy_start, d.zcal_busy_after_wait, d.zcal_polls
+            );
+            println!(
+                "[dram] blobless: devinit: RxReplicaCtl04 {:04x}, after broadcast {:04x?}; DllLockParam {}; LCDL status AC {:04x} DX {:04x}",
+                d.ctl04_before, d.ctl04_after, d.dll_lock_param, d.lcdl_status[0], d.lcdl_status[1]
+            );
+            for (n, r) in d.replica.iter().enumerate() {
+                println!(
+                    "[dram] blobless: devinit: DBYTE {n} replica phases {:?} Ph1UI {} select {} ratio {}",
+                    r.phases, r.ph1ui, r.select, r.ratio
+                );
+            }
             for (i, (b, r)) in cubie_a7a_dram::phy::coldinit::CBT_BLOCKS
                 .iter()
                 .zip(t.blocks.iter())
