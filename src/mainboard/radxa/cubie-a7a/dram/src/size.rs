@@ -23,11 +23,23 @@ pub fn size_mib(p: &Para) -> u32 {
 }
 
 const DRAM_BASE: usize = 0x4000_0000;
+/// Existing boot smoke-test footprint per region. This bounds software work;
+/// it is not full-RAM coverage or an independently measured timing margin.
+pub const MAX_QUICK_WORDS: usize = 4096;
 
 /// Write `words` incrementing patterns at the start of DRAM and at its
 /// middle (`mib / 2`), read both back. Catches a dead or swapped channel,
 /// rank or high address line, not marginal timing.
 pub fn quick_test<H: Hw>(hw: &mut H, mib: u32, words: usize) -> Result<(), Error> {
+    // The AArch32 boot consumer checks at most the first 4096 MiB, using two
+    // disjoint <=16KiB regions at base and midpoint. Reject empty checks,
+    // overlapping/invalid regions and oversized work before the first access.
+    // These limits keep every address representable on the actual 32-bit CPU.
+    if !(2..=4096).contains(&mib) || words == 0 || words > MAX_QUICK_WORDS {
+        return Err(Error::Config(
+            "quick-test size/word count outside bounded boot footprint",
+        ));
+    }
     let half = ((mib / 2) as usize) << 20;
     for i in 0..words {
         hw.write32(DRAM_BASE + 4 * i, 0x0123_4567u32.wrapping_add(i as u32));

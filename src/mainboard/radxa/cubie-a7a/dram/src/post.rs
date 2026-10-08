@@ -16,6 +16,11 @@ const T: u64 = 100_000;
 /// dfi_init_complete, release the PHY's R_PRCM isolation, leave the
 /// controller's self-refresh and wait for normal operation.
 pub fn dfi_init<H: Hw>(hw: &mut H, channels: usize) -> Result<(), Error> {
+    if !(1..=2).contains(&channels) {
+        return Err(Error::Config(
+            "DFI channel count outside controller instances",
+        ));
+    }
     for ch in 0..channels {
         hw.write32(ddrc(ch, SWCTL), 0);
     }
