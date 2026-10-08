@@ -16,9 +16,12 @@ use crate::smhc::{Smhc, BLOCK_SIZE};
 
 /// Where the BROM loads eGON images and the vendor SPL expects to run.
 const SPL_BASE: usize = 0x0004_7000;
-/// SHARED_SRAM (0x74000..0xf3fff) above bt0's image, bss and stack.
-const STAGING: usize = 0x0007_a000;
-const STUB: usize = 0x000c_4000;
+/// SHARED_SRAM (0x74000..0xf3fff) above bt0's image, bss and stack (bt0's
+/// linker script ends them below 0x90000). The stub sits above the largest
+/// SPL (0x4a000) and below fwlog's early buffer at 0xf0000. The copy runs
+/// upwards with the destination below the source, so overlapping is safe.
+const STAGING: usize = 0x0009_0000;
+const STUB: usize = 0x000e_0000;
 const SPL_MAX: usize = STUB - STAGING;
 
 const WDT_CTRL: usize = recovery::WDT0_BASE + 0x0c;
