@@ -378,10 +378,11 @@ extern "C" fn main() -> ! {
     // the SRAM log into this boot's (cubie_a7a_common::fwlog).
     cubie_a7a_common::fwlog::start_dram();
     soc::stage(7);
-    let dram_size = dram_mb as usize * 1024 * 1024;
+    // 64-bit: 4 GiB does not fit bt0's 32-bit usize (it wrapped to 0).
+    let dram_size = dram_mb as u64 * 1024 * 1024;
     println!("[bt0] DRAM: {dram_mb} MiB");
     // Only test what fits the 32-bit address space for now.
-    let test_size = dram_size.min(0xc000_0000 - mem::DRAM_BASE);
+    let test_size = dram_size.min((0xc000_0000 - mem::DRAM_BASE) as u64) as usize;
     if let Err((a, want, got)) = dram::test(mem::DRAM_BASE, test_size) {
         println!("[bt0] DRAM test failed at {a:08x}: wrote {want:08x}, read {got:08x}");
         halt();
@@ -389,7 +390,7 @@ extern "C" fn main() -> ! {
     let dram_end = mem::DRAM_BASE + test_size;
 
     // Raise the CPU clocks only now: libdram trained at the boot clocks
-    // (as with SyterKit and the vendor SPL) and hung after a boost.
+    // (as SyterKit and the vendor SPL do).
     if let Some(p) = dram::pmic() {
         dvfs::boost(p);
         ccu::dump();
@@ -407,7 +408,7 @@ extern "C" fn main() -> ! {
         magic: HANDOFF_MAGIC,
         version: HANDOFF_VERSION,
         dram_base: mem::DRAM_BASE as u64,
-        dram_size: dram_size as u64,
+        dram_size,
         soc_version: version,
         hosc_mhz: hosc,
         bt0_done_ticks: 0,
