@@ -6,8 +6,9 @@
 //! for other pstates or parts. No vendor instructions or firmware bytes are
 //! included. This module does not execute the programs or claim training.
 //!
-//! The hardware binding still needs the surrounding MR/control sequence,
-//! bounded completion, and real DTSM feedback. The flat emulator's repeated
+//! Calibration entry and normal cleanup are described as control steps. The
+//! hardware binding still needs measurement-clock transitions, bounded
+//! completion, qualified register aliases, and real DTSM feedback. The flat emulator's repeated
 //! zero error counts and final delay zero are not a hardware search result.
 
 use super::coldinit::Row;
@@ -16,6 +17,296 @@ use super::coldinit::Row;
 pub enum Rank {
     R0,
     R1,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Channel {
+    A,
+    B,
+}
+
+impl Channel {
+    const fn enables(self) -> (u16, u16) {
+        match self {
+            Self::A => (3, 0),
+            Self::B => (0, 3),
+        }
+    }
+
+    const fn override_mask(self) -> u16 {
+        match self {
+            Self::A => 0xf0,
+            Self::B => 0x0f,
+        }
+    }
+
+    const fn inactive_first_byte(self) -> u32 {
+        match self {
+            Self::A => 2,
+            Self::B => 0,
+        }
+    }
+}
+
+/// Describes a reference control action, without executing it. `Launch` uses
+/// an explicit finite outer-loop count; it is not the CBT infinite-loop step.
+/// Hardware binding must independently establish ownership and bounded
+/// completion, and must not change an unknown register alias into a guess.
+pub enum Step<'a> {
+    Write(u32, u16),
+    Launch { rows: &'a [Row], outer: u16 },
+}
+
+/// MR18 before the two calibration-mode bits are asserted. The source of
+/// this value must be the selected part/pstate's verified mode registers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Mr18Base(u8);
+
+impl Mr18Base {
+    pub const fn new(value: u8) -> Option<Self> {
+        if value & 0xc0 != 0 {
+            None
+        } else {
+            Some(Self(value))
+        }
+    }
+}
+
+fn writes(values: &[(u32, u16)], out: &mut impl FnMut(Step<'_>)) {
+    for &(csr, value) in values {
+        out(Step::Write(csr, value));
+    }
+}
+
+/// Count-clear pulse observed for all nine DTSM lanes, including the extra
+/// clear bit. Its semantics beyond this matching register-family observation
+/// remain a prerequisite of the eventual hardware adapter.
+pub fn clear_counts(out: &mut impl FnMut(Step<'_>)) {
+    for value in [0, 0x1ff, 0x3ff, 0x1ff, 0] {
+        out(Step::Write(0x1f0bb, value));
+    }
+}
+
+/// MR18 in the observed two-edge encoding, with explicit rank control on
+/// both rows. `base` is an input, not a guessed derivation from a parameter
+/// set; the independent reference currently covers base=0x0c only.
+fn mr18_rows(rank: Rank, value: u8, long_tail: bool, first_clock: bool) -> [Row; 6] {
+    let mut rows = [Row::EMPTY; 6];
+    let edges = super::coldinit::mrw_ddr(rank.cs(), 18, value);
+    rows[0] = Row::raw(
+        edges[0].0[0],
+        0,
+        0,
+        rank.control() | if first_clock { 0x400 } else { 0 },
+    );
+    rows[1] = Row::raw(edges[1].0[0], 0, 0, rank.control());
+    if long_tail {
+        rows[2] = Row::nop(0x0b00);
+        rows[3] = Row::nop(0x0800);
+        rows[4] = Row::nop(0x0b00);
+        rows[5] = Row::nop(0x1000);
+    } else {
+        rows[2] = Row::nop(0x7b00);
+        rows[3] = Row::nop(0x0400);
+    }
+    rows
+}
+
+/// The first fifteen launches of one observed WL block, stopping immediately
+/// after the calibration-mode MRW is restored. No synthetic TrainingCntr or
+/// TxWckDly value is replayed. The caller must preserve the pre-block controls
+/// first, then acquire the actual per-DBYTE TrainingCntr results after this
+/// boundary. MR18 base bits 7/6 are supplied clear by the caller.
+pub fn calibration_prefix(
+    channel: Channel,
+    rank: Rank,
+    mr18_base: Mr18Base,
+    out: &mut impl FnMut(Step<'_>),
+) {
+    let (a, b) = channel.enables();
+    writes(
+        &[
+            (0x20072, a),
+            (0x20073, b),
+            (0x2007e, 0),
+            (0x2007a, channel.override_mask()),
+            (0x2000d, 8),
+        ],
+        out,
+    );
+    for db in 0..5 {
+        out(Step::Write(0x10000 + db * 0x1000, 8));
+    }
+    writes(
+        &[
+            (0x2f0a0, 1),
+            (0x2f0a0, 0),
+            (0x200a3, 1),
+            (0x200a3, 0),
+            (0x70011, 0),
+            (0x1f097, 0),
+            (0x1f0b0, 8),
+            (0x1f0b1, 0x40),
+            (0x2f057, 0xaa),
+        ],
+        out,
+    );
+    let mut rows = [Row::EMPTY; 12];
+    rows[0] = Row::raw((rank.cs() as u16) << 14, 0x4000, 1, rank.control());
+    rows[6] = Row::nop(0x2b00);
+    rows[8] = Row::raw((rank.cs() as u16) << 14, 0, 1, rank.control());
+    out(Step::Launch {
+        rows: &rows,
+        outer: 0,
+    });
+    writes(
+        &[
+            (0x1f08a, 0xff),
+            (0x1f089, 0xff),
+            (0x1f08b, 0),
+            (0x1f00a, 0),
+            (0x1f005, 1),
+            (0x1f094, 0),
+            (0x1f00b, 2),
+            (0x20041, 1),
+            (0x2002a, 1),
+            (0x2003f, 0x1014),
+            (0x1f093, 0x200),
+            (0x1f005, 1),
+        ],
+        out,
+    );
+    out(Step::Launch {
+        rows: &mr18_rows(rank, mr18_base.0 | 0x80, true, false),
+        outer: 0,
+    });
+    writes(
+        &[
+            (0x1ffb5, 0),
+            (0x1f0b5, 1),
+            (0x1f4b5, 1),
+            (0x1f0b3, 0),
+            (0x1f0b4, 0),
+            (0x1f0b9, 1),
+            (0x1f0ba, 1),
+            (0x1f0b1, 2),
+            (0x7f060, 1),
+            (0x7f065, 0x1ff),
+            (0x7ff28, 0xffff),
+            (0x7ff29, 0xffff),
+            (0x7ff2a, 0xffff),
+            (0x7ff2b, 0xffff),
+            (0x1ffbe, 0),
+            (0x1f0be, 1),
+            (0x1f4be, 0x10),
+            (0x1ffaa, 0x2000),
+            (0x1f0a7, 0x300),
+        ],
+        out,
+    );
+    clear_counts(out);
+    for db in channel.inactive_first_byte()..channel.inactive_first_byte() + 2 {
+        out(Step::Write(0x10fb5 + db * 0x1000, 0));
+    }
+    out(Step::Launch {
+        rows: &mr18_rows(rank, mr18_base.0 | 0xc0, false, false),
+        outer: 0,
+    });
+    out(Step::Write(0x1f0a7, 0x6300));
+    let program = calibration_program(rank);
+    out(Step::Launch {
+        rows: &program,
+        outer: 8,
+    });
+    out(Step::Write(0x1f0a7, 0x300));
+    for _ in 0..10 {
+        out(Step::Launch {
+            rows: &program,
+            outer: 255,
+        });
+    }
+    out(Step::Launch {
+        rows: &mr18_rows(rank, mr18_base.0 | 0x80, false, false),
+        outer: 0,
+    });
+}
+
+/// Source CSRs saved by the reference before each block. Keep their actual
+/// observed values: channel/rank boundaries do not all start from reset.
+pub const SAVED_CSRS: [u32; 14] = [
+    0x10097, 0x10093, 0x10005, 0x1008b, 0x10095, 0x20074, 0x20057, 0x2002a, 0x2003f, 0x20041,
+    0x20037, 0x2003d, 0x2003e, 0x70011,
+];
+
+/// State captured before the block in `SAVED_CSRS` order. No fabricated default
+/// is provided. The reference restores these via broadcast addresses; those
+/// aliases are recorded here and still need qualification for hardware use.
+pub struct SavedControls(pub [u16; 14]);
+
+/// Cleanup after the caller has stopped measurement clocks and decided what
+/// to do with measured delay results. Does not accept or invent a trained
+/// result, nor restore a guessed zero delay. The caller must retain recovery
+/// on any incomplete launch; this generator is not an abort primitive.
+pub fn cleanup(
+    rank: Rank,
+    mr18_base: Mr18Base,
+    saved: &SavedControls,
+    out: &mut impl FnMut(Step<'_>),
+) {
+    writes(
+        &[
+            (0x1f00b, 0),
+            (0x1f005, 0),
+            (0x1f094, 0),
+            (0x1f00a, 1),
+            (0x1f08a, 0),
+            (0x1f089, 0),
+            (0x1f08c, 0),
+            (0x1f0b0, 0),
+            (0x1f0b1, 0),
+        ],
+        out,
+    );
+    out(Step::Launch {
+        rows: &[Row::nop(0x4b00), Row::EMPTY],
+        outer: 0,
+    });
+    out(Step::Launch {
+        rows: &mr18_rows(rank, mr18_base.0, true, true),
+        outer: 0,
+    });
+    let mut rows = [Row::EMPTY; 12];
+    rows[0] = Row::nop(0x0400);
+    rows[4] = Row::raw(6, 4, 0, rank.control());
+    rows[6] = Row::nop(0x4b00);
+    rows[7] = Row::nop(0x1000);
+    out(Step::Launch {
+        rows: &rows,
+        outer: 0,
+    });
+    writes(
+        &[(0x20079, 1), (0x20079, 0), (0x2f0a0, 1), (0x2f0a0, 0)],
+        out,
+    );
+    for (target, index) in [
+        (0x1f097, 0),
+        (0x1f093, 1),
+        (0x1f005, 2),
+        (0x1f08b, 3),
+        (0x1f095, 4),
+        (0x2f074, 5),
+        (0x2f057, 6),
+        (0x2f02a, 7),
+        (0x2f03f, 8),
+        (0x2f041, 9),
+        (0x2f037, 10),
+        (0x2f03f, 8),
+        (0x2f03d, 11),
+        (0x2f03e, 12),
+        (0x7f011, 13),
+    ] {
+        out(Step::Write(target, saved.0[index]));
+    }
 }
 
 impl Rank {
