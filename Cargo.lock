@@ -361,6 +361,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "cubie-a7a-dram"
+version = "0.1.0"
+
+[[package]]
 name = "d1-pac"
 version = "0.0.31"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -815,6 +819,7 @@ name = "oreboot-cubie-a7a-bt0"
 version = "0.1.0"
 dependencies = [
  "cubie-a7a-common",
+ "cubie-a7a-dram",
  "log 0.1.0",
  "util",
 ]
