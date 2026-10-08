@@ -12,7 +12,15 @@
 //! (whose names STMicroelectronics publishes in TF-A's
 //! drivers/st/ddr/phy/phyinit, BSD-3-Clause).
 
+pub mod freq;
 pub mod fw;
+pub mod init;
+pub mod msgblock;
+pub mod prog;
+#[rustfmt::skip]
+pub mod tables;
+
+pub use init::PhyFirmware;
 
 use crate::hw::Hw;
 
