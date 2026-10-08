@@ -75,7 +75,14 @@ pub enum Error {
     },
 }
 
-/// Poll `cond` until it holds, failing after `timeout_us`.
+/// Independent software cap for controller/MR/DFI polling. This is not a
+/// characterized physical timing margin; individual callbacks must return.
+pub const WAIT_MAX_POLLS: u32 = 10_000_000;
+
+/// Poll `cond` before each timeout check, including the final permitted poll.
+/// A frozen clock is bounded by WAIT_MAX_POLLS; wrapping elapsed time avoids
+/// absolute deadline overflow. A zero deadline permits one immediate check.
+/// Do not log on the failure path here: the UART can have its own dependencies.
 pub fn wait<H: Hw>(
     hw: &mut H,
     what: &'static str,
@@ -83,13 +90,13 @@ pub fn wait<H: Hw>(
     mut cond: impl FnMut(&mut H) -> bool,
 ) -> Result<(), Error> {
     let t0 = hw.now_us();
-    loop {
+    for polls in 1..=WAIT_MAX_POLLS {
         if cond(hw) {
             return Ok(());
         }
-        if hw.now_us().wrapping_sub(t0) > timeout_us {
-            hw.log(format_args!("[dram] timeout: {what}\n"));
+        if polls == WAIT_MAX_POLLS || hw.now_us().wrapping_sub(t0) >= timeout_us {
             return Err(Error::Timeout(what));
         }
     }
+    unreachable!()
 }
