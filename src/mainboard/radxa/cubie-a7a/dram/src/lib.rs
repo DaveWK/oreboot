@@ -27,7 +27,7 @@ use ctrl::{ddrc, DDRC_184, DDRC_B84, PWRCTL};
 /// Controllers and PHY of every channel: clocks, controller set-up, PHY
 /// training, DFI handshake. Returns after the controllers run normally.
 pub fn core_init<H: Hw>(hw: &mut H, p: &mut Para, fw: &PhyFirmware) -> Result<(), Error> {
-    ccu::sys_init(hw, p.clk());
+    ccu::sys_init(hw, p.clk())?;
     let channels = p.channels();
     ctrl::com_pre_init(hw, p);
     for ch in 0..channels {
@@ -71,6 +71,7 @@ pub fn init<H: Hw>(hw: &mut H, p: &mut Para, fw: &PhyFirmware) -> Result<u32, Er
             "geometry scan (tpr13[0] clear) is not supported",
         ));
     }
+    ccu::validate_pll_ddr_rate(p.clk())?;
     ccu::pad_calibration(hw);
     let vddq = power::set_rails(hw, p)?;
     hw.log(format_args!("[dram] VDDQ {vddq} mV\n"));
