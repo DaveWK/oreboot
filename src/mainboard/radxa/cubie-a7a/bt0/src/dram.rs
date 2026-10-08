@@ -614,3 +614,73 @@ pub unsafe extern "C" fn mctl_com_set_controller_after_phy(para: *const u32) {
     }
     println!("[dram] controller after PHY: done");
 }
+
+// ---------------------------------------------------------------------------
+// LPDDR5 mode register access through the controller (replaces the
+// library's lp5_sw_mr_wr / lp5_sw_mr_rd, which the build weakens): the same
+// MRCTRL0/MRCTRL1/MRSTAT sequence, with timeouts and a log line per access.
+
+const MRCTRL0: usize = 0x080;
+const MRCTRL1: usize = 0x084;
+const MRSTAT: usize = 0x090;
+const MR_TIMEOUT_TICKS: u64 = soc::TIMER_HZ / 10;
+
+/// Wait until `cond` holds; false (with a report) after 100 ms.
+fn mr_wait(what: &str, ch: usize, mut cond: impl FnMut() -> bool) -> bool {
+    let t0 = soc::ticks();
+    while !cond() {
+        if soc::ticks() - t0 > MR_TIMEOUT_TICKS {
+            println!(
+                "[dram] ch{ch}: {what} timed out (MRCTRL0 {:08x} MRSTAT {:08x})",
+                read32(mctl(ch, MRCTRL0)),
+                read32(mctl(ch, MRSTAT))
+            );
+            return false;
+        }
+    }
+    true
+}
+
+fn mr_idle(ch: usize) -> bool {
+    mr_wait("MRSTAT.mr_wr_busy", ch, || read32(mctl(ch, MRSTAT)) & 1 == 0)
+}
+
+fn mr_done(ch: usize) -> bool {
+    mr_wait("MRCTRL0.mr_wr", ch, || read32(mctl(ch, MRCTRL0)) & (1 << 31) == 0)
+}
+
+/// Write MR `mr` of both ranks of channel `ch` (rank 0 gets `v0`, rank 1 `v1`).
+#[unsafe(no_mangle)]
+pub extern "C" fn lp5_sw_mr_wr(ch: u32, mr: u32, v0: u32, v1: u32) {
+    let ch = ch as usize;
+    println!("[dram] ch{ch}: MR{mr} <- {v0:#x}/{v1:#x}");
+    for (rank_bit, v) in [(0x10, v0), (0x20, v1)] {
+        mr_idle(ch);
+        write32(mctl(ch, MRCTRL0), rank_bit);
+        write32(mctl(ch, MRCTRL1), (mr << 8) | v);
+        write32(mctl(ch, MRCTRL0), (1 << 31) | rank_bit);
+        mr_done(ch);
+    }
+}
+
+/// Read MR `mr` of rank `rank` of channel `ch`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lp5_sw_mr_rd(para: *const u32, ch: u32, rank: u32, mr: u32) -> u32 {
+    let ty = unsafe { para.add(1).read_volatile() };
+    let c = ch as usize;
+    let rank_bit = 1u32 << (rank + 4);
+    mr_idle(c);
+    write32(mctl(c, MRCTRL0), rank_bit | 1);
+    write32(mctl(c, MRCTRL1), mr << 8);
+    write32(mctl(c, MRCTRL0), (1 << 31) | rank_bit | 1);
+    mr_done(c);
+    let v = if ty == 8 && ch == 1 {
+        read32(0x0a02_0040) & 0xff
+    } else if ch == 0 {
+        (read32(0x0a02_002c) >> 8) & 0xff
+    } else {
+        (read32(0x0a02_0040) >> 8) & 0xff
+    };
+    println!("[dram] ch{ch} rank{rank}: MR{mr} = {v:#04x}");
+    v
+}
