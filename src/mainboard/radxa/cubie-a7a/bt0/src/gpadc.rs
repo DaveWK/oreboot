@@ -33,7 +33,7 @@ const FULL_SCALE_MV: u32 = 1800;
 pub fn read_mv(channel: u32) -> Option<u32> {
     // module clock: gate on, SYS_CLK24M, M = 1
     write32(GPADC0_24M_CLK, 1 << 31);
-    ccu::bus_enable(GPADC0_BGR);
+    ccu::bus_enable(GPADC0_BGR).unwrap_or_else(|error| crate::clock_failure(error));
 
     // acquire time and sample-rate divider as in the vendor sequence
     clr_set_bits(GP_SR_CON, 0xffff_ffff, (0x1df << 16) | 0x164);

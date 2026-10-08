@@ -214,7 +214,7 @@ fn init_uart() {
     gpio::set_function(Port::B, 10, 2);
     gpio::set_pull(Port::B, 10, Pull::Up);
     ccu::uart_clock_24m();
-    ccu::bus_enable(ccu::UART0_BGR);
+    ccu::bus_enable(ccu::UART0_BGR).unwrap_or_else(|error| crate::clock_failure(error));
     cubie_a7a_common::fwlog::start_early();
     init_logger(Uart::init(UART0_BASE, UART_CLOCK_HZ, 115_200));
     UART_UP.store(true, Ordering::Relaxed);
@@ -229,7 +229,7 @@ fn init_pmic() -> Option<axp::Axp<'static>> {
     gpio::set_function(Port::L, 1, 2);
     gpio::set_pull(Port::L, 0, Pull::Up);
     gpio::set_pull(Port::L, 1, Pull::Up);
-    ccu::bus_enable(ccu::R_TWI0_BGR);
+    ccu::bus_enable(ccu::R_TWI0_BGR).unwrap_or_else(|error| crate::clock_failure(error));
     let twi: &'static Twi = unsafe {
         let t = &mut *addr_of_mut!(TWI);
         t.replace(Twi::new(R_TWI0_BASE));

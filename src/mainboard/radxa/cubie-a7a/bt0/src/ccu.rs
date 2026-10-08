@@ -1,8 +1,6 @@
 //! Clock control wrappers over bounded production A733 control logic.
-//! Existing bus helpers retain their separate common-timer dependency.
-use crate::soc::{
-    clr_bits, clr_set_bits, hosc_khz, set_bits, udelay, CCU_BASE, CPU_PLL_CFG_BASE, R_PRCM_BASE,
-};
+//! Peripheral bus settling uses the same bounded production timer logic.
+use crate::soc::{clr_set_bits, hosc_khz, CCU_BASE, CPU_PLL_CFG_BASE, R_PRCM_BASE};
 use util::mmio::{read32, write32};
 #[path = "ccu_control.rs"]
 mod control;
@@ -29,8 +27,6 @@ pub const UART0_BGR: usize = CCU_BASE + 0xe00;
 pub const SMHC0_CLK: usize = CCU_BASE + 0xd00;
 pub const SMHC0_BGR: usize = CCU_BASE + 0xd0c;
 pub const R_TWI0_BGR: usize = R_PRCM_BASE + 0x19c;
-const BGR_GATE: u32 = 1 << 0;
-const BGR_RESET: u32 = 1 << 16;
 
 pub fn ref_pll_init() -> Result<u32, Error> {
     control::reference(&mut Native, hosc_khz())
@@ -65,13 +61,8 @@ pub fn uart_clock_24m() {
 }
 
 /// Ungate a peripheral's bus clock and release its reset.
-pub fn bus_enable(bgr: usize) {
-    clr_bits(bgr, BGR_RESET);
-    clr_bits(bgr, BGR_GATE);
-    udelay(5);
-    set_bits(bgr, BGR_RESET);
-    set_bits(bgr, BGR_GATE);
-    udelay(5);
+pub fn bus_enable(bgr: usize) -> Result<(), Error> {
+    control::bus_enable(&mut Native, bgr)
 }
 
 pub fn dump() {

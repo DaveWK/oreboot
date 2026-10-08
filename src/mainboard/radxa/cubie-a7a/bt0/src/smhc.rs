@@ -121,7 +121,7 @@ impl Smhc {
         }
         // Module clock: gate on, source OSC24M, N = M = 1.
         write32(ccu::SMHC0_CLK, 1 << 31);
-        ccu::bus_enable(ccu::SMHC0_BGR);
+        ccu::bus_enable(ccu::SMHC0_BGR).unwrap_or_else(|error| crate::clock_failure(error));
         Self {
             base,
             rca: 0,

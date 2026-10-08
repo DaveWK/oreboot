@@ -40,6 +40,8 @@ pub enum Phase {
     NsiDivider,
     NsiSource,
     Switch,
+    BusAssert,
+    BusRelease,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Error {
@@ -261,4 +263,24 @@ pub fn retune<H: Hw>(h: &mut H, hosc: u32, mhz: [u32; 3]) -> Result<(), Error> {
         switch(h, CPU_PLLS[i])?;
     }
     Ok(())
+}
+
+/// Preserve the existing peripheral bus reset/gate sequence, but require both
+/// settling intervals to complete. Failure leaves the last programmed state;
+/// no speculative rollback or peripheral readiness guarantee is implied.
+pub fn bus_enable<H: Hw>(h: &mut H, bgr: usize) -> Result<(), Error> {
+    change(h, bgr, 1 << 16, 0);
+    change(h, bgr, 1, 0);
+    delay(h, 5).map_err(|e| Error {
+        phase: Phase::BusAssert,
+        addr: bgr,
+        ..e
+    })?;
+    change(h, bgr, 0, 1 << 16);
+    change(h, bgr, 0, 1);
+    delay(h, 5).map_err(|e| Error {
+        phase: Phase::BusRelease,
+        addr: bgr,
+        ..e
+    })
 }

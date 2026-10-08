@@ -38,11 +38,6 @@ pub fn set_bits(addr: usize, bits: u32) {
 }
 
 #[inline]
-pub fn clr_bits(addr: usize, bits: u32) {
-    write32(addr, read32(addr) & !bits);
-}
-
-#[inline]
 pub fn clr_set_bits(addr: usize, clr: u32, set: u32) {
     write32(addr, (read32(addr) & !clr) | set);
 }
