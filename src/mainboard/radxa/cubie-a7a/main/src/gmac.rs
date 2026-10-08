@@ -34,9 +34,8 @@ const GMAC_PTP_CLK: usize = CCU + 0x1400;
 const GMAC0_PHY_CLK: usize = CCU + 0x1410;
 const GMAC0_BGR: usize = CCU + 0x141c;
 const MBUS_GATE_EN: usize = CCU + 0x05e4;
-/// Write-enable key for MBUS_GATE_EN_REG (ccu-sun60iw2.c
-/// `MBUS_GATE_KEY_VALUE`); the key bits read back as 0.
-const MBUS_GATE_KEY: u32 = 0x0004_0302;
+/// Ordinary R/W GMAC0 gate (A733 manual 4.1.6.84). The BSP's "key"
+/// overlaps VE/ISP/CSI gates and must not be ORed into this shared register.
 const MBUS_GMAC0: u32 = 1 << 11;
 
 const PIO: usize = 0x0200_0000;
@@ -206,7 +205,7 @@ fn clocks_and_resets() {
     write32(GMAC_PTP_CLK, 1 << 31);
     // 25 MHz PHY clock out on PH15: PERI0_150M / 6.
     write32(GMAC0_PHY_CLK, 1 << 31 | (6 - 1));
-    write32(MBUS_GATE_EN, read32(MBUS_GATE_EN) | MBUS_GATE_KEY | MBUS_GMAC0);
+    write32(MBUS_GATE_EN, read32(MBUS_GATE_EN) | MBUS_GMAC0);
     // Pulse both resets, then release them and open the bus gate.
     write32(GMAC0_BGR, 0);
     udelay(10);

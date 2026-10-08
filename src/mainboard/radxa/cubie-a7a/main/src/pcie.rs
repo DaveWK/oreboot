@@ -15,7 +15,7 @@
 //!   (96 MiB), PE11 power, PE12 wake, PE13 PERST#, max-link-speed 3.
 //! - vehoelite/edk2-a733 @ 44aeea5 SunxiPcieDxe and its research notes,
 //!   which brought an NVMe up from cold on the Orange Pi 4 Pro (same SoC):
-//!   the keyed bus-gate stray bits, the serdes reset after its clocks, the
+//!   the serdes reset after its clocks, the
 //!   100 MHz serdes config clock, training at Gen1 first.
 //!
 //! Rails: DCDC1 (3.3 V, always on), BLDO1 (PCIe 1.8 V) and CLDO5 (SERDES
@@ -40,16 +40,11 @@ use crate::ppu;
 
 // --- CCU (vendor ccu-sun60iw2.c) -------------------------------------------
 const CCU: usize = 0x0200_2000;
-/// AHB/MBUS master gates take a key in the same write; its low bits land
-/// on real gates, which edk2-a733 measured against a vendor boot and puts
-/// back (`*_STRAY`) unless they were already on.
+/// Ordinary R/W master gates (A733 manual 4.1.6.82/83). BSP "key"
+/// constants overlap other masters' gates; change only the SERDES fields.
 const AHB_GATE: usize = CCU + 0x05c0;
-const AHB_KEY: u32 = 0x0100_00ff;
-const AHB_STRAY: u32 = 0x0000_0007;
 const AHB_SERDES: u32 = 1 << 8;
 const MBUS_GATE: usize = CCU + 0x05e0;
-const MBUS_KEY: u32 = 0x4105_5800;
-const MBUS_STRAY: u32 = 0x0100_5000;
 const MBUS_SERDES: u32 = 1 << 28;
 const ITS_BGR: usize = CCU + 0x0574; // gate bit 1, reset bit 16
 const PCIE_AUX_CLK: usize = CCU + 0x1380; // sys24M, gate bit 31
@@ -244,20 +239,11 @@ fn pe_out(pin: u32, high: bool) {
     rmw32(PE_CFG1, 0xf << shift, 1 << shift);
 }
 
-fn keyed_gate(reg: usize, key: u32, stray: u32, gate: u32) {
-    let before = read32(reg);
-    write32(reg, before | key | gate);
-    let strays = stray & !before;
-    if strays != 0 {
-        write32(reg, read32(reg) & !strays);
-    }
-}
-
 /// sunxi_pcie_plat_clk_setup() plus the serdes side of
 /// sunxi_cadence_phy_combo1_pcie_init(), up to the PHY table.
 fn clocks_on() {
-    keyed_gate(AHB_GATE, AHB_KEY, AHB_STRAY, AHB_SERDES);
-    keyed_gate(MBUS_GATE, MBUS_KEY, MBUS_STRAY, MBUS_SERDES);
+    set32(AHB_GATE, AHB_SERDES);
+    set32(MBUS_GATE, MBUS_SERDES);
     // serdes config clock: PERI0 600M / 6 = 100 MHz (clk_set_rate 100 MHz)
     rmw32(SERDES_CFG_CLK, (7 << 24) | 0x1f, (1 << 24) | 5);
     set32(SERDES_CFG_CLK, GATE);

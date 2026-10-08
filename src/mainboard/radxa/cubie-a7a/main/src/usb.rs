@@ -47,19 +47,12 @@ use crate::ppu;
 
 const CCU: usize = 0x0200_2000;
 
-// Key-protected bus master gates (vendor ccu-sun60iw2.c). A write only
-// takes effect with the key in the same write; the key bits read back as
-// zero, so each update is read | key | gate. Only the gates the USB
-// controllers sit behind are set.
-//   0x05C0 AHB masters,  key 0x010000FF: usb-sys-ahb BIT9, serdes-ahb BIT8
-//   0x05E0 MBUS masters, key 0x41055800: msilite2 BIT31, serdes BIT28
-// Without them the EHCI DMA path is gated off: USBCMD.PSE/ASE never echo
-// into USBSTS.PSS/ASS.
+// Ordinary R/W bus-master gates (A733 manual 4.1.6.82/83). The BSP's
+// "key" constants overlap other masters' live gates; preserve those fields.
+// USB needs usb-sys/SERDES AHB bits9/8 and MSILITE2/SERDES MBUS bits31/28.
 const AHB_GATE: usize = 0x05c0;
-const AHB_GATE_KEY: u32 = 0x0100_00ff;
 const AHB_GATE_USB: u32 = (1 << 9) | (1 << 8);
 const MBUS_GATE: usize = 0x05e0;
-const MBUS_GATE_KEY: u32 = 0x4105_5800;
 const MBUS_GATE_USB: u32 = (1 << 31) | (1 << 28);
 /// CLK_MSI_LITE2 gate (bit 0), MSI_LITE2_AHB reset (bit 16), MSI_LITE2_MBUS
 /// reset (bit 17). The EHCI DT binding (sun60iw2p1.dtsi:2454) needs it;
@@ -222,10 +215,10 @@ fn clr(addr: usize, bits: u32) {
     write32(addr, read32(addr) & !bits);
 }
 
-fn keyed_gate(reg: usize, key: u32, gates: u32) {
+fn master_gate(reg: usize, gates: u32) {
     let old = read32(CCU + reg);
     if old & gates != gates {
-        write32(CCU + reg, old | key | gates);
+        write32(CCU + reg, old | gates);
     }
 }
 
@@ -251,8 +244,8 @@ fn poll(addr: usize, mask: u32, want: u32, timeout_us: u32) -> bool {
 
 fn ccu_init() {
     // 1. AHB and MBUS master gates for the USB and SERDES (dwc3) blocks.
-    keyed_gate(AHB_GATE, AHB_GATE_KEY, AHB_GATE_USB);
-    keyed_gate(MBUS_GATE, MBUS_GATE_KEY, MBUS_GATE_USB);
+    master_gate(AHB_GATE, AHB_GATE_USB);
+    master_gate(MBUS_GATE, MBUS_GATE_USB);
     // 1c. MSI_LITE2 gate and resets.
     set(CCU + MSI_LITE2, (1 << 0) | (1 << 16) | (1 << 17));
 
