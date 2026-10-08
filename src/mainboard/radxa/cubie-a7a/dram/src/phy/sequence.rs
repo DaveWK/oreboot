@@ -92,10 +92,10 @@ pub enum Cause<E> {
     Quarantined,
     Port(E),
     AlreadyRunning,
-    StaleDone,
-    /// No post-launch low Done was observed. A sequence that finishes before
-    /// the first read is deliberately not accepted: this source does not
-    /// document a clear/acknowledge operation or generation counter.
+    /// No post-launch low Done was observed and the port gave no independent
+    /// completion witness. Done also reads 1 while the ACSM is idle (measured
+    /// on the Cubie A7A, M2), so a set Done on the first poll alone cannot
+    /// distinguish a finished sequence from a launch that never started.
     NoBusyObserved,
     Timeout,
 }
@@ -112,6 +112,10 @@ pub struct Completion {
     pub polls: u16,
     pub busy_polls: u16,
     pub raw_done: u16,
+    /// Done as read before launch (1 while idle on the A733 PHY).
+    pub prior_done: u16,
+    /// Completion accepted on the port's witness rather than a busy poll.
+    pub witnessed: bool,
 }
 
 /// An eventual physical implementation must establish the matching register
@@ -128,6 +132,13 @@ pub trait Port {
     fn read_control(&mut self) -> Result<u16, Self::Error>;
     fn write_control(&mut self, value: u16) -> Result<(), Self::Error>;
     fn read_done(&mut self) -> Result<u16, Self::Error>;
+    /// Independent evidence that the sequence just launched has run to its
+    /// end, consulted only when Done is already set at the first poll (a
+    /// short sequence can finish before it). Default: none, so such a
+    /// completion is rejected as [`Cause::NoBusyObserved`].
+    fn completion_witness(&mut self) -> Result<bool, Self::Error> {
+        Ok(false)
+    }
 }
 
 pub struct DirectRun<P> {
@@ -172,13 +183,12 @@ impl<P: Port> DirectRun<P> {
         if control & RUN_BIT != 0 {
             return Err(before_launch(Cause::AlreadyRunning));
         }
+        // Done is not cleared by software: it reads 1 while idle. It is
+        // recorded, and freshness comes from the post-launch observation.
         let prior_done = self
             .port
             .read_done()
             .map_err(|e| before_launch(Cause::Port(e)))?;
-        if prior_done & DONE_BIT != 0 {
-            return Err(before_launch(Cause::StaleDone));
-        }
 
         // The source defines start as a 0->1 edge. Preserve every other field,
         // including PIE-managed AcsmProgPtr; no translation mode is invented.
@@ -191,13 +201,16 @@ impl<P: Port> DirectRun<P> {
             for count in 1..=polls {
                 let raw_done = self.port.read_done().map_err(Cause::Port)?;
                 if raw_done & DONE_BIT != 0 {
-                    if busy_polls == 0 {
+                    let witnessed = busy_polls == 0;
+                    if witnessed && !self.port.completion_witness().map_err(Cause::Port)? {
                         return Err(Cause::NoBusyObserved);
                     }
                     return Ok(Completion {
                         polls: count,
                         busy_polls,
                         raw_done,
+                        prior_done,
+                        witnessed,
                     });
                 }
                 busy_polls += 1;

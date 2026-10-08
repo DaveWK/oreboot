@@ -143,9 +143,13 @@ pub const MEM_RESET_L: u32 = 0x20060;
 
 /// [`sequence::Port`] on the PHY CSRs for the firmware-free path. Preflight
 /// requires what [`pre_training`] establishes: PMU stalled (MicroReset 1),
-/// DRAM held in reset (MemResetL 2); it then selects host CSR access.
+/// DRAM held in reset (MemResetL 2); it then selects host CSR access and
+/// records ACSMLastAddr. The completion witness is ACSMLastAddr reaching
+/// `stop` from a different value.
 pub struct PhyPort<'a, H: Hw> {
     pub hw: &'a mut H,
+    pub stop: u16,
+    pub prior_last: u16,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -167,6 +171,7 @@ impl<H: Hw> sequence::Port for PhyPort<'_, H> {
             csr_access(self.hw, false);
             return Err(PortError::DramNotInReset(reset));
         }
+        self.prior_last = self.hw.read16(csr(ACSM_LAST));
         Ok(())
     }
     fn read_control(&mut self) -> Result<u16, PortError> {
@@ -179,41 +184,71 @@ impl<H: Hw> sequence::Port for PhyPort<'_, H> {
     fn read_done(&mut self) -> Result<u16, PortError> {
         Ok(self.hw.read16(csr(sequence::DONE)))
     }
+    fn completion_witness(&mut self) -> Result<bool, PortError> {
+        let last = self.hw.read16(csr(ACSM_LAST));
+        Ok(last == self.stop && self.prior_last != self.stop)
+    }
 }
 
-/// Result of [`acsm_delay_probe`].
+/// One sample of [`acsm_delay_probe`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct AcsmProbe {
+pub struct AcsmSample {
+    /// Control halfword of the delay row.
+    pub ctl: u16,
+    /// Stop row: alternates 1 and 2 so ACSMLastAddr can witness each run.
+    pub stop: u16,
     pub run: Result<sequence::Completion, sequence::Failure<PortError>>,
     pub last_addr: u16,
-    pub done_after: u16,
+    pub elapsed_us: u64,
 }
 
-/// Run one ACSM sequence of a single delay-only row (no command, CS idle)
-/// while DRAM stays in reset: the shape of the PMU firmware's first DevInit
-/// launch (rows 0..1, control 0x1b00). Shows whether the host can start the
-/// ACSM and observe Done. Call after [`pre_training`].
-pub fn acsm_delay_probe<H: Hw>(hw: &mut H) -> AcsmProbe {
-    csr_access(hw, true);
-    hw.write16(csr(ACSM_START), 0);
-    hw.write16(csr(ACSM_STOP), 0);
-    let rows: [[u16; 4]; 2] = [[0, 0, 0, 0x1b00], [0; 4]];
-    for (r, row) in rows.iter().enumerate() {
-        for (k, &v) in row.iter().enumerate() {
-            hw.write16(csr(ACSM_MEM + 4 * r as u32 + k as u32), v);
+/// Control words of the delay-only rows seen in the PMU firmware's DevInit
+/// launches (emulator trace), shortest-looking first.
+pub const DELAY_CONTROLS: [u16; 8] = [
+    0x0400, 0x0800, 0x1b00, 0x2b00, 0x4800, 0x4b00, 0x5b00, 0x7b00,
+];
+
+/// Run ACSM sequences of one delay-only row (no command, CS idle) followed by
+/// empty rows, as in the firmware's first DevInit launch (Start 0, Stop 1),
+/// for each of [`DELAY_CONTROLS`] while DRAM stays in reset, timing each.
+/// The stop row alternates 1 and 2 so that ACSMLastAddr changes on every
+/// run. A failed sample stops the series. Call after [`pre_training`].
+pub fn acsm_delay_probe<H: Hw>(hw: &mut H, out: &mut [Option<AcsmSample>; 8]) {
+    *out = [None; 8];
+    for (i, (slot, &ctl)) in out.iter_mut().zip(DELAY_CONTROLS.iter()).enumerate() {
+        let stop = 1 + (i as u16 & 1);
+        csr_access(hw, true);
+        hw.write16(csr(ACSM_START), 0);
+        hw.write16(csr(ACSM_STOP), 0);
+        let rows: [[u16; 4]; 3] = [[0, 0, 0, ctl], [0; 4], [0; 4]];
+        for (r, row) in rows.iter().enumerate() {
+            for (k, &v) in row.iter().enumerate() {
+                hw.write16(csr(ACSM_MEM + 4 * r as u32 + k as u32), v);
+            }
         }
-    }
-    hw.write16(csr(ACSM_OUTER_LOOP), 0);
-    hw.write16(csr(ACSM_STOP), 1);
-    let mut run = sequence::DirectRun::new(PhyPort { hw: &mut *hw });
-    let result = run.run(sequence::MAX_POLLS);
-    csr_access(hw, true);
-    let last_addr = hw.read16(csr(ACSM_LAST));
-    let done_after = hw.read16(csr(sequence::DONE));
-    csr_access(hw, false);
-    AcsmProbe {
-        run: result,
-        last_addr,
-        done_after,
+        hw.write16(csr(ACSM_OUTER_LOOP), 0);
+        hw.write16(csr(ACSM_STOP), stop);
+        let t0 = hw.now_us();
+        let mut run = sequence::DirectRun::new(PhyPort {
+            hw: &mut *hw,
+            stop,
+            prior_last: 0,
+        });
+        let result = run.run(sequence::MAX_POLLS);
+        let elapsed_us = hw.now_us().wrapping_sub(t0);
+        csr_access(hw, true);
+        let last_addr = hw.read16(csr(ACSM_LAST));
+        csr_access(hw, false);
+        let ok = result.is_ok();
+        *slot = Some(AcsmSample {
+            ctl,
+            stop,
+            run: result,
+            last_addr,
+            elapsed_us,
+        });
+        if !ok {
+            break;
+        }
     }
 }

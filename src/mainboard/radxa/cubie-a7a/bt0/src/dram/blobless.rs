@@ -46,13 +46,14 @@ pub fn init_one(para: &[u32; 32]) -> Option<u32> {
             );
             report("C_ONCE", &rb[0]);
             report("C_PSTATE", &rb[1]);
-            let t1 = soc::ticks();
-            let a = blobless::acsm_delay_probe(&mut Bt0Hw);
-            let us = (soc::ticks() - t1) / (soc::TIMER_HZ / 1_000_000);
-            println!(
-                "[dram] blobless: ACSM delay row: {:?}; LastAddr {:04x}, Done after {:04x}, {us} us",
-                a.run, a.last_addr, a.done_after
-            );
+            let mut samples = [None; 8];
+            blobless::acsm_delay_probe(&mut Bt0Hw, &mut samples);
+            for a in samples.iter().flatten() {
+                println!(
+                    "[dram] blobless: ACSM delay row ctl {:04x} stop {}: {:?}; LastAddr {:04x}, {} us",
+                    a.ctl, a.stop, a.run, a.last_addr, a.elapsed_us
+                );
+            }
         }
         Err(e) => {
             println!("[dram] blobless: pre-training failed after {ms} ms: {e:?}");
