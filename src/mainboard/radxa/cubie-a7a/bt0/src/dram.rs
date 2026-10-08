@@ -8,6 +8,8 @@
 
 use core::ffi::{c_char, c_int, c_void, CStr, VaList};
 
+use util::mmio::{read32, write32};
+
 use crate::axp::Axp;
 use crate::soc;
 
@@ -185,9 +187,163 @@ pub fn test(base: usize, size: usize) -> Result<(), (usize, u32, u32)> {
 // ---------------------------------------------------------------------------
 // Imports of the vendor library.
 
-#[unsafe(no_mangle)]
-pub extern "C" fn udelay(us: u32) {
+// `udelay` for the library goes through a trampoline that passes the
+// caller's return address, so the log shows how far the library got: one
+// line each time the calling site changes. The last site also goes to an
+// RTC register, which survives the watchdog reset after a hang.
+core::arch::global_asm!(
+    ".section .text.udelay, \"ax\"",
+    ".arm",
+    ".global udelay",
+    ".type udelay, %function",
+    "udelay:",
+    "mov r1, lr",
+    "b {traced}",
+    traced = sym udelay_traced,
+);
+
+/// RTC GP_DATA_REG4/5: last udelay caller and its time (ms since bt0) in
+/// the DRAM library, kept across a watchdog reset.
+pub const TRACE_LR_GPR: usize = 0x0709_0110;
+pub const TRACE_MS_GPR: usize = 0x0709_0114;
+const TRACE_MAX_LINES: u32 = 160;
+
+static mut TRACE_LAST: u32 = 0;
+static mut TRACE_REPEAT: u32 = 0;
+static mut TRACE_LINES: u32 = 0;
+
+extern "C" fn udelay_traced(us: u32, lr: u32) {
+    let ms = (soc::ticks() / (soc::TIMER_HZ / 1000)) as u32;
+    unsafe {
+        let (last, repeat) = (TRACE_LAST, TRACE_REPEAT);
+        if lr != last {
+            if TRACE_LINES < TRACE_MAX_LINES {
+                TRACE_LINES += 1;
+                println!(
+                    "[dram] {ms} ms: udelay({us}) from {lr:08x} (previous site {last:08x} x{})",
+                    repeat + 1
+                );
+            }
+            TRACE_LAST = lr;
+            TRACE_REPEAT = 0;
+        } else {
+            TRACE_REPEAT += 1;
+        }
+    }
+    write32(TRACE_LR_GPR, lr);
+    write32(TRACE_MS_GPR, ms);
     soc::udelay(us as u64);
+}
+
+/// What the previous boot's trace registers held; call before [`init`].
+pub fn report_previous_trace() {
+    let (lr, ms) = (read32(TRACE_LR_GPR), read32(TRACE_MS_GPR));
+    if lr != 0 {
+        println!("[bt0] previous boot: last DRAM library udelay from {lr:08x} at {ms} ms");
+    }
+    write32(TRACE_LR_GPR, 0);
+    write32(TRACE_MS_GPR, 0);
+}
+
+/// Clock, reset and PHY state around DRAM init. Only registers the library
+/// itself touches before training, each read once.
+pub fn dump_clocks(when: &str) {
+    const REGS: [(&str, usize); 10] = [
+        ("PLL_REF", 0x0200_2000),
+        ("PLL_DDR", 0x0200_2020),
+        ("PLL_DDR_PAT0", 0x0200_2028),
+        ("NSI_CLK", 0x0200_2580),
+        ("NSI_BGR", 0x0200_2584),
+        ("MBUS_CLK", 0x0200_2588),
+        ("DRAM_CLK", 0x0200_2c00),
+        ("DRAM_BGR", 0x0200_2c0c),
+        ("R_PRCM+250", 0x0701_0250),
+        ("SYS+160", 0x0300_0160),
+    ];
+    print!("[dram] {when}:");
+    for (name, addr) in REGS {
+        print!(" {name}={:08x}", read32(addr));
+    }
+    println!();
+}
+
+// ---------------------------------------------------------------------------
+// PHY firmware execution (replaces the library's
+// dwc_ddrphy_phyinit_G_execFW, which the build weakens): the same register
+// sequence, with a timeout and a report instead of an endless poll.
+
+/// Synopsys PHY APB space at 0x0a90_0000, 16-bit registers at 2 * address.
+const PHY_BASE: usize = 0x0a90_0000;
+const fn phy(apb: usize) -> usize {
+    PHY_BASE + 2 * apb
+}
+const MICRO_CONT_MUX_SEL: usize = phy(0xd0000);
+const UCT_SHADOW_REGS: usize = phy(0xd0004);
+const DCT_WRITE_PROT: usize = phy(0xd0031);
+const UCT_WRITE_ONLY_SHADOW: usize = phy(0xd0032);
+const D0033: usize = phy(0xd0033);
+const UCT_DAT_WRITE_ONLY_SHADOW: usize = phy(0xd0034);
+const MICRO_RESET: usize = phy(0xd0099);
+
+const TRAIN_TIMEOUT_MS: u64 = 4000;
+
+fn w16(a: usize, v: u16) {
+    util::mmio::write16(a, v);
+}
+fn r16(a: usize) -> u16 {
+    util::mmio::read16(a)
+}
+
+fn phy_report(why: &str) {
+    println!(
+        "[dram] {why}: UctShadowRegs={:04x} UctWriteOnlyShadow={:04x} UctDat={:04x} MicroReset={:04x} MuxSel={:04x}",
+        r16(UCT_SHADOW_REGS),
+        r16(UCT_WRITE_ONLY_SHADOW),
+        r16(UCT_DAT_WRITE_ONLY_SHADOW),
+        r16(MICRO_RESET),
+        r16(MICRO_CONT_MUX_SEL),
+    );
+    dump_clocks(why);
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn dwc_ddrphy_phyinit_G_execFW(ps: c_int) -> u32 {
+    crate::recovery::kick();
+    let t0 = soc::ticks();
+    let ms = |t: u64| (t - t0) / (soc::TIMER_HZ / 1000);
+    println!("[dram] PHY firmware: start (pstate loop index {ps})");
+    w16(MICRO_CONT_MUX_SEL, 1);
+    w16(MICRO_RESET, 9);
+    w16(MICRO_RESET, 1);
+    w16(MICRO_RESET, 0);
+    w16(DCT_WRITE_PROT, 1);
+    w16(D0033, 1);
+    let mut next_report = 1000;
+    while r16(UCT_SHADOW_REGS) & 1 != 0 {
+        let now = ms(soc::ticks());
+        if now >= TRAIN_TIMEOUT_MS {
+            phy_report("PHY firmware: no mailbox message, giving up");
+            w16(MICRO_RESET, 1);
+            return 0xdead;
+        }
+        if now >= next_report {
+            next_report += 1000;
+            phy_report("PHY firmware: waiting");
+        }
+    }
+    let mail = r16(UCT_WRITE_ONLY_SHADOW) as u32 | (r16(UCT_DAT_WRITE_ONLY_SHADOW) as u32) << 16;
+    println!("Training result is = {mail:x} ({} ms)", ms(soc::ticks()));
+    w16(DCT_WRITE_PROT, 0);
+    let t1 = soc::ticks();
+    while r16(UCT_SHADOW_REGS) == 0 {
+        if ms(soc::ticks()) - ms(t1) > 1000 {
+            phy_report("PHY firmware: mailbox ack timed out");
+            break;
+        }
+    }
+    w16(DCT_WRITE_PROT, 1);
+    w16(MICRO_RESET, 1);
+    mail
 }
 
 #[unsafe(no_mangle)]

@@ -347,6 +347,7 @@ extern "C" fn main() -> ! {
     );
 
     soc::stage(4);
+    dram::report_previous_trace();
     if recovery::previous_boot_failed() {
         println!("[bt0] the previous boot never reached EDK2's boot manager");
         let mut sd = smhc::Smhc::new_smhc0(soc::SMHC0_BASE);
@@ -367,7 +368,9 @@ extern "C" fn main() -> ! {
     ccu::dump();
 
     soc::stage(6);
-    let Some((dram_mb, dram_mhz)) = dram::init(pmic, dram::select()) else {
+    let set = dram::select();
+    dram::dump_clocks("before init_DRAM");
+    let Some((dram_mb, dram_mhz)) = dram::init(pmic, set) else {
         println!("[bt0] DRAM init failed");
         halt();
     };
