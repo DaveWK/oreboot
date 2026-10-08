@@ -285,7 +285,8 @@ const D0033: usize = phy(0xd0033);
 const UCT_DAT_WRITE_ONLY_SHADOW: usize = phy(0xd0034);
 const MICRO_RESET: usize = phy(0xd0099);
 
-const TRAIN_TIMEOUT_MS: u64 = 4000;
+/// Pstate 0 (2400 MHz) training takes ~3.7 s on the Cubie A7A.
+const TRAIN_TIMEOUT_MS: u64 = 10_000;
 
 fn w16(a: usize, v: u16) {
     util::mmio::write16(a, v);
@@ -536,4 +537,80 @@ fn utoa(mut v: u64, base: u64, upper: bool, buf: &mut [u8]) -> usize {
         }
     }
     n
+}
+
+// ---------------------------------------------------------------------------
+// Controller programming after PHY training (replaces the library's
+// mctl_com_set_controller_after_phy, which the build weakens): the same
+// writes, with a timeout and a report on the uMCTL2 quasi-dynamic
+// programming handshake (SWCTL.sw_done / SWSTAT.sw_done_ack) instead of an
+// endless poll.
+
+/// uMCTL2 controller of channel 0; channel 1 is 4 MiB above.
+const MCTL_CH0: usize = 0x0a11_0000;
+const MCTL_CH_STRIDE: usize = 0x40_0000;
+const SWCTL: usize = 0xc80;
+const SWSTAT: usize = 0xc84;
+
+fn mctl(ch: usize, off: usize) -> usize {
+    MCTL_CH0 + ch * MCTL_CH_STRIDE + off
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mctl_com_set_controller_after_phy(para: *const u32) {
+    let tpr13 = unsafe { para.add(30).read_volatile() };
+    let channels = if tpr13 & 0x40 != 0 { 2 } else { 1 };
+    println!("[dram] controller after PHY: {channels} channel(s)");
+    for ch in 0..channels {
+        write32(mctl(ch, SWCTL), 0);
+    }
+    for ch in 0..channels {
+        write32(mctl(ch, 0x208), 0);
+    }
+    for ch in 0..channels {
+        let v = read32(mctl(ch, 0x510));
+        write32(mctl(ch, 0x510), (v & !0xc000) | 0x4000);
+    }
+    for ch in 0..channels {
+        write32(mctl(ch, SWCTL), 1);
+    }
+    for ch in 0..channels {
+        let t0 = soc::ticks();
+        while read32(mctl(ch, SWSTAT)) & 1 == 0 {
+            if soc::ticks() - t0 > soc::TIMER_HZ {
+                println!(
+                    "[dram] channel {ch}: SWSTAT.sw_done_ack never set (SWSTAT {:08x}, SWCTL {:08x}, +0x510 {:08x})",
+                    read32(mctl(ch, SWSTAT)),
+                    read32(mctl(ch, SWCTL)),
+                    read32(mctl(ch, 0x510)),
+                );
+                break;
+            }
+        }
+    }
+    println!("[dram] controller after PHY: handshake done");
+    if channels == 2 {
+        write32(0x0202_4818, 0x8002);
+        write32(0x0202_481c, 0xffff_ffff);
+        write32(0x0a03_0018, 0x8002);
+        write32(0x0a04_0018, 0x8002);
+        write32(0x0a03_0068, 0xffff_ffff);
+        write32(0x0a04_0068, 0xffff_ffff);
+        write32(0x0202_4838, 2);
+        write32(0x0202_448c, 2);
+        write32(0x0202_468c, 2);
+        for off in [0x000, 0x200, 0x400, 0x600, 0x800] {
+            write32(0x0202_3a04 + off, 0xffff_ffff);
+        }
+        write32(0x0202_4490, 0x1010_2010);
+        write32(0x0202_4494, 0x0808_1008);
+        write32(0x0202_4690, 0x1010_2010);
+        write32(0x0202_4694, 0x0808_1008);
+    } else {
+        write32(0x0202_44a8, 1);
+        write32(0x0202_46a8, 1);
+        write32(0x0a03_0008, 3);
+        write32(0x0a04_0008, 3);
+    }
+    println!("[dram] controller after PHY: done");
 }
