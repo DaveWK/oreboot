@@ -112,6 +112,7 @@ const SERDES_RST_BIT: u32 = 1 << 16;
 /// combo_usb_clk_set): bit 17 ACLK (AXI), bit 16 HCLK (AHB) gate the dwc3
 /// core bus.
 const SERDES_USB3P1_BGR: usize = 0x06c0_0000 + 0x0008;
+const USB3P1_UTMI_SEL_CCU: u32 = 1 << 21; // 0: USB2 PHY UTMI, 1: USB3-only CCU clock
 const USB3P1_PIPE_SEL_U2: u32 = 1 << 20; // PIPE clock: 0 combo PHY, 1 CCU USB2_U2_PIPE
 const USB3P1_ACLK_EN: u32 = 1 << 17;
 const USB3P1_HCLK_EN: u32 = 1 << 16;
@@ -293,13 +294,21 @@ fn ccu_init() {
     set(SERDES_USB3P1_BGR, USB3P1_ACLK_EN | USB3P1_HCLK_EN);
     udelay(10);
 
-    // 8. USB2-only operation of the USB3 controller: UTMI and PIPE clocks
-    // from the CCU, PIPE mux to USB2_U2_PIPE, then release the USB2 PHY's
+    // 8. USB2-only operation of the USB3 controller: enable CCU fallback
+    // clocks, select the real USB2 PHY for UTMI and CCU for PIPE, then
+    // release the USB2 PHY's
     // reset-n (before the PHY writes and the dwc3 core reset below).
     write32(CCU + USB2_U3_UTMI, GATE | clk_src(1));
     write32(CCU + USB2_U2_PIPE, GATE | clk_src(1));
     udelay(10);
-    set(SERDES_USB3P1_BGR, USB3P1_PIPE_SEL_U2 | USB3P1_U2PHY_RSTN);
+    // A733 manual V1.00 18.2.6.2: USB2 needs the real PHY UTMI
+    // clock (bit21=0); only the absent SuperSpeed PIPE clock uses CCU.
+    // Do not retain a previous USB3-only UTMI selection across warm boot.
+    let clocks = read32(SERDES_USB3P1_BGR);
+    write32(
+        SERDES_USB3P1_BGR,
+        (clocks & !USB3P1_UTMI_SEL_CCU) | USB3P1_PIPE_SEL_U2 | USB3P1_U2PHY_RSTN,
+    );
     udelay(10);
 
     // Settle.
