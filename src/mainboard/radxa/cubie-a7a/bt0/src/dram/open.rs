@@ -35,7 +35,10 @@ impl Hw for Bt0Hw {
         util::mmio::write16(addr, val)
     }
     fn udelay(&mut self, us: u32) {
-        soc::udelay(us as u64)
+        // This mandatory settling ABI cannot return an error. Never silently
+        // shorten it or proceed with a stalled counter: stop through the
+        // timer-free failure path and the already armed boot watchdog.
+        crate::ccu::delay_us(us).unwrap_or_else(|error| crate::clock_failure(error));
     }
     fn now_us(&mut self) -> u64 {
         soc::ticks() / (soc::TIMER_HZ / 1_000_000)
