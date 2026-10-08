@@ -243,6 +243,52 @@ pub const SAVED_CSRS: [u32; 14] = [
 /// aliases are recorded here and still need qualification for hardware use.
 pub struct SavedControls(pub [u16; 14]);
 
+/// Supported TxWckDly range in the matching EIC7700X register schema:
+/// coarse [10:6] is at most 20 UI; fine [5:0] is UI/64. This range check is
+/// not proof of a valid analog result or of the A733 broadcast alias.
+pub const MAX_WCK_DELAY: u16 = 20 * 64 + 63;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TxWckDelay(u16);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UnsupportedCounter {
+    pub raw: u16,
+    pub decoded: u16,
+}
+
+impl TxWckDelay {
+    /// Original bit-field conversion established by synthetic PMU oracle
+    /// inputs: low ten bits stay, upper six shift down four, combined by OR
+    /// (not addition). The independent fixture retains all sixteen input
+    /// bits and mixed fields. No physical meaning is assigned to the raw
+    /// TrainingCntr fields beyond that observed conversion.
+    pub const fn from_training_counter(raw: u16) -> Result<Self, UnsupportedCounter> {
+        let decoded = (raw & 0x03ff) | ((raw >> 4) & 0x0fc0);
+        if decoded > MAX_WCK_DELAY {
+            Err(UnsupportedCounter { raw, decoded })
+        } else {
+            Ok(Self(decoded))
+        }
+    }
+
+    pub const fn encoded(self) -> u16 {
+        self.0
+    }
+
+    /// The observed first verification point is half a UI above the initial
+    /// value. Reject a point outside the documented range, without wrapping
+    /// or silently saturating it into a different measurement.
+    pub const fn half_ui_later(self) -> Option<Self> {
+        let delay = self.0 + 32;
+        if delay > MAX_WCK_DELAY {
+            None
+        } else {
+            Some(Self(delay))
+        }
+    }
+}
+
 /// Cleanup after the caller has stopped measurement clocks and decided what
 /// to do with measured delay results. Does not accept or invent a trained
 /// result, nor restore a guessed zero delay. The caller must retain recovery
