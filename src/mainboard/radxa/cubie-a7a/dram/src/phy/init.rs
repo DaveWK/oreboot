@@ -72,15 +72,16 @@ pub fn set_dfi_clk<H: Hw>(hw: &mut H, p: &Para, pstate: u32) -> Result<(), Error
         sw_done(hw, ch)?;
     }
     const DRAM0_CLK: usize = 0x0200_2c00;
-    hw.clr32(DRAM0_CLK, 7 << 24);
     let div = if p.tpr13() & 4 != 0 {
         (p.tpr2() >> (8 * pstate)) & 0x1f
     } else {
         3
     };
-    let v = (hw.read32(DRAM0_CLK) & !0x1f) | div;
+    // A733's public CCU driver requires the bit27 key on parent/divider
+    // writes. Apply both fields in that keyed write: do not depend on a
+    // preceding keyless mux write being latched and then read back.
+    let v = (hw.read32(DRAM0_CLK) & !((7 << 24) | 0x1f)) | div | (1 << 27);
     hw.write32(DRAM0_CLK, v);
-    hw.write32(DRAM0_CLK, v | (1 << 27));
     hw.udelay(1000);
     Ok(())
 }
