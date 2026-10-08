@@ -14,6 +14,7 @@
 
 pub mod ethernet;
 pub mod fwlog;
+pub mod memtest;
 pub mod sha256;
 pub mod time;
 pub mod twi;

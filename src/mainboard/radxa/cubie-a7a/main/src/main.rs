@@ -24,6 +24,8 @@ use cubie_a7a_common::{
 mod fdt;
 mod gic;
 mod gmac;
+#[cfg(feature = "memtest")]
+mod memtest;
 mod pcie;
 mod pmic;
 mod ppu;
@@ -406,7 +408,11 @@ fn build_dtb(h: &Handoff) -> usize {
     let usb = usb::ready();
     let mut list = [0u8; 18];
     let mut n = 0;
-    for (up, name) in [(usb.ehci0, "ehci0\0"), (usb.ehci1, "ehci1\0"), (usb.xhci, "xhci\0")] {
+    for (up, name) in [
+        (usb.ehci0, "ehci0\0"),
+        (usb.ehci1, "ehci1\0"),
+        (usb.xhci, "xhci\0"),
+    ] {
         if up {
             list[n..n + name.len()].copy_from_slice(name.as_bytes());
             n += name.len();
@@ -432,7 +438,8 @@ fn build_dtb(h: &Handoff) -> usize {
     f.end_node();
 
     // SAFETY: DTB_ADDR..+DTB_MAX_SIZE is reserved for this in the EL3 region.
-    let out = unsafe { core::slice::from_raw_parts_mut(mem::DTB_ADDR as *mut u8, mem::DTB_MAX_SIZE) };
+    let out =
+        unsafe { core::slice::from_raw_parts_mut(mem::DTB_ADDR as *mut u8, mem::DTB_MAX_SIZE) };
     f.finish(out)
 }
 
@@ -441,7 +448,10 @@ extern "C" fn primary_main(mpidr: u64, core: usize) -> ! {
     init_logger(Uart::attach(soc::UART0_BASE));
     let t0 = ticks();
     println!();
-    println!("oreboot 🦀 main | Radxa Cubie A7A | AArch64 EL{}", current_el());
+    println!(
+        "oreboot 🦀 main | Radxa Cubie A7A | AArch64 EL{}",
+        current_el()
+    );
 
     let h: Handoff = unsafe { read_volatile(mem::HANDOFF_ADDR as *const Handoff) };
     if h.magic != HANDOFF_MAGIC || h.version != HANDOFF_VERSION {
@@ -479,6 +489,8 @@ extern "C" fn primary_main(mpidr: u64, core: usize) -> ! {
     if h.payload_addr == 0 {
         panic!("bt0 loaded no payload");
     }
+    #[cfg(feature = "memtest")]
+    memtest::run(&h).unwrap_or_else(|e| panic!("memtest failed: {e}"));
     if h.dtb_addr != 0 {
         println!("[main] note: DTB from boot media is not used yet, generating one");
     }
@@ -498,7 +510,10 @@ extern "C" fn primary_main(mpidr: u64, core: usize) -> ! {
         mem::DTB_ADDR,
         mem::PAYLOAD_RAM_BASE
     );
-    println!("[main] PSCI 1.0 ready; entering payload @ {:#x} in EL2", h.payload_addr);
+    println!(
+        "[main] PSCI 1.0 ready; entering payload @ {:#x} in EL2",
+        h.payload_addr
+    );
 
     unsafe { write_volatile(addr_of_mut!(BOOT_STATE), BOOT_WARM) };
     enter_nonsecure(h.payload_addr, mem::DTB_ADDR as u64)

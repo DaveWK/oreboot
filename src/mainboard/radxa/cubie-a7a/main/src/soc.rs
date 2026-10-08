@@ -124,10 +124,19 @@ pub fn watchdog_reset() -> ! {
     write32(WDT0_BASE + 0x08, KEY | 1);
     let t = ticks() + TIMER_HZ / 100;
     while ticks() < t {}
-    write32(WDT0_BASE + 0x10, (read32(WDT0_BASE + 0x10) & !0x3) | KEY | 1);
+    write32(
+        WDT0_BASE + 0x10,
+        (read32(WDT0_BASE + 0x10) & !0x3) | KEY | 1,
+    );
     write32(WDT0_BASE + 0x14, KEY | 1);
     write32(WDT0_BASE + 0x0c, (0x0a57 << 1) | 1);
     loop {
         unsafe { core::arch::asm!("wfi") };
     }
+}
+
+/// Reload the watchdog already armed by bt0; retain its interval/recovery marker.
+#[cfg(feature = "memtest")]
+pub fn watchdog_kick() {
+    write32(WDT0_BASE + 0x0c, (0x0a57 << 1) | 1);
 }
