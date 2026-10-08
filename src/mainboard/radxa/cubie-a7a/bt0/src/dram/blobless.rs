@@ -4,7 +4,8 @@
 //! halts. DRAM is not brought up yet, so the boot watchdog resets the board
 //! and the next boot takes the recovery path (README, Recovery).
 
-use cubie_a7a_dram::blobless::{self, Readback};
+use cubie_a7a_dram::blobless::{self, BlockTrain, Readback};
+use cubie_a7a_dram::phy::coldinit::CbtBlock;
 use cubie_a7a_dram::Para;
 
 use super::bt0hw::Bt0Hw;
@@ -21,6 +22,51 @@ fn report(name: &str, r: &Readback) {
     for &(csr, want, got) in r.first.iter().take(r.mismatches.min(8) as usize) {
         println!("[dram] blobless:   csr {csr:05x} wrote {want:04x} read {got:04x}");
     }
+}
+
+/// Print one CBT block's training result.
+fn report_block(i: usize, b: &CbtBlock, t: &BlockTrain) {
+    let ch = ["A", "B"][b.chan.ac as usize];
+    let cs = blobless::CA_SWEEP_STEP as u32;
+    let (s0, l0) = t.common_run;
+    println!(
+        "[dram] blobless: CBT {i} ch {ch} rank {} phase {}: common {}..+{} center {}, raw {:04x?} {:04x?}",
+        b.rank,
+        b.phase,
+        s0 * cs,
+        l0 * cs,
+        t.common_center,
+        t.raw_first,
+        t.raw_mid
+    );
+    for bit in 0..8 {
+        if b.chan.echo_bits() >> bit & 1 != 0 {
+            let (s, l) = t.bit_runs[bit];
+            println!(
+                "[dram] blobless: CBT {i} bit {bit}: map {:032x} run {}..+{}",
+                t.bit_maps[bit],
+                s * cs,
+                l * cs
+            );
+        }
+    }
+    let ls = blobless::LANE_SWEEP_STEP as u32;
+    for lane in 0..7 {
+        let (s, l) = t.lane_runs[lane];
+        println!(
+            "[dram] blobless: CBT {i} lane {lane}: bit {} window {}..+{} delay {}",
+            t.lane_bit[lane],
+            s * ls,
+            l * ls,
+            t.lane_delay[lane]
+        );
+    }
+    println!(
+        "[dram] blobless: CBT {i} trained: pass {:04x} (want {:04x}), echo {:04x?}",
+        t.final_pass,
+        b.chan.echo_bits(),
+        t.final_echo
+    );
 }
 
 /// Probe the PHY with `para`, print the result and stop.
@@ -54,52 +100,40 @@ pub fn init_one(para: &[u32; 32]) -> Option<u32> {
                     a.ctl, a.stop, a.run, a.last_addr, a.elapsed_us
                 );
             }
-            // Cold init to CBT on channel A rank 0, then our own command bus
-            // training on the DRAM's CBT echo.
+            // Cold init to CBT, then our own command bus training on the
+            // DRAM's CBT echo for both channels, ranks and phases.
             let m1 = cubie_a7a_dram::phy::coldinit::Mrs::ORACLE_PSTATE1_CXMT_4G;
             let m2 = cubie_a7a_dram::phy::coldinit::Mrs2::ORACLE_PSTATE1_CXMT_4G;
-            let t = blobless::cold_init_ca_train(&mut Bt0Hw, &m1, &m2);
+            let mut t = blobless::CaTrainReport::EMPTY;
+            blobless::cold_init_ca_train(&mut Bt0Hw, &m1, &m2, &mut t);
             let e = &t.exec;
             println!(
-                "[dram] blobless: CA train: {} launches ({} witnessed, max {} busy polls), {} us, failure {:?}",
-                e.launches, e.witnessed, e.busy_max, e.elapsed_us, e.failure
+                "[dram] blobless: CA train: {} blocks, {} launches ({} witnessed, max {} busy polls), {} us, failure {:?}",
+                t.done, e.launches, e.witnessed, e.busy_max, e.elapsed_us, e.failure
             );
-            let cs = blobless::CA_SWEEP_STEP as u32;
-            for b in 0..16 {
-                if cubie_a7a_dram::phy::coldinit::CBT_ECHO_BITS >> b & 1 != 0 {
-                    let (s0, l0) = t.bit_runs[b];
-                    println!(
-                        "[dram] blobless: CA common sweep bit {b}: pass map {:032x}, run {}..+{}",
-                        t.bit_maps[b],
-                        s0 * cs,
-                        l0 * cs
-                    );
-                }
+            for (i, (b, r)) in cubie_a7a_dram::phy::coldinit::CBT_BLOCKS
+                .iter()
+                .zip(t.blocks.iter())
+                .enumerate()
+            {
+                report_block(i, b, r);
             }
-            let (s0, l0) = t.common_run;
-            println!(
-                "[dram] blobless: CA common window {}..+{}, center {}",
-                s0 * cs,
-                l0 * cs,
-                t.common_center
-            );
-            let ls = blobless::LANE_SWEEP_STEP as u32;
-            for lane in 0..7 {
-                let (s1, l1) = t.lane_runs[lane];
+            for (ch, c) in t.channels.iter().enumerate() {
+                let ls = blobless::LANE_SWEEP_STEP as u32;
                 println!(
-                    "[dram] blobless: CA lane {lane}: echo bit {}, window {}..+{}, delay {}",
-                    t.lane_bit[lane],
-                    s1 * ls,
-                    l1 * ls,
-                    t.lane_delay[lane]
+                    "[dram] blobless: CA ch {}: lane map agrees {}, delays {:?}, windows {}..+{} {}..+{} {}..+{} {}..+{} {}..+{} {}..+{} {}..+{}",
+                    ["A", "B"][ch],
+                    c.lane_map_agrees,
+                    c.delay,
+                    c.runs[0].0 * ls, c.runs[0].1 * ls,
+                    c.runs[1].0 * ls, c.runs[1].1 * ls,
+                    c.runs[2].0 * ls, c.runs[2].1 * ls,
+                    c.runs[3].0 * ls, c.runs[3].1 * ls,
+                    c.runs[4].0 * ls, c.runs[4].1 * ls,
+                    c.runs[5].0 * ls, c.runs[5].1 * ls,
+                    c.runs[6].0 * ls, c.runs[6].1 * ls,
                 );
             }
-            println!(
-                "[dram] blobless: CA trained: pass {:04x} (want {:04x}), echo {:04x} {:04x} {:04x} {:04x}",
-                t.final_pass,
-                cubie_a7a_dram::phy::coldinit::CBT_ECHO_BITS,
-                t.final_echo[0], t.final_echo[1], t.final_echo[2], t.final_echo[3]
-            );
         }
         Err(e) => {
             println!("[dram] blobless: pre-training failed after {ms} ms: {e:?}");

@@ -292,6 +292,19 @@ pub struct ColdInitReport {
     pub n_reads: u16,
 }
 
+impl ColdInitReport {
+    pub const EMPTY: ColdInitReport = ColdInitReport {
+        launches: 0,
+        writes: 0,
+        witnessed: 0,
+        busy_max: 0,
+        failure: None,
+        elapsed_us: 0,
+        reads: [0; 192],
+        n_reads: 0,
+    };
+}
+
 /// Runs [`coldinit::Step`]s on the PHY: blocking launches through
 /// [`sequence::DirectRun`] (row base alternating 0/64 for launches at row 0,
 /// so ACSMLastAddr witnesses each), loop launches without waiting, loop ends
@@ -402,16 +415,7 @@ fn run_program<H: Hw>(hw: &mut H, program: impl FnOnce(&mut Executor<H>)) -> Col
     hw.udelay(RESET_HIGH_US);
     let mut ex = Executor {
         hw: &mut *hw,
-        r: ColdInitReport {
-            launches: 0,
-            writes: 0,
-            witnessed: 0,
-            busy_max: 0,
-            failure: None,
-            elapsed_us: 0,
-            reads: [0; 192],
-            n_reads: 0,
-        },
+        r: ColdInitReport::EMPTY,
         loop_run: 0,
         mem_reset: 3,
     };
@@ -462,16 +466,7 @@ pub fn cold_init_diag<H: Hw>(
     let t0 = hw.now_us();
     let mut ex = Executor {
         hw: &mut *hw,
-        r: ColdInitReport {
-            launches: 0,
-            writes: 0,
-            witnessed: 0,
-            busy_max: 0,
-            failure: None,
-            elapsed_us: 0,
-            reads: [0; 192],
-            n_reads: 0,
-        },
+        r: ColdInitReport::EMPTY,
         loop_run: 0,
         mem_reset: 3,
     };
@@ -529,13 +524,13 @@ fn bring_up_to_cbt<H: Hw>(
 }
 
 impl<H: Hw> Executor<'_, H> {
-    /// CA lane delays `delays`, then the four CBT patterns: DBYTE 1's
-    /// AsyncDbyteRxData after each, or None after a failure.
-    fn cbt_measure(&mut self, delays: &[u16; 7]) -> Option<[u16; 4]> {
-        coldinit::set_ca_delays(delays, &mut |s| self.step(s));
+    /// Block `b`'s CA lane delays `delays`, then its four CBT patterns: its
+    /// DBYTE's AsyncDbyteRxData after each, or None after a failure.
+    fn cbt_measure(&mut self, b: &coldinit::CbtBlock, delays: &[u16; 7]) -> Option<[u16; 4]> {
+        coldinit::set_block_delays(b.chan.ac, delays, &mut |s| self.step(s));
         let mut echo = [0u16; 4];
         let mut k = 0;
-        coldinit::cbt_patterns(&[coldinit::CBT_DBYTE_A], &mut |s| match s {
+        coldinit::block_patterns(b, &[b.chan.dbyte], &mut |s| match s {
             coldinit::Step::Read(c) => {
                 csr_access(self.hw, true);
                 if k < 4 {
@@ -551,136 +546,253 @@ impl<H: Hw> Executor<'_, H> {
             Some(echo)
         }
     }
-}
 
-/// Points of the common CA delay sweep (0..511 in steps of 4).
-pub const CA_SWEEP_POINTS: u32 = 128;
-pub const CA_SWEEP_STEP: u16 = 4;
-/// Points of each per-lane sweep (0..511 in steps of 8).
-pub const LANE_SWEEP_POINTS: u32 = 64;
-pub const LANE_SWEEP_STEP: u16 = 8;
-
-/// Result of [`cold_init_ca_train`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct CaTrainReport {
-    pub exec: ColdInitReport,
-    /// Common sweep: per echo bit (AsyncDbyteRxData bit), pass map over the
-    /// sweep points and its longest circular pass run (start point, length).
-    pub bit_maps: [u128; 16],
-    pub bit_runs: [(u32, u32); 16],
-    /// Longest run where every echo bit passes, and its center delay.
-    pub common_run: (u32, u32),
-    pub common_center: u16,
-    /// Per CA lane (delay register index): the echo bit it moves (0xff if not
-    /// exactly one), its pass run in lane-sweep points, and the chosen delay.
-    pub lane_bit: [u8; 7],
-    pub lane_runs: [(u32, u32); 7],
-    pub lane_delay: [u16; 7],
-    /// Pass bits with the final per-lane delays (CBT_ECHO_BITS when all pass).
-    pub final_pass: u16,
-    pub final_echo: [u16; 4],
-}
-
-/// Command bus training on channel A, rank 0, by the host: our own search
-/// on the DRAM's CBT echo. A common CA delay sweep gives each echo bit's
-/// window; each CA lane is then swept alone around the common center to find
-/// the echo bit it drives and its window; the per-lane centers are applied
-/// and verified. Call after [`pre_training`]. DRAM stays in CBT mode.
-pub fn cold_init_ca_train<H: Hw>(
-    hw: &mut H,
-    m1: &coldinit::Mrs,
-    m2: &coldinit::Mrs2,
-) -> CaTrainReport {
-    let t0 = hw.now_us();
-    let mut ex = Executor {
-        hw: &mut *hw,
-        r: ColdInitReport {
-            launches: 0,
-            writes: 0,
-            witnessed: 0,
-            busy_max: 0,
-            failure: None,
-            elapsed_us: 0,
-            reads: [0; 192],
-            n_reads: 0,
-        },
-        loop_run: 0,
-        mem_reset: 3,
-    };
-    let mut out = CaTrainReport {
-        exec: ex.r,
-        bit_maps: [0; 16],
-        bit_runs: [(0, 0); 16],
-        common_run: (0, 0),
-        common_center: 0,
-        lane_bit: [0xff; 7],
-        lane_runs: [(0, 0); 7],
-        lane_delay: [0; 7],
-        final_pass: 0,
-        final_echo: [0; 4],
-    };
-    bring_up_to_cbt(&mut ex, m1, m2, &mut |_| {});
-    // Common sweep.
-    for i in 0..CA_SWEEP_POINTS {
-        let d = i as u16 * CA_SWEEP_STEP;
-        let Some(echo) = ex.cbt_measure(&[d; 7]) else {
-            break;
-        };
-        let pass = coldinit::cbt_pass(echo);
-        for b in 0..16 {
-            if pass >> b & 1 != 0 {
-                out.bit_maps[b] |= 1u128 << i;
+    /// Our CA search on one block (the DRAM is in CBT for it): a common CA
+    /// delay sweep gives each echo bit's window; each CA lane is then swept
+    /// alone around the common center to find the echo bit it drives and its
+    /// window; the per-lane centers are applied and verified.
+    fn train_block(&mut self, b: &coldinit::CbtBlock, out: &mut BlockTrain) {
+        let bits = b.chan.echo_bits();
+        *out = BlockTrain::EMPTY;
+        for i in 0..CA_SWEEP_POINTS {
+            let d = i as u16 * CA_SWEEP_STEP;
+            let Some(echo) = self.cbt_measure(b, &[d; 7]) else {
+                return;
+            };
+            if i == 0 {
+                out.raw_first = echo;
+            }
+            if i == CA_RAW_POINT {
+                out.raw_mid = echo;
+            }
+            let pass = coldinit::cbt_pass_bits(echo, bits);
+            for (bit, map) in out.bit_maps.iter_mut().enumerate() {
+                if pass >> bit & 1 != 0 {
+                    *map |= 1u128 << i;
+                }
             }
         }
-    }
-    let mut all = u128::MAX >> (128 - CA_SWEEP_POINTS);
-    for b in 0..16 {
-        if coldinit::CBT_ECHO_BITS >> b & 1 != 0 {
-            out.bit_runs[b] = coldinit::longest_run(out.bit_maps[b], CA_SWEEP_POINTS);
-            all &= out.bit_maps[b];
+        let mut all = u128::MAX >> (128 - CA_SWEEP_POINTS);
+        for bit in 0..8 {
+            if bits >> bit & 1 != 0 {
+                out.bit_runs[bit] = coldinit::longest_run(out.bit_maps[bit], CA_SWEEP_POINTS);
+                all &= out.bit_maps[bit];
+            }
         }
-    }
-    out.common_run = coldinit::longest_run(all, CA_SWEEP_POINTS);
-    let (s0, l0) = out.common_run;
-    out.common_center = (((s0 + l0 / 2) % CA_SWEEP_POINTS) as u16) * CA_SWEEP_STEP;
-    // Per-lane sweeps around the common center.
-    if ex.r.failure.is_none() && l0 > 0 {
+        out.common_run = coldinit::longest_run(all, CA_SWEEP_POINTS);
+        let (s0, l0) = out.common_run;
+        out.common_center = (((s0 + l0 / 2) % CA_SWEEP_POINTS) as u16) * CA_SWEEP_STEP;
+        if l0 == 0 {
+            return;
+        }
+        let full = u64::MAX >> (64 - LANE_SWEEP_POINTS);
         for lane in 0..7 {
-            let mut maps = [0u128; 16];
+            let mut maps = [0u64; 8];
             for i in 0..LANE_SWEEP_POINTS {
                 let mut delays = [out.common_center; 7];
                 delays[lane] = i as u16 * LANE_SWEEP_STEP;
-                let Some(echo) = ex.cbt_measure(&delays) else {
-                    break;
+                let Some(echo) = self.cbt_measure(b, &delays) else {
+                    return;
                 };
-                let pass = coldinit::cbt_pass(echo);
-                for b in 0..16 {
-                    if pass >> b & 1 != 0 {
-                        maps[b] |= 1u128 << i;
+                let pass = coldinit::cbt_pass_bits(echo, bits);
+                for (bit, map) in maps.iter_mut().enumerate() {
+                    if pass >> bit & 1 != 0 {
+                        *map |= 1u64 << i;
                     }
                 }
             }
-            let full = u128::MAX >> (128 - LANE_SWEEP_POINTS);
-            let moved: u16 = (0..16)
-                .filter(|&b| coldinit::CBT_ECHO_BITS >> b & 1 != 0 && maps[b] != full)
-                .fold(0, |m, b| m | 1 << b);
+            let moved: u16 = (0..8)
+                .filter(|&bit| bits >> bit & 1 != 0 && maps[bit] != full)
+                .fold(0, |m, bit| m | 1 << bit);
             if moved.count_ones() == 1 {
-                let b = moved.trailing_zeros() as usize;
-                out.lane_bit[lane] = b as u8;
-                out.lane_runs[lane] = coldinit::longest_run(maps[b], LANE_SWEEP_POINTS);
+                let bit = moved.trailing_zeros() as usize;
+                out.lane_bit[lane] = bit as u8;
+                out.lane_maps[lane] = maps[bit];
+                out.lane_runs[lane] = coldinit::longest_run(maps[bit] as u128, LANE_SWEEP_POINTS);
                 let (s, l) = out.lane_runs[lane];
                 out.lane_delay[lane] = (((s + l / 2) % LANE_SWEEP_POINTS) as u16) * LANE_SWEEP_STEP;
             } else {
                 out.lane_delay[lane] = out.common_center;
             }
         }
-        if let Some(echo) = ex.cbt_measure(&out.lane_delay) {
+        if let Some(echo) = self.cbt_measure(b, &out.lane_delay) {
             out.final_echo = echo;
-            out.final_pass = coldinit::cbt_pass(echo);
+            out.final_pass = coldinit::cbt_pass_bits(echo, bits);
+        }
+    }
+}
+
+/// Points of the common CA delay sweep (0..511 in steps of 4).
+pub const CA_SWEEP_POINTS: u32 = 128;
+pub const CA_SWEEP_STEP: u16 = 4;
+/// Common-sweep point whose raw echo is kept (delay 288, inside the window
+/// measured on channel A rank 0 in M7).
+pub const CA_RAW_POINT: u32 = 72;
+/// Points of each per-lane sweep (0..511 in steps of 8).
+pub const LANE_SWEEP_POINTS: u32 = 64;
+pub const LANE_SWEEP_STEP: u16 = 8;
+
+/// Our CA training result for one CBT block.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BlockTrain {
+    /// Common sweep: per AsyncDbyteRxData bit 0..7, pass map over the sweep
+    /// points and its longest circular pass run (start point, length).
+    pub bit_maps: [u128; 8],
+    pub bit_runs: [(u32, u32); 8],
+    /// Longest run where every echo bit passes, and its center delay.
+    pub common_run: (u32, u32),
+    pub common_center: u16,
+    /// Per CA lane (delay register index): the echo bit it moves (0xff if not
+    /// exactly one), its pass map and run in lane-sweep points, and the chosen
+    /// delay.
+    pub lane_bit: [u8; 7],
+    pub lane_maps: [u64; 7],
+    pub lane_runs: [(u32, u32); 7],
+    pub lane_delay: [u16; 7],
+    /// Pass bits with the final per-lane delays (the channel's echo bits when
+    /// all pass).
+    pub final_pass: u16,
+    pub final_echo: [u16; 4],
+    /// Raw echo at common-sweep points 0 and [`CA_RAW_POINT`].
+    pub raw_first: [u16; 4],
+    pub raw_mid: [u16; 4],
+}
+
+impl BlockTrain {
+    pub const EMPTY: BlockTrain = BlockTrain {
+        bit_maps: [0; 8],
+        bit_runs: [(0, 0); 8],
+        common_run: (0, 0),
+        common_center: 0,
+        lane_bit: [0xff; 7],
+        lane_maps: [0; 7],
+        lane_runs: [(0, 0); 7],
+        lane_delay: [0; 7],
+        final_pass: 0,
+        final_echo: [0; 4],
+        raw_first: [0; 4],
+        raw_mid: [0; 4],
+    };
+}
+
+/// One channel's CA delays from the windows of its four blocks (both ranks,
+/// both phases): per lane, the center of the intersection of the windows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChannelCa {
+    /// Lane-sweep run of the intersection per lane (length 0: no overlap or
+    /// a block without a window for that lane).
+    pub runs: [(u32, u32); 7],
+    pub delay: [u16; 7],
+    /// Every lane drives the same echo bit in all four blocks.
+    pub lane_map_agrees: bool,
+}
+
+impl ChannelCa {
+    pub const EMPTY: ChannelCa = ChannelCa {
+        runs: [(0, 0); 7],
+        delay: [0; 7],
+        lane_map_agrees: false,
+    };
+}
+
+/// Result of [`cold_init_ca_train`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CaTrainReport {
+    pub exec: ColdInitReport,
+    /// Per [`coldinit::CBT_BLOCKS`] entry.
+    pub blocks: [BlockTrain; 8],
+    /// Blocks trained (entered, swept and left).
+    pub done: u8,
+    /// Per channel (A, B); applied to the AC blocks after the last block.
+    pub channels: [ChannelCa; 2],
+}
+
+impl CaTrainReport {
+    pub const EMPTY: CaTrainReport = CaTrainReport {
+        exec: ColdInitReport::EMPTY,
+        blocks: [BlockTrain::EMPTY; 8],
+        done: 0,
+        channels: [ChannelCa::EMPTY; 2],
+    };
+}
+
+/// Combine the four blocks of channel `ch` (indices 4 ch .. 4 ch + 3).
+pub fn combine_channel(blocks: &[BlockTrain; 8], ch: usize) -> ChannelCa {
+    let full = u64::MAX >> (64 - LANE_SWEEP_POINTS);
+    let set = &blocks[4 * ch..4 * ch + 4];
+    let mut out = ChannelCa {
+        lane_map_agrees: true,
+        ..ChannelCa::EMPTY
+    };
+    for lane in 0..7 {
+        let bit = set[0].lane_bit[lane];
+        let mut map = full;
+        for b in set {
+            if b.lane_bit[lane] != bit || bit == 0xff {
+                out.lane_map_agrees = false;
+            }
+            map &= b.lane_maps[lane];
+        }
+        out.runs[lane] = coldinit::longest_run(map as u128, LANE_SWEEP_POINTS);
+        let (s, l) = out.runs[lane];
+        out.delay[lane] = if l == 0 {
+            set[0].lane_delay[lane]
+        } else {
+            (((s + l / 2) % LANE_SWEEP_POINTS) as u16) * LANE_SWEEP_STEP
+        };
+    }
+    out
+}
+
+/// Command bus training by the host on every channel, rank and CBT phase, in
+/// the oracle's block order ([`coldinit::CBT_BLOCKS`]): cold init to CBT on
+/// the first block, then per block our own CA search
+/// ([`BlockTrain`]) between the block's entry and exit. Afterwards each
+/// channel's CA delays are the centers of its four blocks' window
+/// intersections, applied to its AC block. Call after [`pre_training`]. The
+/// DRAM has left CBT at the end. Stops at the first ACSM failure.
+pub fn cold_init_ca_train<H: Hw>(
+    hw: &mut H,
+    m1: &coldinit::Mrs,
+    m2: &coldinit::Mrs2,
+    out: &mut CaTrainReport,
+) {
+    let t0 = hw.now_us();
+    *out = CaTrainReport::EMPTY;
+    let mut ex = Executor {
+        hw: &mut *hw,
+        r: out.exec,
+        loop_run: 0,
+        mem_reset: 3,
+    };
+    bring_up_to_cbt(&mut ex, m1, m2, &mut |_| {});
+    for (i, b) in coldinit::CBT_BLOCKS.iter().enumerate() {
+        if ex.r.failure.is_some() {
+            break;
+        }
+        if i > 0 {
+            coldinit::block_entry(b, m2, &mut |s| ex.step(s));
+        }
+        ex.train_block(b, &mut out.blocks[i]);
+        coldinit::block_exit(b, m2, &mut |s| ex.step(s));
+        if ex.r.failure.is_none() {
+            out.done += 1;
+        }
+    }
+    coldinit::cbt_end(&mut |s| ex.step(s));
+    out.channels = [
+        combine_channel(&out.blocks, 0),
+        combine_channel(&out.blocks, 1),
+    ];
+    if out.done == 8 {
+        for (c, ca) in [coldinit::CBT_A, coldinit::CBT_B]
+            .iter()
+            .zip(out.channels.iter())
+        {
+            coldinit::set_block_delays(c.ac, &ca.delay, &mut |s| ex.step(s));
         }
     }
     out.exec = ex.r;
     csr_access(hw, false);
     out.exec.elapsed_us = hw.now_us().wrapping_sub(t0);
-    out
 }

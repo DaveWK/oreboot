@@ -15,12 +15,16 @@
 //!   carry `0x?b00`, `0x0400`, `0x0800` or `0x4800` (field meaning not
 //!   established: they are reproduced as the oracle's timing rows).
 //!
-//! This covers part 1 of DevInit at the boot pstate: after the DRAM reset is
-//! released, CS initialization, a two-row command with rising code 0x70 and
-//! operand 6 (multi-purpose command class; purpose not verified) and MRW of
-//! MR16/MR1/MR28, then MR16/MR41, per channel and rank. WCK2CK sync, MR18 and
-//! later steps follow in DevInit and are not generated yet. The mode register
-//! values are inputs ([`Mrs`]).
+//! This covers DevInit at the boot pstate: part 1 after the DRAM reset is
+//! released (CS initialization, a two-row command with rising code 0x70 and
+//! operand 6, multi-purpose command class, purpose not verified, and MRW of
+//! MR16/MR1/MR28, then MR16/MR41, per channel and rank), and the command bus
+//! training blocks ([`CBT_BLOCKS`]: per channel, rank and CBT phase, the
+//! entry with WCK2CK sync and I/O mode registers, CBT pattern points and the
+//! exit). The second and later blocks are checked against the oracle's
+//! decoded record in `tests/fixtures/devinit-cbt-blocks-pstate1.txt`. Mode
+//! register values are inputs ([`Mrs`], [`Mrs2`]); the CA search on the
+//! echo is ours (`blobless::cold_init_ca_train`).
 
 /// One ACSM memory row.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -36,14 +40,15 @@ impl Row {
     }
 
     /// Row driving CA `lo` on the first and `hi` on the second phase with
-    /// chip selects `cs` (CBT patterns); control as for [`Row::cmd`].
+    /// chip selects `cs` (CBT patterns, and commands sent while a rank is in
+    /// command bus training). The oracle's rows of this form carry no control
+    /// word, also for rank 1.
     pub const fn ca2(cs: u8, lo: u8, hi: u8) -> Row {
-        let ctl = if cs & 2 != 0 { 0x0010 } else { 0 };
         Row([
             ((cs as u16 & 3) << 14) | (((hi & 0x7f) as u16) << 7) | (lo & 0x7f) as u16,
             0,
             0,
-            ctl,
+            0,
         ])
     }
 
@@ -68,6 +73,16 @@ pub const fn mrw(cs: u8, ma: u8, op: u8) -> [Row; 4] {
         Row::cmd(0, ma),
         Row::cmd(cs, 0x08 | ((op >> 7) << 6)),
         Row::cmd(0, op & 0x7f),
+    ]
+}
+
+/// LPDDR5 MRW as two rows with both CA edges each (MRW-1 + MA, MRW-2 +
+/// OP[6:0]), CS on both: the form the oracle uses for rank 0 while rank 1 is
+/// in command bus training.
+pub const fn mrw_ddr(cs: u8, ma: u8, op: u8) -> [Row; 2] {
+    [
+        Row::ca2(cs, 0x58, ma),
+        Row::ca2(cs, 0x08 | ((op >> 7) << 6), op & 0x7f),
     ]
 }
 
@@ -340,7 +355,7 @@ pub fn part1(m: &Mrs, emit: &mut impl FnMut(Step)) {
     }
 }
 
-/// Part 2 mode registers (WCK and I/O settings, then CBT entry).
+/// Part 2 and command bus training mode registers.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Mrs2 {
     pub mr18: u8,
@@ -348,8 +363,18 @@ pub struct Mrs2 {
     pub mr17: u8,
     pub mr11: u8,
     pub mr13: u8,
-    /// MR16 value that enters command bus training.
+    /// MR16 value that enters command bus training (phase 0; OP[7] selects
+    /// the CBT phase and is set for phase 1).
     pub mr16_cbt: u8,
+    /// MR16 written to the trained rank when it leaves CBT.
+    pub mr16_exit: u8,
+    /// MR16 of rank 0 while rank 1 is trained (OP[7] follows the phase), and
+    /// when it is restored.
+    pub mr16_park: u8,
+    pub mr16_unpark: u8,
+    /// MR17 written to rank 1 before its set-up (rank 1 gets MR18, MR3 and
+    /// MR13 only; rank 0 gets MR17 and MR11 with them).
+    pub mr17_rank1: u8,
 }
 
 impl Mrs2 {
@@ -361,6 +386,10 @@ impl Mrs2 {
         mr11: 0x10,
         mr13: 0x60,
         mr16_cbt: 0x61,
+        mr16_exit: 0x41,
+        mr16_park: 0x45,
+        mr16_unpark: 0x40,
+        mr17_rank1: 0x2e,
     };
 }
 
@@ -381,20 +410,24 @@ pub const fn async_rx_data(n: u32) -> u32 {
 /// The DBYTE that returns channel A's CBT feedback.
 pub const CBT_DBYTE_A: u32 = 1;
 /// AC block `blk` CA lane `lane` delay (Address/Command Delay, per pstate).
+/// Block 0xf addresses every AC block; lane 0xf every lane of a block.
 pub const fn ca_delay(blk: u32, lane: u32) -> u32 {
     0x30001 + 0x1000 * blk + 0x100 * lane
 }
+/// AC block `blk` register 2 (written with the CA delays; meaning not
+/// established).
+pub const fn ac_reg2(blk: u32) -> u32 {
+    0x30002 + 0x1000 * blk
+}
+/// AC broadcast block.
+pub const AC_ALL: u32 = 0xf;
 /// Applies new delay CSR values (TRM: ForceInternalUpdate), pulsed 1 then 0.
 const FORCE_INTERNAL_UPDATE: u32 = 0x200a3;
-/// Writes before the first WCK loop (named in the TRM register list:
-/// 0x20041 ACSMWckFreeRunMode, 0x2002a ACSMWckEnControl).
-const WCK_SETUP: [(u32, u16); 5] = [
-    (0x30f01, 0),
-    (0x30002, 0),
-    (0x20041, 1),
-    (0x2002a, 1),
-    (0x20007, 0x100),
-];
+/// TRM register list: ACSMWckFreeRunMode, ACSMWckEnControl.
+const WCK_FREE_RUN: u32 = 0x20041;
+const WCK_EN_CONTROL: u32 = 0x2002a;
+/// Written 0x100 before CBT entry and 0 after the exit (not established).
+const CBT_CONTROL: u32 = 0x20007;
 /// WCK loop body: rows with hw1/hw2 control (meaning not established).
 const WCK_LOOP: [Row; 16] = [
     Row::raw(0, 0x4000, 1, 0),
@@ -417,21 +450,81 @@ const WCK_LOOP: [Row; 16] = [
 const WCK_LOOP_START: u16 = 300;
 const PAIR_GAP: [Row; 2] = [Row::nop(0x5b00), Row::EMPTY];
 
-/// Part 2 at the boot pstate on channel A, rank 0 (cs 1), up to command bus
-/// training entry with the asynchronous DQ path of DBYTE 1 set up and the
-/// WCK loop stopped. Continues where [`part1`] ended.
-pub fn part2(m: &Mrs2, emit: &mut impl FnMut(Step)) {
-    let a = Channels::A.mask();
-    ls_off(Channels::B.mask(), emit);
-    select(Channels::Both, 0x0e, emit);
-    select(Channels::A, 0, emit);
-    for (csr, v) in WCK_SETUP {
-        emit(Step::Write(csr, v));
+/// One channel's command bus training resources: the AC block driving its CA
+/// lanes, the DBYTE returning the DRAM's echo, and the asynchronous DQ set-up
+/// of that DBYTE (values as in the oracle).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CbtChannel {
+    pub ch: Channels,
+    pub ac: u32,
+    pub dbyte: u32,
+    /// AsyncDbyteTxMode/TxEn while measuring: the lanes the host drives (one
+    /// DQ lane plus lane 8, DMI); they carry no echo.
+    pub tx_lanes: u16,
+    /// AsyncDbyteTxData written after the CBT entry MRW.
+    pub tx_entry: u16,
+    /// AsyncDbyteTxData written before measuring (two writes).
+    pub tx_data: [u16; 2],
+}
+
+impl CbtChannel {
+    /// AsyncDbyteRxData bits that carry the echo of CA[6:0].
+    pub const fn echo_bits(&self) -> u16 {
+        0xff & !self.tx_lanes
     }
-    let n = CBT_DBYTE_A;
-    emit(Step::Write(async_tx_mode(n), 0x1ff));
-    emit(Step::Write(async_tx_en(n), 0x1ff));
-    emit(Step::Write(async_tx_data(n), 0));
+}
+
+pub const CBT_A: CbtChannel = CbtChannel {
+    ch: Channels::A,
+    ac: 0,
+    dbyte: CBT_DBYTE_A,
+    tx_lanes: 0x110,
+    tx_entry: 0x10,
+    tx_data: [0x52, 0x152],
+};
+pub const CBT_B: CbtChannel = CbtChannel {
+    ch: Channels::B,
+    ac: 1,
+    dbyte: 3,
+    tx_lanes: 0x104,
+    tx_entry: 0x04,
+    tx_data: [0x0e, 0x10e],
+};
+
+/// One command bus training block: a channel, a rank and a CBT phase (MR16
+/// OP[7]).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CbtBlock {
+    pub chan: CbtChannel,
+    pub rank: u8,
+    pub phase: u8,
+}
+
+impl CbtBlock {
+    /// Chip select of the trained rank.
+    pub const fn cs(&self) -> u8 {
+        1 << self.rank
+    }
+}
+
+const fn block(chan: CbtChannel, rank: u8, phase: u8) -> CbtBlock {
+    CbtBlock { chan, rank, phase }
+}
+
+/// The oracle's block order: per channel, per rank, phase 0 then 1.
+pub const CBT_BLOCKS: [CbtBlock; 8] = [
+    block(CBT_A, 0, 0),
+    block(CBT_A, 0, 1),
+    block(CBT_A, 1, 0),
+    block(CBT_A, 1, 1),
+    block(CBT_B, 0, 0),
+    block(CBT_B, 0, 1),
+    block(CBT_B, 1, 0),
+    block(CBT_B, 1, 1),
+];
+
+/// WCK loop with ACSMInfiniteOLRC set, then cleared and awaited.
+fn wck_loop(emit: &mut impl FnMut(Step)) {
     emit(Step::Write(ACSM_INFINITE_OLRC, 1));
     emit(Step::LaunchLoop {
         start: WCK_LOOP_START,
@@ -439,69 +532,206 @@ pub fn part2(m: &Mrs2, emit: &mut impl FnMut(Step)) {
     });
     emit(Step::Write(ACSM_INFINITE_OLRC, 0));
     emit(Step::AwaitEnd);
-    ls_on(a, emit);
-    // MR18, WCK2CK sync (CAS 0x38/0x40), MR3, MR17, MR11, MR13.
+}
+
+fn async_open(n: u32, emit: &mut impl FnMut(Step)) {
+    emit(Step::Write(async_tx_mode(n), 0x1ff));
+    emit(Step::Write(async_tx_en(n), 0x1ff));
+    emit(Step::Write(async_tx_data(n), 0));
+}
+
+/// The MRW launch that enters CBT on `b`'s rank and phase, with the WCK loop
+/// body, repeating; rank 0 is parked while rank 1 enters.
+fn entry_launch(b: &CbtBlock, m: &Mrs2, emit: &mut impl FnMut(Step)) {
     let mut r = Rows::new();
     r.push(&HEAD);
-    r.push(&mrw(1, 18, m.mr18));
-    r.push(&PAIR_GAP);
-    r.push(&PAIR_GAP);
-    r.push(&[Row::cmd(1, 0x38), Row::cmd(1, 0x40)]);
-    r.push(&PAIR_GAP);
-    for (ma, op) in [(3, m.mr3), (17, m.mr17), (11, m.mr11), (13, m.mr13)] {
-        r.push(&mrw(1, ma, op));
-        r.push(&AFTER_MRW);
+    r.push(&mrw(b.cs(), 16, m.mr16_cbt | (b.phase << 7)));
+    if b.rank == 0 {
+        r.push(&[Row::nop(0x1a00), Row::EMPTY, Row::nop(0x0100), Row::EMPTY]);
+    } else {
+        r.push(&[Row::nop(0x3b00), Row::EMPTY]);
+        r.push(&mrw(1, 16, m.mr16_park | (b.phase << 7)));
+        r.push(&[Row::nop(0x7b00), Row::nop(0x0c00)]);
     }
-    r.push(&TAIL);
-    emit(Step::Launch {
-        start: 0,
-        rows: r.rows(),
-    });
-    // MR16: enter CBT, with the WCK loop body, repeating.
-    ls_off(a, emit);
-    emit(Step::Write(ACSM_INFINITE_OLRC, 1));
-    ls_on(a, emit);
-    let mut r = Rows::new();
-    r.push(&HEAD);
-    r.push(&mrw(1, 16, m.mr16_cbt));
-    r.push(&[Row::nop(0x1a00), Row::EMPTY, Row::nop(0x0100), Row::EMPTY]);
     r.push(&WCK_LOOP);
     r.push(&TAIL);
     emit(Step::LaunchLoop {
         start: 0,
         rows: r.rows(),
     });
-    emit(Step::Write(async_tx_data(n), 0x10));
-    ls_off(a, emit);
+}
+
+/// After the entry launch: stop it, then the WCK loop again while the
+/// asynchronous DQ path is set up for measuring.
+fn entry_finish(c: &CbtChannel, emit: &mut impl FnMut(Step)) {
+    let mask = c.ch.mask();
+    emit(Step::Write(async_tx_data(c.dbyte), c.tx_entry));
+    ls_off(mask, emit);
     emit(Step::Write(ACSM_INFINITE_OLRC, 0));
     emit(Step::AwaitEnd);
-    // WCK loop again while the asynchronous DQ path is set up.
     emit(Step::Write(ACSM_INFINITE_OLRC, 1));
     emit(Step::LaunchLoop {
         start: WCK_LOOP_START,
         rows: &WCK_LOOP,
     });
-    emit(Step::Write(async_tx_data(n), 0x52));
-    emit(Step::Write(async_tx_data(n), 0x152));
-    emit(Step::Write(async_tx_mode(n), 0x110));
-    emit(Step::Write(async_tx_en(n), 0x110));
+    emit(Step::Write(async_tx_data(c.dbyte), c.tx_data[0]));
+    emit(Step::Write(async_tx_data(c.dbyte), c.tx_data[1]));
+    emit(Step::Write(async_tx_mode(c.dbyte), c.tx_lanes));
+    emit(Step::Write(async_tx_en(c.dbyte), c.tx_lanes));
     emit(Step::Write(ACSM_INFINITE_OLRC, 0));
     emit(Step::AwaitEnd);
 }
 
-/// The four CBT patterns: (first row, CS row) as (cs, CA first phase, CA
-/// second phase). The DRAM in CBT mode returns the CA it latched on DQ.
+/// Enter command bus training for block `b`. For phase 0 this selects the
+/// channel and writes the rank's WCK and I/O mode registers first (CAS-WCK
+/// sync included); phase 1 follows the phase-0 exit of the same rank and
+/// only re-enters with MR16 OP[7] set.
+pub fn block_entry(b: &CbtBlock, m: &Mrs2, emit: &mut impl FnMut(Step)) {
+    let c = &b.chan;
+    let mask = c.ch.mask();
+    let cs = b.cs();
+    if b.phase == 0 {
+        select(c.ch, 0, emit);
+        emit(Step::Write(ca_delay(c.ac, 0xf), 0));
+        emit(Step::Write(ac_reg2(c.ac), 0));
+    }
+    emit(Step::Write(WCK_FREE_RUN, 1));
+    emit(Step::Write(WCK_EN_CONTROL, 1));
+    emit(Step::Write(CBT_CONTROL, 0x100));
+    async_open(c.dbyte, emit);
+    if b.phase == 0 {
+        wck_loop(emit);
+        ls_on(mask, emit);
+        if b.rank != 0 {
+            let mut r = Rows::new();
+            r.push(&HEAD);
+            r.push(&mrw(cs, 17, m.mr17_rank1));
+            r.push(&AFTER_MRW);
+            r.push(&TAIL);
+            emit(Step::Launch {
+                start: 0,
+                rows: r.rows(),
+            });
+            ls_off(mask, emit);
+            ls_on(mask, emit);
+        }
+        // MR18, WCK2CK sync (CAS 0x38/0x40), then the I/O mode registers.
+        let mut r = Rows::new();
+        r.push(&HEAD);
+        r.push(&mrw(cs, 18, m.mr18));
+        r.push(&PAIR_GAP);
+        r.push(&PAIR_GAP);
+        r.push(&[Row::cmd(cs, 0x38), Row::cmd(cs, 0x40)]);
+        r.push(&PAIR_GAP);
+        let rank0 = [(3, m.mr3), (17, m.mr17), (11, m.mr11), (13, m.mr13)];
+        let rank1 = [(3, m.mr3), (13, m.mr13)];
+        let regs: &[(u8, u8)] = if b.rank == 0 { &rank0 } else { &rank1 };
+        for &(ma, op) in regs {
+            r.push(&mrw(cs, ma, op));
+            r.push(&AFTER_MRW);
+        }
+        r.push(&TAIL);
+        emit(Step::Launch {
+            start: 0,
+            rows: r.rows(),
+        });
+        ls_off(mask, emit);
+    }
+    emit(Step::Write(ACSM_INFINITE_OLRC, 1));
+    ls_on(mask, emit);
+    entry_launch(b, m, emit);
+    entry_finish(c, emit);
+}
+
+/// Leave command bus training of block `b`: CA delays of every AC block back
+/// to 0 (applied), rank 0 restored (rank-1 blocks, in the two-edge form while rank 1 is
+/// still in CBT), the WCK loop, then MR16 on the trained rank.
+pub fn block_exit(b: &CbtBlock, m: &Mrs2, emit: &mut impl FnMut(Step)) {
+    let c = &b.chan;
+    let mask = c.ch.mask();
+    for lane in 0..7 {
+        emit(Step::Write(ca_delay(AC_ALL, lane), 0));
+    }
+    emit(Step::Write(FORCE_INTERNAL_UPDATE, 1));
+    emit(Step::Write(FORCE_INTERNAL_UPDATE, 0));
+    if b.rank != 0 {
+        let mut r = Rows::new();
+        r.push(&mrw_ddr(1, 16, m.mr16_unpark));
+        r.push(&[Row::nop(0x7b00), Row::nop(0x0400)]);
+        emit(Step::Launch {
+            start: 0,
+            rows: r.rows(),
+        });
+    }
+    ls_on(mask, emit);
+    emit(Step::Write(ACSM_INFINITE_OLRC, 1));
+    emit(Step::LaunchLoop {
+        start: WCK_LOOP_START,
+        rows: &WCK_LOOP,
+    });
+    emit(Step::Write(async_tx_data(c.dbyte), 0x100));
+    emit(Step::Write(ACSM_INFINITE_OLRC, 0));
+    emit(Step::AwaitEnd);
+    emit(Step::Write(WCK_FREE_RUN, 0));
+    ls_on(mask, emit);
+    let mut r = Rows::new();
+    r.push(&HEAD);
+    r.push(&[Row::nop(0x5b00), Row::nop(0x0c00)]);
+    r.push(&mrw(b.cs(), 16, m.mr16_exit));
+    r.push(&AFTER_FIRST_MRW);
+    r.push(&TAIL);
+    emit(Step::Launch {
+        start: 0,
+        rows: r.rows(),
+    });
+    ls_off(mask, emit);
+    emit(Step::Write(async_tx_data(c.dbyte), 0x1000));
+    emit(Step::Write(CBT_CONTROL, 0));
+}
+
+/// After the last block: every AC block's CA delays and register 2 to 0,
+/// applied.
+pub fn cbt_end(emit: &mut impl FnMut(Step)) {
+    for lane in 0..7 {
+        emit(Step::Write(ca_delay(AC_ALL, lane), 0));
+    }
+    emit(Step::Write(ac_reg2(AC_ALL), 0));
+    emit(Step::Write(FORCE_INTERNAL_UPDATE, 1));
+    emit(Step::Write(FORCE_INTERNAL_UPDATE, 0));
+}
+
+/// Part 2 at the boot pstate: both channels selected once, then CBT entry on
+/// channel A, rank 0, phase 0 ([`CBT_BLOCKS`]\[0\]) with the asynchronous DQ
+/// path of DBYTE 1 set up and the WCK loop stopped. Continues where [`part1`]
+/// ended.
+pub fn part2(m: &Mrs2, emit: &mut impl FnMut(Step)) {
+    ls_off(Channels::B.mask(), emit);
+    select(Channels::Both, 0x0e, emit);
+    block_entry(&CBT_BLOCKS[0], m, emit);
+}
+
+/// The four CBT patterns for phase 0: (first row, CS row) as (cs, CA first
+/// phase, CA second phase), CS row on rank 0. The DRAM in CBT mode returns the
+/// CA it latched on DQ.
 pub const CBT_PATTERNS: [[(u8, u8, u8); 2]; 4] = [
     [(0, 0x00, 0x7f), (1, 0x00, 0x00)],
     [(0, 0x00, 0x00), (1, 0x7f, 0x00)],
     [(0, 0x7f, 0x00), (1, 0x7f, 0x7f)],
     [(0, 0x7f, 0x7f), (1, 0x00, 0x7f)],
 ];
+/// Phase 1 (the DRAM latches the CS row's second edge): that edge carries the
+/// level of [`CBT_EXPECT`], so the aligned echo is the same as in phase 0.
+pub const CBT_PATTERNS_PHASE1: [[(u8, u8, u8); 2]; 4] = [
+    [(0, 0x00, 0x00), (1, 0x7f, 0x00)],
+    [(0, 0x00, 0x00), (1, 0x00, 0x7f)],
+    [(0, 0x7f, 0x7f), (1, 0x00, 0x7f)],
+    [(0, 0x7f, 0x7f), (1, 0x7f, 0x00)],
+];
 const CBT_STARTS: [u16; 4] = [100, 118, 136, 154];
 
-/// One CBT point on channel A: set all seven CA lane delays of AC block 0 to
-/// `delay`, apply, then for each pattern run its launch and read DBYTE 1's
-/// AsyncDbyteRxData.
+/// One CBT point on channel A, rank 0, phase 0: set all seven CA lane delays
+/// of AC block 0 to `delay`, apply, then for each pattern run its launch and
+/// read DBYTE 1's AsyncDbyteRxData.
 pub fn cbt_point(delay: u16, emit: &mut impl FnMut(Step)) {
     cbt_point_bytes(delay, &[CBT_DBYTE_A], emit)
 }
@@ -513,21 +743,45 @@ pub fn cbt_point_bytes(delay: u16, bytes: &[u32], emit: &mut impl FnMut(Step)) {
     cbt_patterns(bytes, emit);
 }
 
+/// One CBT point of block `b`: its channel's seven CA lane delays, then the
+/// four patterns of its phase on its rank, reading its DBYTE after each.
+pub fn cbt_point_block(b: &CbtBlock, delays: &[u16; 7], emit: &mut impl FnMut(Step)) {
+    set_block_delays(b.chan.ac, delays, emit);
+    block_patterns(b, &[b.chan.dbyte], emit);
+}
+
 /// Set the seven CA lane delays of AC block 0 and apply them
 /// (ForceInternalUpdate pulse).
 pub fn set_ca_delays(delays: &[u16; 7], emit: &mut impl FnMut(Step)) {
+    set_block_delays(0, delays, emit);
+}
+
+/// Set the seven CA lane delays of AC block `ac` and apply them.
+pub fn set_block_delays(ac: u32, delays: &[u16; 7], emit: &mut impl FnMut(Step)) {
     for (lane, &d) in delays.iter().enumerate() {
-        emit(Step::Write(ca_delay(0, lane as u32), d));
+        emit(Step::Write(ca_delay(ac, lane as u32), d));
     }
     emit(Step::Write(FORCE_INTERNAL_UPDATE, 1));
     emit(Step::Write(FORCE_INTERNAL_UPDATE, 0));
 }
 
-/// Run the four CBT pattern launches, reading AsyncDbyteRxData of each DBYTE
-/// in `bytes` after every one.
+/// Run the four phase-0 rank-0 CBT pattern launches, reading
+/// AsyncDbyteRxData of each DBYTE in `bytes` after every one.
 pub fn cbt_patterns(bytes: &[u32], emit: &mut impl FnMut(Step)) {
-    for (pat, &start) in CBT_PATTERNS.iter().zip(CBT_STARTS.iter()) {
-        let [(c0, l0, h0), (c1, l1, h1)] = *pat;
+    block_patterns(&CBT_BLOCKS[0], bytes, emit);
+}
+
+/// The four CBT pattern launches of block `b` (its phase's patterns, CS row
+/// on its rank), reading AsyncDbyteRxData of each DBYTE in `bytes` after
+/// every one.
+pub fn block_patterns(b: &CbtBlock, bytes: &[u32], emit: &mut impl FnMut(Step)) {
+    let pats = if b.phase == 0 {
+        &CBT_PATTERNS
+    } else {
+        &CBT_PATTERNS_PHASE1
+    };
+    for (pat, &start) in pats.iter().zip(CBT_STARTS.iter()) {
+        let [(c0, l0, h0), (_, l1, h1)] = *pat;
         let rows = [
             Row::raw(0, 0x4000, 1, 0),
             Row::EMPTY,
@@ -536,7 +790,7 @@ pub fn cbt_patterns(bytes: &[u32], emit: &mut impl FnMut(Step)) {
             Row::nop(0x3b00),
             Row::EMPTY,
             Row::ca2(c0, l0, h0),
-            Row::ca2(c1, l1, h1),
+            Row::ca2(b.cs(), l1, h1),
             Row::nop(0x3b00),
             Row::nop(0x0800),
             Row::raw(0, 0x0003, 0, 0),
@@ -556,17 +810,23 @@ pub fn cbt_patterns(bytes: &[u32], emit: &mut impl FnMut(Step)) {
 }
 
 /// AsyncDbyteRxData bits (physical lanes) that carry the CBT echo of CA[6:0]
-/// on the Cubie A7A (measured, M6): lanes 4 (host-driven, memory DQ7 by the
-/// DBYTE 1 lane map) and 8 (DMI) do not.
-pub const CBT_ECHO_BITS: u16 = 0x00ef;
-/// Expected echo per pattern when the DRAM latches the CS row's first phase
-/// (the aligned case), as a per-bit level.
+/// on channel A (measured, M6): lanes 4 (host-driven, memory DQ7 by the
+/// DBYTE 1 lane map) and 8 (DMI) do not. See [`CbtChannel::echo_bits`].
+pub const CBT_ECHO_BITS: u16 = CBT_A.echo_bits();
+/// Expected echo per pattern when the DRAM latches the CS row's edge of its
+/// phase (the aligned case), as a per-bit level.
 pub const CBT_EXPECT: [bool; 4] = [false, true, true, false];
 
-/// Bits of `echo` (four AsyncDbyteRxData samples, one per pattern) that pass:
-/// every pattern shows the expected level on that bit.
+/// Bits of `echo` (four AsyncDbyteRxData samples, one per pattern) that pass
+/// on channel A: every pattern shows the expected level on that bit.
 pub const fn cbt_pass(echo: [u16; 4]) -> u16 {
-    let mut pass = CBT_ECHO_BITS;
+    cbt_pass_bits(echo, CBT_ECHO_BITS)
+}
+
+/// [`cbt_pass`] over the echo bits `bits` (a channel's
+/// [`CbtChannel::echo_bits`]).
+pub const fn cbt_pass_bits(echo: [u16; 4], bits: u16) -> u16 {
+    let mut pass = bits;
     let mut p = 0;
     while p < 4 {
         let want = if CBT_EXPECT[p] { 0xffff } else { 0 };
