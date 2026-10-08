@@ -426,10 +426,11 @@ fn dwc3_host_init() -> Result<(), &'static str> {
         return Err("did not halt");
     }
     set(op + XHCI_USBCMD, USBCMD_HCRST);
-    if !poll(op + XHCI_USBCMD, USBCMD_HCRST, 0, 100_000)
-        || !poll(op + XHCI_USBSTS, USBSTS_CNR, 0, 100_000)
-    {
-        return Err("reset did not complete");
+    if !poll(op + XHCI_USBCMD, USBCMD_HCRST, 0, 100_000) {
+        return Err("HCRST did not clear within 100 ms");
+    }
+    if !poll(op + XHCI_USBSTS, USBSTS_CNR, 0, 100_000) {
+        return Err("CNR did not clear within 100 ms");
     }
 
     // Init done: let the unused SuperSpeed PHY interface suspend.
@@ -443,7 +444,10 @@ pub fn init() {
     // The USB2 PHY block is in PCK-600 domain 8, off at cold boot; until it
     // is on, the PHY MMIO at 0x06B00000 drops writes and reads 0.
     if let Err(e) = ppu::power_on(ppu::USB2) {
-        println!("[main] USB: USB2 power domain: {e:?}; continuing");
+        println!("[main] USB: USB2 power domain: {e:?}; controllers withheld");
+        // Do not access PHY/controller registers behind a domain that failed
+        // to power on. No USB readiness has been published.
+        return;
     }
     ccu_init();
     phy_init();
