@@ -24,6 +24,24 @@ pub use phy::PhyFirmware;
 
 use ctrl::{ddrc, DDRC_184, DDRC_B84, PWRCTL};
 
+/// Distinguish ordinary initialization failures from result-save recovery
+/// failures without discarding either the primary or any per-rank error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InitError {
+    Operation(Error),
+    ResultSave(post::SaveFailure),
+}
+impl From<Error> for InitError {
+    fn from(error: Error) -> Self {
+        Self::Operation(error)
+    }
+}
+impl From<post::SaveFailure> for InitError {
+    fn from(error: post::SaveFailure) -> Self {
+        Self::ResultSave(error)
+    }
+}
+
 /// Controllers and PHY of every channel: clocks, controller set-up, PHY
 /// training, DFI handshake. Returns after the controllers run normally.
 pub fn core_init<H: Hw>(hw: &mut H, p: &mut Para, fw: &PhyFirmware) -> Result<(), Error> {
@@ -59,19 +77,17 @@ pub fn core_init<H: Hw>(hw: &mut H, p: &mut Para, fw: &PhyFirmware) -> Result<()
 
 /// Bring up LPDDR5 with parameter set `p`. Returns the size in MiB; `p`
 /// then also holds the size (para2) and the training results.
-pub fn init<H: Hw>(hw: &mut H, p: &mut Para, fw: &PhyFirmware) -> Result<u32, Error> {
+pub fn init<H: Hw>(hw: &mut H, p: &mut Para, fw: &PhyFirmware) -> Result<u32, InitError> {
     hw.log(format_args!(
         "[dram] open LPDDR5 init: {} MHz, type {}\n",
         p.clk(),
         p.ty()
     ));
     if !p.is_lpddr5() {
-        return Err(Error::Config("only LPDDR5 (dram_type 9) is supported"));
+        return Err(Error::Config("only LPDDR5 (dram_type 9) is supported").into());
     }
     if p.tpr13() & 1 == 0 {
-        return Err(Error::Config(
-            "geometry scan (tpr13[0] clear) is not supported",
-        ));
+        return Err(Error::Config("geometry scan (tpr13[0] clear) is not supported").into());
     }
     ccu::validate_pll_ddr_rate(p.clk())?;
     phy::init::validate(p)?;

@@ -7,7 +7,7 @@
 
 use core::fmt;
 
-use cubie_a7a_dram::{Error, Hw, Para, PhyFirmware, Rail};
+use cubie_a7a_dram::{Error, Hw, InitError, Para, PhyFirmware, Rail};
 
 use super::PMIC;
 use crate::soc;
@@ -92,16 +92,28 @@ pub fn init_one(para: &[u32; 32]) -> Option<u32> {
                 "[bt0] DRAM: open init failed after {ms} ms: {}",
                 ErrorText(e)
             );
+            if matches!(e, InitError::ResultSave(failure) if failure.recovery_failed()) {
+                // Do not automatically attempt another parameter set after
+                // ambiguous restoration. The already armed boot watchdog and
+                // existing halt/recovery path retain control.
+                crate::halt();
+            }
             None
         }
     }
 }
 
-struct ErrorText(Error);
+struct ErrorText(InitError);
 
 impl fmt::Display for ErrorText {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.0 {
+        let error = match self.0 {
+            InitError::Operation(error) => error,
+            InitError::ResultSave(failure) => {
+                return write!(f, "result save/recovery failed: {failure:?}")
+            }
+        };
+        match error {
             Error::Power => write!(f, "PMIC refused a DRAM rail"),
             Error::Timeout(what) => write!(f, "timeout: {what}"),
             Error::Training { pstate, message } => {

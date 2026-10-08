@@ -189,34 +189,74 @@ pub fn controller_after_phy<H: Hw>(hw: &mut H, p: &Para) -> Result<(), Error> {
     Ok(())
 }
 
-/// Store the trained per-lane delays (PHY DBYTE +0x4e/+0x4f of the 9
-/// lanes, 4 byte lanes per word) in words 32..49 and each rank's MR14/MR15
-/// (VREF(DQ) after training, read with MR16 FSP-OP 1 selected) in words
-/// 50/51, as vendor boot0 hands them on.
-pub fn save_training_results<H: Hw>(hw: &mut H, p: &mut Para) -> Result<(), Error> {
+/// Result-save failure, including each independently attempted restoration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SaveFailure {
+    /// Initial operation failure, before restoration (if one occurred).
+    pub primary: Option<Error>,
+    /// Restoration failure per channel/rank: ch0r0,ch0r1,ch1r0,ch1r1.
+    pub restore: [Option<Error>; 4],
+    /// A failed command may nevertheless have reached the DRAM.
+    pub attempted_ranks: u8,
+}
+impl SaveFailure {
+    pub fn recovery_failed(&self) -> bool {
+        self.restore.iter().any(Option::is_some)
+    }
+}
+
+/// Store per-lane delays (DBYTE +0x4e/+0x4f, nine lanes) in words 32..49 and
+/// each rank's MR14/MR15 in words 50/51, preserving the inherited ABI.
+/// Stage results until every operation and restoration succeeds. On any
+/// error, invalidate the output, attempt MR16=4 on each possibly changed rank,
+/// and return CSR ownership through the existing baseline close operation.
+/// A successful restore command is not proof of physical state recovery.
+pub fn save_training_results<H: Hw>(hw: &mut H, p: &mut Para) -> Result<(), SaveFailure> {
+    p.w[32..52].fill(0);
+    let mut staged = [0u32; 20];
+    let mut attempted_ranks = 0u8;
     phy::csr_access(hw, true);
-    for lane in 0..9 {
-        for (half, word) in [(0, 32), (2, 41)] {
-            let mut v = 0;
-            for db in 0..4 {
-                let a = phy::dbyte_lane_delay(db, lane) + half;
-                v |= (hw.read16(a) as u32 & 0x7f) << (8 * db);
+    let primary = (|| -> Result<(), Error> {
+        for lane in 0..9 {
+            for (half, word) in [(0, 0), (2, 9)] {
+                let mut v = 0;
+                for db in 0..4 {
+                    let a = phy::dbyte_lane_delay(db, lane) + half;
+                    v |= (hw.read16(a) as u32 & 0x7f) << (8 * db);
+                }
+                staged[word + lane as usize] = v;
             }
-            p.w[word + lane as usize] = v;
+        }
+        for (index, (ch, rank)) in [(0, 0), (0, 1), (1, 0), (1, 1)].into_iter().enumerate() {
+            attempted_ranks |= 1 << index;
+            crate::mr::write_rank(hw, ch, rank, 16, 5)?;
+        }
+        for (mr, word) in [(14, 18), (15, 19)] {
+            let mut v = 0;
+            for (i, (ch, rank)) in [(0, 0), (0, 1), (1, 0), (1, 1)].into_iter().enumerate() {
+                v |= crate::mr::read(hw, ch, rank, mr)? << (8 * i);
+            }
+            staged[word] = v;
+        }
+        Ok(())
+    })()
+    .err();
+    let mut restore = [None; 4];
+    for (index, (ch, rank)) in [(0, 0), (0, 1), (1, 0), (1, 1)].into_iter().enumerate() {
+        if attempted_ranks & (1 << index) != 0 {
+            // Continue best-effort restoration after an earlier restore failure.
+            restore[index] = crate::mr::write_rank(hw, ch, rank, 16, 4).err();
         }
     }
-    crate::mr::write(hw, 0, 16, 5, 5)?;
-    crate::mr::write(hw, 1, 16, 5, 5)?;
-    for (mr, word) in [(14, 50), (15, 51)] {
-        let mut v = 0;
-        for (i, (ch, rank)) in [(0, 0), (0, 1), (1, 0), (1, 1)].into_iter().enumerate() {
-            v |= crate::mr::read(hw, ch, rank, mr)? << (8 * i);
-        }
-        p.w[word] = v;
-    }
-    crate::mr::write(hw, 0, 16, 4, 4)?;
-    crate::mr::write(hw, 1, 16, 4, 4)?;
     phy::csr_access(hw, false);
+    if primary.is_some() || restore.iter().any(Option::is_some) {
+        return Err(SaveFailure {
+            primary,
+            restore,
+            attempted_ranks,
+        });
+    }
+    p.w[32..52].copy_from_slice(&staged);
     Ok(())
 }
 
