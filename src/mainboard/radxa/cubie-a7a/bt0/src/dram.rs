@@ -91,6 +91,16 @@ pub fn pmic() -> Option<&'static Axp<'static>> {
 /// Returns the DRAM size in MiB and the clock in MHz of the set that
 /// trained, or `None`.
 pub fn init(pmic: Option<Axp<'static>>, set: &'static ParamSet) -> Option<(u32, u32)> {
+    let capacity = |candidate: &ParamSet| {
+        cubie_a7a_dram::size::boot_size_mib(&cubie_a7a_dram::Para::from_sysconfig(&candidate.para))
+    };
+    let expected = match capacity(set) {
+        Ok(mib) => mib,
+        Err(error) => {
+            println!("[bt0] DRAM: invalid selected capacity: {error:?}");
+            return None;
+        }
+    };
     unsafe { *core::ptr::addr_of_mut!(PMIC) = pmic };
     let fallback: &[&'static ParamSet] = if core::ptr::eq(set, &PARAM_SETS[CXMT_4G]) {
         &[&PARAM_SETS[HYNIX_4G], &PARAM_SETS[SAFE_4G]]
@@ -100,6 +110,16 @@ pub fn init(pmic: Option<Axp<'static>>, set: &'static ParamSet) -> Option<(u32, 
         &[]
     };
     for s in core::iter::once(set).chain(fallback.iter().copied()) {
+        // A retry must not silently replace the selected physical extent.
+        // Keep the inherited parameter bytes for audit; an inconsistent set
+        // is rejected before its backend can change rails/controller/PHY.
+        if capacity(s) != Ok(expected) {
+            println!(
+                "[bt0] DRAM: skip {}: capacity differs from {expected} MiB",
+                s.name
+            );
+            continue;
+        }
         println!(
             "[bt0] DRAM: init with {} parameters ({} MHz)",
             s.name, s.para[0]
