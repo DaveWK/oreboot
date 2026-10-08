@@ -509,11 +509,23 @@ pub fn cbt_point(delay: u16, emit: &mut impl FnMut(Step)) {
 /// [`cbt_point`] reading AsyncDbyteRxData of each DBYTE in `bytes` after
 /// every pattern (diagnostics: where the CBT feedback appears).
 pub fn cbt_point_bytes(delay: u16, bytes: &[u32], emit: &mut impl FnMut(Step)) {
-    for lane in 0..7 {
-        emit(Step::Write(ca_delay(0, lane), delay));
+    set_ca_delays(&[delay; 7], emit);
+    cbt_patterns(bytes, emit);
+}
+
+/// Set the seven CA lane delays of AC block 0 and apply them
+/// (ForceInternalUpdate pulse).
+pub fn set_ca_delays(delays: &[u16; 7], emit: &mut impl FnMut(Step)) {
+    for (lane, &d) in delays.iter().enumerate() {
+        emit(Step::Write(ca_delay(0, lane as u32), d));
     }
     emit(Step::Write(FORCE_INTERNAL_UPDATE, 1));
     emit(Step::Write(FORCE_INTERNAL_UPDATE, 0));
+}
+
+/// Run the four CBT pattern launches, reading AsyncDbyteRxData of each DBYTE
+/// in `bytes` after every one.
+pub fn cbt_patterns(bytes: &[u32], emit: &mut impl FnMut(Step)) {
     for (pat, &start) in CBT_PATTERNS.iter().zip(CBT_STARTS.iter()) {
         let [(c0, l0, h0), (c1, l1, h1)] = *pat;
         let rows = [
@@ -541,4 +553,61 @@ pub fn cbt_point_bytes(delay: u16, bytes: &[u32], emit: &mut impl FnMut(Step)) {
             emit(Step::Read(async_rx_data(n)));
         }
     }
+}
+
+/// AsyncDbyteRxData bits (physical lanes) that carry the CBT echo of CA[6:0]
+/// on the Cubie A7A (measured, M6): lanes 4 (host-driven, memory DQ7 by the
+/// DBYTE 1 lane map) and 8 (DMI) do not.
+pub const CBT_ECHO_BITS: u16 = 0x00ef;
+/// Expected echo per pattern when the DRAM latches the CS row's first phase
+/// (the aligned case), as a per-bit level.
+pub const CBT_EXPECT: [bool; 4] = [false, true, true, false];
+
+/// Bits of `echo` (four AsyncDbyteRxData samples, one per pattern) that pass:
+/// every pattern shows the expected level on that bit.
+pub const fn cbt_pass(echo: [u16; 4]) -> u16 {
+    let mut pass = CBT_ECHO_BITS;
+    let mut p = 0;
+    while p < 4 {
+        let want = if CBT_EXPECT[p] { 0xffff } else { 0 };
+        pass &= !(echo[p] ^ want);
+        p += 1;
+    }
+    pass
+}
+
+/// Longest run of set bits in a circular `n`-bit window map: (start, len).
+pub fn longest_run(map: u128, n: u32) -> (u32, u32) {
+    let full = if n == 128 {
+        u128::MAX
+    } else {
+        (1u128 << n) - 1
+    };
+    let map = map & full;
+    if map == full {
+        return (0, n);
+    }
+    let mut best = (0, 0);
+    // Start counting after a zero so that a wrapping run is counted once.
+    let mut first_zero = 0;
+    while map >> first_zero & 1 != 0 {
+        first_zero += 1;
+    }
+    let mut start = 0;
+    let mut len = 0;
+    for k in 1..=n {
+        let i = (first_zero + k) % n;
+        if map >> i & 1 != 0 {
+            if len == 0 {
+                start = i;
+            }
+            len += 1;
+            if len > best.1 {
+                best = (start, len);
+            }
+        } else {
+            len = 0;
+        }
+    }
+    best
 }
