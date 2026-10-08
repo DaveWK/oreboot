@@ -23,6 +23,10 @@ const SPL_BASE: usize = 0x0004_7000;
 const STAGING: usize = 0x0009_0000;
 const STUB: usize = 0x000e_0000;
 const SPL_MAX: usize = STUB - STAGING;
+/// eGON header: boot_media byte (sunxi `struct boot_file_head`), written by
+/// the BROM: 0 MMC0 at 8 KiB, 0x10 MMC0 at 128 KiB.
+const BOOT_MEDIA: usize = 0x28;
+const BOOTED_FROM_MMC0_HIGH: u8 = 0x10;
 
 const WDT_CTRL: usize = recovery::WDT0_BASE + 0x0c;
 const WDT_CFG: usize = recovery::WDT0_BASE + 0x10;
@@ -53,6 +57,11 @@ pub fn arm_watchdog() {
     write32(WDT_CFG, WDT_KEY | 1); // reset the whole system
     write32(WDT_MODE, WDT_KEY | WDT_INTERVAL_16S | 1);
     kick();
+}
+
+/// Disable WDT0 (before handing over to the vendor recovery chain).
+fn stop_watchdog() {
+    write32(WDT_MODE, WDT_KEY);
 }
 
 /// Restart the watchdog count, e.g. before handing over to the next stage.
@@ -127,10 +136,26 @@ pub fn boot_vendor_spl(sd: &Smhc, table: &layout::Table) {
         }
     }
 
+    // The vendor SPL (sunxi U-Boot SPL) reads the boot source from the
+    // eGON header's boot_media byte, which the BROM fills in SRAM when it
+    // loads an image. MMC0_HIGH means "loaded from 128 KiB", and the SPL
+    // then looks for U-Boot (the FIT that follows it on the vendor card)
+    // 120 KiB further than for an 8 KiB load. The card copy holds 0
+    // (MMC0, 8 KiB), so pass on the 128 KiB source explicitly. bt0's own
+    // header shows what the BROM wrote for this boot.
+    // SAFETY: bt0's eGON header is at SPL_BASE; the staged copy is ours.
+    let brom = unsafe { core::ptr::read_volatile((SPL_BASE + BOOT_MEDIA) as *const u8) };
+    let staged = unsafe { &mut *((STAGING + BOOT_MEDIA) as *mut u8) };
+    let card = *staged;
+    *staged = BOOTED_FROM_MMC0_HIGH;
     println!(
-        "[bt0] recovery: starting the vendor SPL ({} KiB)",
+        "[bt0] recovery: starting the vendor SPL ({} KiB); boot_media card {card:#x}, BROM for bt0 {brom:#x}, passing {BOOTED_FROM_MMC0_HIGH:#x}",
         e.size / 1024
     );
+    // The vendor chain is the known-good recovery path and boots without
+    // a watchdog from the BROM; a 16 s reset could cut a slow but healthy
+    // boot short and keep the board cycling. Stop WDT0 for it.
+    stop_watchdog();
     crate::Uart::attach(crate::UART0_BASE).drain();
     // SAFETY: stub symbols bound a small position-independent routine;
     // STUB is unused SRAM above the staging area.
