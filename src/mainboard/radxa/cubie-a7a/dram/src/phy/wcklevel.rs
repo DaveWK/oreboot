@@ -7,7 +7,7 @@
 //! included. This module does not execute the programs or claim training.
 //!
 //! Calibration entry and normal cleanup are described as control steps. The
-//! hardware binding still needs measurement-clock transitions, bounded
+//! hardware binding still needs bounded
 //! completion, qualified register aliases, and real DTSM feedback. The flat emulator's repeated
 //! zero error counts and final delay zero are not a hardware search result.
 
@@ -229,6 +229,104 @@ pub fn calibration_prefix(
         rows: &mr18_rows(rank, mr18_base.0 | 0x80, false, false),
         outer: 0,
     });
+}
+
+/// Start the observed verification clocks after the caller has supplied valid
+/// per-DBYTE delays. The finite eight-row transition is followed by full-speed
+/// ACSM with the observed WCK static pulse timing. No feedback is synthesized.
+pub fn measurement_clocks_start(channel: Channel, out: &mut impl FnMut(Step<'_>)) {
+    writes(
+        &[
+            (0x20079, 1),
+            (0x20079, 0),
+            (0x2007e, 0),
+            (0x2007a, 0xff),
+            (0x20042, 0x103),
+            (0x20044, 1),
+            (0x2007a, channel.override_mask()),
+            (0x2007e, 0),
+        ],
+        out,
+    );
+    let mut rows = [Row::EMPTY; 8];
+    for (i, control) in [
+        (0, 0x4b00),
+        (2, 0x7b00),
+        (3, 0x0400),
+        (6, 0x1b00),
+        (7, 0x0400),
+    ] {
+        rows[i] = Row::nop(control);
+    }
+    out(Step::Launch {
+        rows: &rows,
+        outer: 0,
+    });
+    writes(
+        &[
+            (0x20044, 2),
+            (0x2003e, 0x402),
+            (0x2003d, 0x402),
+            (0x20042, 0x183),
+        ],
+        out,
+    );
+}
+
+/// Prepare DTSM for the first finite measurement. The caller must set and
+/// read back its chosen per-rank delays before this boundary. Broadcast
+/// writes here retain oracle addresses, still unqualified for hardware.
+pub fn first_measurement(channel: Channel, rank: Rank, out: &mut impl FnMut(Step<'_>)) {
+    writes(
+        &[
+            (0x20079, 1),
+            (0x20079, 0),
+            (0x1f0b9, 0xffff),
+            (0x1f0ba, 0xffff),
+            (0x1ffb5, 0),
+        ],
+        out,
+    );
+    let first = 2 - channel.inactive_first_byte();
+    for db in first..first + 2 {
+        out(Step::Write(0x10fb5 + db * 0x1000, 1));
+    }
+    writes(&[(0x7f060, 1), (0x1ffbe, 0)], out);
+    measurement_once(rank, out);
+}
+
+/// One finite measurement after the caller has handled feedback and selected
+/// delays. Repeated calls are not a training search: completion and actual
+/// count/delay reads must be bound independently, with a caller-owned limit.
+pub fn measurement_once(rank: Rank, out: &mut impl FnMut(Step<'_>)) {
+    clear_counts(out);
+    writes(&[(0x20079, 1), (0x20079, 0)], out);
+    out(Step::Launch {
+        rows: &measurement_program(rank),
+        outer: 0,
+    });
+}
+
+/// Stop the observed verification clocks before restoring delays and normal
+/// cleanup. This is the normal path; it cannot recover an incomplete launch.
+pub fn measurement_clocks_stop(channel: Channel, out: &mut impl FnMut(Step<'_>)) {
+    let all_but_active = match channel {
+        Channel::A => 0xfc,
+        Channel::B => 0xcf,
+    };
+    writes(
+        &[
+            (0x20044, 1),
+            (0x20042, 0x103),
+            (0x2007e, 0),
+            (0x2007a, all_but_active),
+            (0x20042, 0),
+            (0x20044, 0),
+            (0x2007a, channel.override_mask()),
+            (0x2007e, 0),
+        ],
+        out,
+    );
 }
 
 /// Source CSRs saved by the reference before each block. Keep their actual
