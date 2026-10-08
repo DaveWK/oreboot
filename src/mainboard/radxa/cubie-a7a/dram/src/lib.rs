@@ -47,6 +47,7 @@ impl From<post::SaveFailure> for InitError {
 pub fn core_init<H: Hw>(hw: &mut H, p: &mut Para, fw: &PhyFirmware) -> Result<(), Error> {
     ccu::validate_pll_ddr_rate(p.clk())?;
     phy::init::validate(p)?;
+    ctrl::validate_geometry(p)?;
     ccu::sys_init(hw, p.clk())?;
     let channels = p.channels();
     ctrl::com_pre_init(hw, p);
@@ -91,6 +92,7 @@ pub fn init<H: Hw>(hw: &mut H, p: &mut Para, fw: &PhyFirmware) -> Result<u32, In
     }
     ccu::validate_pll_ddr_rate(p.clk())?;
     phy::init::validate(p)?;
+    ctrl::validate_geometry(p)?;
     let mib = size::boot_size_mib(p)?;
     ccu::pad_calibration(hw);
     let vddq = power::set_rails(hw, p)?;

@@ -154,6 +154,7 @@ pub fn controller_odt<H: Hw>(hw: &mut H, p: &Para, ch: usize) {
 /// Controller set-up before the PHY: everything up to and including the
 /// timing registers of every frequency set.
 pub fn com_init<H: Hw>(hw: &mut H, p: &mut Para, ch: usize) -> Result<(), Error> {
+    validate_address_map(p, ch)?;
     controller_config(hw, p, ch);
     controller_odt(hw, p, ch);
     hw.clrset32(ddrc(ch, MSTR4), 0x100, 1);
@@ -169,7 +170,7 @@ pub fn com_init<H: Hw>(hw: &mut H, p: &mut Para, ch: usize) -> Result<(), Error>
     hw.clrset32(ddrc(ch, DFIPHYMSTR), 0xff00_0001, 0x2500_0000);
     hw.set32(ddrc(ch, DDRC_208), 1);
     hw.clrset32(ddrc(ch, DFIMISC), 0x3_0000, 0x1_0015);
-    set_address_map(hw, p, ch);
+    set_address_map(hw, p, ch)?;
     crate::timing::set_channel_timing(hw, p, ch);
     hw.clr32(ddrc(ch, DDRC_B84), 1);
     hw.write32(ddrc(ch, SWCTL), 0);
@@ -188,7 +189,31 @@ pub fn com_init<H: Hw>(hw: &mut H, p: &mut Para, ch: usize) -> Result<(), Error>
 /// laid out, from bit 0 up: column bits 0..2 (fixed), bank group, column
 /// bits 3.., bank, row, rank. The fields below follow the vendor init for
 /// each geometry (col 8..11, row 14..17) of the A733 parameter sets.
-pub fn set_address_map<H: Hw>(hw: &mut H, p: &Para, ch: usize) {
+/// Encodings implemented by the existing ADDRMAP writer. This validates its
+/// software representation, not the fitted DRAM geometry or PHY topology.
+pub fn validate_geometry(p: &Para) -> Result<(), Error> {
+    if !(8..=11).contains(&p.col_bits())
+        || !(14..=18).contains(&p.row_bits())
+        || !matches!(p.bank_bits(), 2 | 3)
+        || p.bg_bits() > 2
+        || !matches!(p.rank_bits(), 0 | 1 | 7)
+        || (p.tpr13() >> 16) & 7 > 2
+    {
+        return Err(Error::Config("geometry outside implemented ADDRMAP fields"));
+    }
+    Ok(())
+}
+
+fn validate_address_map(p: &Para, ch: usize) -> Result<(), Error> {
+    validate_geometry(p)?;
+    if ch >= p.channels() {
+        return Err(Error::Config("inactive ADDRMAP controller instance"));
+    }
+    Ok(())
+}
+
+pub fn set_address_map<H: Hw>(hw: &mut H, p: &Para, ch: usize) -> Result<(), Error> {
+    validate_address_map(p, ch)?;
     let col = p.col_bits();
     let row = p.row_bits();
     let ba = p.bank_bits();
@@ -285,4 +310,5 @@ pub fn set_address_map<H: Hw>(hw: &mut H, p: &Para, ch: usize) {
         hw.write32(ddrc(ch, DDRC_220), 0x0a09_0e01);
         hw.write32(ddrc(ch, DDRC_224), 0);
     }
+    Ok(())
 }
