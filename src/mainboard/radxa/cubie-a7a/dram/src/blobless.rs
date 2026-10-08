@@ -10,7 +10,7 @@
 use crate::hw::{Error, Hw};
 use crate::para::Para;
 use crate::phy::prog::{self, Kind, Op};
-use crate::phy::{csr, csr_access, freq, init, tables, MICRO_CONT_MUX_SEL, MICRO_RESET};
+use crate::phy::{csr, csr_access, freq, init, sequence, tables, MICRO_CONT_MUX_SEL, MICRO_RESET};
 use crate::{ccu, ctrl, power};
 
 /// MASTER PhyConfig (synthesis configuration word; field layout per the
@@ -130,4 +130,90 @@ fn run_checked<H: Hw>(hw: &mut H, prog: &[Op], c: &prog::Ctx, out: &mut Readback
         }
     }
     hw.write16(MICRO_CONT_MUX_SEL, mux);
+}
+
+/// ACSM sequence memory: row `r` is four halfwords at CSR 0x41000 + 4 r.
+pub const ACSM_MEM: u32 = 0x41000;
+pub const ACSM_START: u32 = 0x20022;
+pub const ACSM_STOP: u32 = 0x20023;
+pub const ACSM_LAST: u32 = 0x20024;
+pub const ACSM_OUTER_LOOP: u32 = 0x20027;
+/// MemResetL: [1] ProtectMemReset, [0] BP_MemReset_L. 2 keeps DRAM in reset.
+pub const MEM_RESET_L: u32 = 0x20060;
+
+/// [`sequence::Port`] on the PHY CSRs for the firmware-free path. Preflight
+/// requires what [`pre_training`] establishes: PMU stalled (MicroReset 1),
+/// DRAM held in reset (MemResetL 2); it then selects host CSR access.
+pub struct PhyPort<'a, H: Hw> {
+    pub hw: &'a mut H,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PortError {
+    PmuNotHeld(u16),
+    DramNotInReset(u16),
+}
+
+impl<H: Hw> sequence::Port for PhyPort<'_, H> {
+    type Error = PortError;
+    fn preflight(&mut self) -> Result<(), PortError> {
+        let micro = self.hw.read16(MICRO_RESET);
+        if micro != 1 {
+            return Err(PortError::PmuNotHeld(micro));
+        }
+        csr_access(self.hw, true);
+        let reset = self.hw.read16(csr(MEM_RESET_L));
+        if reset != 2 {
+            csr_access(self.hw, false);
+            return Err(PortError::DramNotInReset(reset));
+        }
+        Ok(())
+    }
+    fn read_control(&mut self) -> Result<u16, PortError> {
+        Ok(self.hw.read16(csr(sequence::RUN_CTRL)))
+    }
+    fn write_control(&mut self, value: u16) -> Result<(), PortError> {
+        self.hw.write16(csr(sequence::RUN_CTRL), value);
+        Ok(())
+    }
+    fn read_done(&mut self) -> Result<u16, PortError> {
+        Ok(self.hw.read16(csr(sequence::DONE)))
+    }
+}
+
+/// Result of [`acsm_delay_probe`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AcsmProbe {
+    pub run: Result<sequence::Completion, sequence::Failure<PortError>>,
+    pub last_addr: u16,
+    pub done_after: u16,
+}
+
+/// Run one ACSM sequence of a single delay-only row (no command, CS idle)
+/// while DRAM stays in reset: the shape of the PMU firmware's first DevInit
+/// launch (rows 0..1, control 0x1b00). Shows whether the host can start the
+/// ACSM and observe Done. Call after [`pre_training`].
+pub fn acsm_delay_probe<H: Hw>(hw: &mut H) -> AcsmProbe {
+    csr_access(hw, true);
+    hw.write16(csr(ACSM_START), 0);
+    hw.write16(csr(ACSM_STOP), 0);
+    let rows: [[u16; 4]; 2] = [[0, 0, 0, 0x1b00], [0; 4]];
+    for (r, row) in rows.iter().enumerate() {
+        for (k, &v) in row.iter().enumerate() {
+            hw.write16(csr(ACSM_MEM + 4 * r as u32 + k as u32), v);
+        }
+    }
+    hw.write16(csr(ACSM_OUTER_LOOP), 0);
+    hw.write16(csr(ACSM_STOP), 1);
+    let mut run = sequence::DirectRun::new(PhyPort { hw: &mut *hw });
+    let result = run.run(sequence::MAX_POLLS);
+    csr_access(hw, true);
+    let last_addr = hw.read16(csr(ACSM_LAST));
+    let done_after = hw.read16(csr(sequence::DONE));
+    csr_access(hw, false);
+    AcsmProbe {
+        run: result,
+        last_addr,
+        done_after,
+    }
 }
