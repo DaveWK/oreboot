@@ -54,13 +54,30 @@ pub fn init_one(para: &[u32; 32]) -> Option<u32> {
                     a.ctl, a.stop, a.run, a.last_addr, a.elapsed_us
                 );
             }
-            // DRAM reset released here: cold init part 1 (MRW only, no read).
-            let mrs = cubie_a7a_dram::phy::coldinit::Mrs::ORACLE_PSTATE1_CXMT_4G;
-            let c = blobless::cold_init_part1(&mut Bt0Hw, &mrs);
+            // DRAM reset released here: cold init parts 1 and 2, CBT entry on
+            // channel A rank 0, then a coarse CA delay sweep. In CBT the DRAM
+            // returns the CA it latched on DQ (read asynchronously).
+            let m1 = cubie_a7a_dram::phy::coldinit::Mrs::ORACLE_PSTATE1_CXMT_4G;
+            let m2 = cubie_a7a_dram::phy::coldinit::Mrs2::ORACLE_PSTATE1_CXMT_4G;
+            let mut delays = [0u16; 17];
+            for (i, d) in delays.iter_mut().enumerate() {
+                *d = if i < 16 { 32 * i as u16 } else { 511 };
+            }
+            let c = blobless::cold_init_cbt(&mut Bt0Hw, &m1, &m2, &delays);
             println!(
-                "[dram] blobless: cold init part 1: {} launches ({} witnessed, max {} busy polls), {} CSR writes, {} us, failure {:?}",
+                "[dram] blobless: cold init + CBT: {} launches ({} witnessed, max {} busy polls), {} CSR writes, {} us, failure {:?}",
                 c.launches, c.witnessed, c.busy_max, c.writes, c.elapsed_us, c.failure
             );
+            for (k, &d) in delays.iter().enumerate() {
+                let r = &c.reads[4 * k..4 * k + 4];
+                if 4 * k as u16 >= c.n_reads {
+                    break;
+                }
+                println!(
+                    "[dram] blobless: CBT ca delay {d:3}: rx {:04x} {:04x} {:04x} {:04x}",
+                    r[0], r[1], r[2], r[3]
+                );
+            }
         }
         Err(e) => {
             println!("[dram] blobless: pre-training failed after {ms} ms: {e:?}");

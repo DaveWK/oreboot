@@ -267,22 +267,130 @@ pub const RESET_HIGH_US: u32 = 5_000;
 /// Row bases used alternately so that ACSMLastAddr changes on every launch.
 const ROW_BASES: [u16; 2] = [0, 64];
 
-/// Outcome of [`cold_init_part1`].
+/// Why an execution stopped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExecFailure {
+    /// A blocking launch failed (1-based launch number).
+    Launch(u16, sequence::Failure<PortError>),
+    /// A loop launch found Run already set.
+    LoopBusy(u16),
+    /// A loop did not report Done within the poll budget after OLRC cleared.
+    LoopEnd(u16),
+}
+
+/// Outcome of a cold-init execution.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ColdInitReport {
     pub launches: u16,
     pub writes: u16,
     pub witnessed: u16,
     pub busy_max: u16,
-    /// First failing launch (1-based) and its failure.
-    pub failure: Option<(u16, sequence::Failure<PortError>)>,
+    pub failure: Option<ExecFailure>,
     pub elapsed_us: u64,
+    /// AsyncDbyteRxData samples in program order.
+    pub reads: [u16; 80],
+    pub n_reads: u16,
 }
 
-/// Release the DRAM reset and run part 1 of the cold init
-/// ([`phy::coldinit::part1`](crate::phy::coldinit::part1)) through the host
-/// ACSM. Call after [`pre_training`]. Stops at the first failed launch.
-pub fn cold_init_part1<H: Hw>(hw: &mut H, mrs: &coldinit::Mrs) -> ColdInitReport {
+/// Runs [`coldinit::Step`]s on the PHY: blocking launches through
+/// [`sequence::DirectRun`] (row base alternating 0/64 for launches at row 0,
+/// so ACSMLastAddr witnesses each), loop launches without waiting, loop ends
+/// with a bounded Done poll, and reads. Stops at the first failure.
+struct Executor<'a, H: Hw> {
+    hw: &'a mut H,
+    r: ColdInitReport,
+    loop_run: u16,
+}
+
+impl<H: Hw> Executor<'_, H> {
+    fn load(&mut self, start: u16, rows: &[coldinit::Row]) -> (u16, u16) {
+        let base = if start == 0 {
+            ROW_BASES[self.r.launches as usize & 1]
+        } else {
+            start
+        };
+        let stop = base + rows.len() as u16 - 1;
+        csr_access(self.hw, true);
+        self.hw.write16(csr(ACSM_START), base);
+        self.hw.write16(csr(ACSM_STOP), base);
+        for (i, row) in rows.iter().enumerate() {
+            for (k, &v) in row.0.iter().enumerate() {
+                let a = (base as u32 + i as u32) * 4 + k as u32;
+                self.hw.write16(csr(ACSM_MEM + a), v);
+            }
+        }
+        self.hw.write16(csr(ACSM_OUTER_LOOP), 0);
+        self.hw.write16(csr(ACSM_STOP), stop);
+        self.r.launches += 1;
+        (base, stop)
+    }
+
+    fn step(&mut self, step: coldinit::Step) {
+        if self.r.failure.is_some() {
+            return;
+        }
+        match step {
+            coldinit::Step::Write(c, v) => {
+                csr_access(self.hw, true);
+                self.hw.write16(csr(c), v);
+                self.r.writes += 1;
+            }
+            coldinit::Step::Read(c) => {
+                csr_access(self.hw, true);
+                let v = self.hw.read16(csr(c));
+                if (self.r.n_reads as usize) < self.r.reads.len() {
+                    self.r.reads[self.r.n_reads as usize] = v;
+                }
+                self.r.n_reads += 1;
+            }
+            coldinit::Step::Launch { start, rows } => {
+                let (_, stop) = self.load(start, rows);
+                let mut run = sequence::DirectRun::new(PhyPort {
+                    hw: &mut *self.hw,
+                    stop,
+                    prior_last: 0,
+                    mem_reset: 3,
+                });
+                match run.run(sequence::MAX_POLLS) {
+                    Ok(c) => {
+                        self.r.witnessed += c.witnessed as u16;
+                        self.r.busy_max = self.r.busy_max.max(c.busy_polls);
+                    }
+                    Err(f) => self.r.failure = Some(ExecFailure::Launch(self.r.launches, f)),
+                }
+            }
+            coldinit::Step::LaunchLoop { start, rows } => {
+                self.load(start, rows);
+                let control = self.hw.read16(csr(sequence::RUN_CTRL));
+                if control & 1 != 0 {
+                    self.r.failure = Some(ExecFailure::LoopBusy(self.r.launches));
+                    return;
+                }
+                self.hw.write16(csr(sequence::RUN_CTRL), control | 1);
+                self.loop_run = self.r.launches;
+            }
+            coldinit::Step::AwaitEnd => {
+                csr_access(self.hw, true);
+                let mut done = false;
+                for _ in 0..sequence::MAX_POLLS {
+                    if self.hw.read16(csr(sequence::DONE)) & 1 != 0 {
+                        done = true;
+                        break;
+                    }
+                }
+                let control = self.hw.read16(csr(sequence::RUN_CTRL));
+                self.hw.write16(csr(sequence::RUN_CTRL), control & !1);
+                if !done {
+                    self.r.failure = Some(ExecFailure::LoopEnd(self.loop_run));
+                }
+            }
+        }
+    }
+}
+
+/// Release the DRAM reset (ClrPORMemReset pulse, reset-low time, MemResetL
+/// 3, tINIT3) and run `program` through an [`Executor`].
+fn run_program<H: Hw>(hw: &mut H, program: impl FnOnce(&mut Executor<H>)) -> ColdInitReport {
     let t0 = hw.now_us();
     csr_access(hw, true);
     hw.write16(csr(CLR_POR_MEM_RESET), 1);
@@ -290,56 +398,47 @@ pub fn cold_init_part1<H: Hw>(hw: &mut H, mrs: &coldinit::Mrs) -> ColdInitReport
     hw.udelay(RESET_LOW_US);
     hw.write16(csr(MEM_RESET_L), 3);
     hw.udelay(RESET_HIGH_US);
-    let mut report = ColdInitReport {
-        launches: 0,
-        writes: 0,
-        witnessed: 0,
-        busy_max: 0,
-        failure: None,
-        elapsed_us: 0,
+    let mut ex = Executor {
+        hw: &mut *hw,
+        r: ColdInitReport {
+            launches: 0,
+            writes: 0,
+            witnessed: 0,
+            busy_max: 0,
+            failure: None,
+            elapsed_us: 0,
+            reads: [0; 80],
+            n_reads: 0,
+        },
+        loop_run: 0,
     };
-    coldinit::part1(mrs, &mut |step| {
-        if report.failure.is_some() {
-            return;
-        }
-        match step {
-            coldinit::Step::Write(c, v) => {
-                csr_access(hw, true);
-                hw.write16(csr(c), v);
-                report.writes += 1;
-            }
-            coldinit::Step::Launch { start, rows } => {
-                let base = ROW_BASES[report.launches as usize & 1] + start;
-                let stop = base + rows.len() as u16 - 1;
-                csr_access(hw, true);
-                hw.write16(csr(ACSM_START), base);
-                hw.write16(csr(ACSM_STOP), base);
-                for (i, row) in rows.iter().enumerate() {
-                    for (k, &v) in row.0.iter().enumerate() {
-                        let r = (base as u32 + i as u32) * 4 + k as u32;
-                        hw.write16(csr(ACSM_MEM + r), v);
-                    }
-                }
-                hw.write16(csr(ACSM_OUTER_LOOP), 0);
-                hw.write16(csr(ACSM_STOP), stop);
-                report.launches += 1;
-                let mut run = sequence::DirectRun::new(PhyPort {
-                    hw: &mut *hw,
-                    stop,
-                    prior_last: 0,
-                    mem_reset: 3,
-                });
-                match run.run(sequence::MAX_POLLS) {
-                    Ok(c) => {
-                        report.witnessed += c.witnessed as u16;
-                        report.busy_max = report.busy_max.max(c.busy_polls);
-                    }
-                    Err(f) => report.failure = Some((report.launches, f)),
-                }
-            }
-        }
-    });
+    program(&mut ex);
+    let mut r = ex.r;
     csr_access(hw, false);
-    report.elapsed_us = hw.now_us().wrapping_sub(t0);
-    report
+    r.elapsed_us = hw.now_us().wrapping_sub(t0);
+    r
+}
+
+/// Release the DRAM reset, run cold-init part 1, part 2 up to CBT entry on
+/// channel A, rank 0, and the CBT points `delays` (each: four CA patterns,
+/// reading DBYTE 1's AsyncDbyteRxData after each). Call after
+/// [`pre_training`]. Stops at the first failure.
+pub fn cold_init_cbt<H: Hw>(
+    hw: &mut H,
+    m1: &coldinit::Mrs,
+    m2: &coldinit::Mrs2,
+    delays: &[u16],
+) -> ColdInitReport {
+    run_program(hw, |ex| {
+        coldinit::part1(m1, &mut |s| ex.step(s));
+        coldinit::part2(m2, &mut |s| ex.step(s));
+        for &d in delays {
+            coldinit::cbt_point(d, &mut |s| ex.step(s));
+        }
+    })
+}
+
+/// Release the DRAM reset and run part 1 only.
+pub fn cold_init_part1<H: Hw>(hw: &mut H, mrs: &coldinit::Mrs) -> ColdInitReport {
+    run_program(hw, |ex| coldinit::part1(mrs, &mut |s| ex.step(s)))
 }

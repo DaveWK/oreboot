@@ -29,6 +29,24 @@ pub struct Row(pub [u16; 4]);
 impl Row {
     pub const EMPTY: Row = Row([0; 4]);
 
+    /// Row with explicit halfwords (CA pattern rows with different phase
+    /// values, and the hw1/hw2 control rows of the WCK and CBT sequences).
+    pub const fn raw(hw0: u16, hw1: u16, hw2: u16, hw3: u16) -> Row {
+        Row([hw0, hw1, hw2, hw3])
+    }
+
+    /// Row driving CA `lo` on the first and `hi` on the second phase with
+    /// chip selects `cs` (CBT patterns); control as for [`Row::cmd`].
+    pub const fn ca2(cs: u8, lo: u8, hi: u8) -> Row {
+        let ctl = if cs & 2 != 0 { 0x0010 } else { 0 };
+        Row([
+            ((cs as u16 & 3) << 14) | (((hi & 0x7f) as u16) << 7) | (lo & 0x7f) as u16,
+            0,
+            0,
+            ctl,
+        ])
+    }
+
     /// Delay/timing row: no command, CS idle.
     pub const fn nop(ctl: u16) -> Row {
         Row([0, 0, 0, ctl])
@@ -75,11 +93,17 @@ impl Mrs {
     };
 }
 
-/// One step of the program: a PHY CSR write, or an ACSM launch of `rows`
-/// loaded from row `start` (stop = start + len - 1, outer loop 0).
+/// One step of the program. `Launch` loads `rows` from row `start` (stop =
+/// start + len - 1, outer loop 0), runs it and waits for Done. `LaunchLoop`
+/// does the same without waiting: the caller has set ACSMInfiniteOLRC, so the
+/// sequence repeats until the program clears it and issues `AwaitEnd` (wait
+/// for Done, clear Run). `Read` samples a CSR (AsyncDbyteRxData).
 pub enum Step<'a> {
     Write(u32, u16),
     Launch { start: u16, rows: &'a [Row] },
+    LaunchLoop { start: u16, rows: &'a [Row] },
+    AwaitEnd,
+    Read(u32),
 }
 
 const HW_CS_EN_A: u32 = 0x20072;
@@ -162,14 +186,14 @@ const SETTLE: [Row; 10] = [
 
 /// Fixed-capacity row buffer for one launch.
 struct Rows {
-    buf: [Row; 32],
+    buf: [Row; 48],
     len: usize,
 }
 
 impl Rows {
     const fn new() -> Self {
         Rows {
-            buf: [Row::EMPTY; 32],
+            buf: [Row::EMPTY; 48],
             len: 0,
         }
     }
@@ -313,5 +337,200 @@ pub fn part1(m: &Mrs, emit: &mut impl FnMut(Step)) {
             launch_mrws(cs, &round2, emit);
             prev = Some(ch);
         }
+    }
+}
+
+/// Part 2 mode registers (WCK and I/O settings, then CBT entry).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Mrs2 {
+    pub mr18: u8,
+    pub mr3: u8,
+    pub mr17: u8,
+    pub mr11: u8,
+    pub mr13: u8,
+    /// MR16 value that enters command bus training.
+    pub mr16_cbt: u8,
+}
+
+impl Mrs2 {
+    /// The reference oracle's pstate-1 values for the CXMT 4 GB set.
+    pub const ORACLE_PSTATE1_CXMT_4G: Mrs2 = Mrs2 {
+        mr18: 0x08,
+        mr3: 0xc6,
+        mr17: 0x06,
+        mr11: 0x10,
+        mr13: 0x60,
+        mr16_cbt: 0x61,
+    };
+}
+
+const ACSM_INFINITE_OLRC: u32 = 0x20031;
+/// DBYTE `n` asynchronous DQ access (TRM: AsyncDbyteTxMode/TxEn/TxData/RxData).
+pub const fn async_tx_mode(n: u32) -> u32 {
+    0x10089 + 0x1000 * n
+}
+pub const fn async_tx_en(n: u32) -> u32 {
+    0x1008b + 0x1000 * n
+}
+pub const fn async_tx_data(n: u32) -> u32 {
+    0x1008c + 0x1000 * n
+}
+pub const fn async_rx_data(n: u32) -> u32 {
+    0x1008d + 0x1000 * n
+}
+/// The DBYTE that returns channel A's CBT feedback.
+pub const CBT_DBYTE_A: u32 = 1;
+/// AC block `blk` CA lane `lane` delay (Address/Command Delay, per pstate).
+pub const fn ca_delay(blk: u32, lane: u32) -> u32 {
+    0x30001 + 0x1000 * blk + 0x100 * lane
+}
+/// Applies new delay CSR values (TRM: ForceInternalUpdate), pulsed 1 then 0.
+const FORCE_INTERNAL_UPDATE: u32 = 0x200a3;
+/// Writes before the first WCK loop (named in the TRM register list:
+/// 0x20041 ACSMWckFreeRunMode, 0x2002a ACSMWckEnControl).
+const WCK_SETUP: [(u32, u16); 5] = [
+    (0x30f01, 0),
+    (0x30002, 0),
+    (0x20041, 1),
+    (0x2002a, 1),
+    (0x20007, 0x100),
+];
+/// WCK loop body: rows with hw1/hw2 control (meaning not established).
+const WCK_LOOP: [Row; 16] = [
+    Row::raw(0, 0x4000, 1, 0),
+    Row::EMPTY,
+    Row::EMPTY,
+    Row::EMPTY,
+    Row::nop(0x0400),
+    Row::EMPTY,
+    Row::nop(0x0400),
+    Row::EMPTY,
+    Row::nop(0x0400),
+    Row::EMPTY,
+    Row::EMPTY,
+    Row::EMPTY,
+    Row::raw(0, 0, 1, 0),
+    Row::EMPTY,
+    Row::EMPTY,
+    Row::EMPTY,
+];
+const WCK_LOOP_START: u16 = 300;
+const PAIR_GAP: [Row; 2] = [Row::nop(0x5b00), Row::EMPTY];
+
+/// Part 2 at the boot pstate on channel A, rank 0 (cs 1), up to command bus
+/// training entry with the asynchronous DQ path of DBYTE 1 set up and the
+/// WCK loop stopped. Continues where [`part1`] ended.
+pub fn part2(m: &Mrs2, emit: &mut impl FnMut(Step)) {
+    let a = Channels::A.mask();
+    ls_off(Channels::B.mask(), emit);
+    select(Channels::Both, 0x0e, emit);
+    select(Channels::A, 0, emit);
+    for (csr, v) in WCK_SETUP {
+        emit(Step::Write(csr, v));
+    }
+    let n = CBT_DBYTE_A;
+    emit(Step::Write(async_tx_mode(n), 0x1ff));
+    emit(Step::Write(async_tx_en(n), 0x1ff));
+    emit(Step::Write(async_tx_data(n), 0));
+    emit(Step::Write(ACSM_INFINITE_OLRC, 1));
+    emit(Step::LaunchLoop {
+        start: WCK_LOOP_START,
+        rows: &WCK_LOOP,
+    });
+    emit(Step::Write(ACSM_INFINITE_OLRC, 0));
+    emit(Step::AwaitEnd);
+    ls_on(a, emit);
+    // MR18, WCK2CK sync (CAS 0x38/0x40), MR3, MR17, MR11, MR13.
+    let mut r = Rows::new();
+    r.push(&HEAD);
+    r.push(&mrw(1, 18, m.mr18));
+    r.push(&PAIR_GAP);
+    r.push(&PAIR_GAP);
+    r.push(&[Row::cmd(1, 0x38), Row::cmd(1, 0x40)]);
+    r.push(&PAIR_GAP);
+    for (ma, op) in [(3, m.mr3), (17, m.mr17), (11, m.mr11), (13, m.mr13)] {
+        r.push(&mrw(1, ma, op));
+        r.push(&AFTER_MRW);
+    }
+    r.push(&TAIL);
+    emit(Step::Launch {
+        start: 0,
+        rows: r.rows(),
+    });
+    // MR16: enter CBT, with the WCK loop body, repeating.
+    ls_off(a, emit);
+    emit(Step::Write(ACSM_INFINITE_OLRC, 1));
+    ls_on(a, emit);
+    let mut r = Rows::new();
+    r.push(&HEAD);
+    r.push(&mrw(1, 16, m.mr16_cbt));
+    r.push(&[Row::nop(0x1a00), Row::EMPTY, Row::nop(0x0100), Row::EMPTY]);
+    r.push(&WCK_LOOP);
+    r.push(&TAIL);
+    emit(Step::LaunchLoop {
+        start: 0,
+        rows: r.rows(),
+    });
+    emit(Step::Write(async_tx_data(n), 0x10));
+    ls_off(a, emit);
+    emit(Step::Write(ACSM_INFINITE_OLRC, 0));
+    emit(Step::AwaitEnd);
+    // WCK loop again while the asynchronous DQ path is set up.
+    emit(Step::Write(ACSM_INFINITE_OLRC, 1));
+    emit(Step::LaunchLoop {
+        start: WCK_LOOP_START,
+        rows: &WCK_LOOP,
+    });
+    emit(Step::Write(async_tx_data(n), 0x52));
+    emit(Step::Write(async_tx_data(n), 0x152));
+    emit(Step::Write(async_tx_mode(n), 0x110));
+    emit(Step::Write(async_tx_en(n), 0x110));
+    emit(Step::Write(ACSM_INFINITE_OLRC, 0));
+    emit(Step::AwaitEnd);
+}
+
+/// The four CBT patterns: (first row, CS row) as (cs, CA first phase, CA
+/// second phase). The DRAM in CBT mode returns the CA it latched on DQ.
+pub const CBT_PATTERNS: [[(u8, u8, u8); 2]; 4] = [
+    [(0, 0x00, 0x7f), (1, 0x00, 0x00)],
+    [(0, 0x00, 0x00), (1, 0x7f, 0x00)],
+    [(0, 0x7f, 0x00), (1, 0x7f, 0x7f)],
+    [(0, 0x7f, 0x7f), (1, 0x00, 0x7f)],
+];
+const CBT_STARTS: [u16; 4] = [100, 118, 136, 154];
+
+/// One CBT point on channel A: set all seven CA lane delays of AC block 0 to
+/// `delay`, apply, then for each pattern run its launch and read DBYTE 1's
+/// AsyncDbyteRxData.
+pub fn cbt_point(delay: u16, emit: &mut impl FnMut(Step)) {
+    for lane in 0..7 {
+        emit(Step::Write(ca_delay(0, lane), delay));
+    }
+    emit(Step::Write(FORCE_INTERNAL_UPDATE, 1));
+    emit(Step::Write(FORCE_INTERNAL_UPDATE, 0));
+    for (pat, &start) in CBT_PATTERNS.iter().zip(CBT_STARTS.iter()) {
+        let [(c0, l0, h0), (c1, l1, h1)] = *pat;
+        let rows = [
+            Row::raw(0, 0x4000, 1, 0),
+            Row::EMPTY,
+            Row::nop(0x2b00),
+            Row::EMPTY,
+            Row::nop(0x3b00),
+            Row::EMPTY,
+            Row::ca2(c0, l0, h0),
+            Row::ca2(c1, l1, h1),
+            Row::nop(0x3b00),
+            Row::nop(0x0800),
+            Row::raw(0, 0x0003, 0, 0),
+            Row::EMPTY,
+            Row::EMPTY,
+            Row::EMPTY,
+            Row::raw(0, 0, 1, 0),
+            Row::EMPTY,
+            Row::nop(0x2b00),
+            Row::EMPTY,
+        ];
+        emit(Step::Launch { start, rows: &rows });
+        emit(Step::Read(async_rx_data(CBT_DBYTE_A)));
     }
 }
