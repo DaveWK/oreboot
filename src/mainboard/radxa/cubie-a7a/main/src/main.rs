@@ -422,6 +422,8 @@ fn build_dtb(h: &Handoff) -> usize {
     if n != 0 {
         f.prop("usb-ready", &list[..n]);
     }
+    f.prop_u32("usb-super-speed-ready", u32::from(usb.superspeed));
+    f.prop_u32("usb-combo0-status", usb.combo0_status);
     // Child nodes after all properties: the trained PCIe link, if any.
     pcie::fdt_node(f);
     f.end_node();

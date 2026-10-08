@@ -11,7 +11,7 @@
 //! | `0x02002000` | CCU                                         |
 //! | `0x04101000` | EHCI0 (`0x04100000` is the OTG block)       |
 //! | `0x04200000` | EHCI1                                       |
-//! | `0x06A00000` | xHCI2, dwc3, run USB2-only (see below)      |
+//! | `0x06A00000` | xHCI2, dwc3, combo0 USB3.1 + USB2          |
 //! | `0x06B00000` | USB2 PHY, shared aw-phy                     |
 //!
 //! Register layout from the orange-pi-5.15-sun60iw2 BSP kernel
@@ -28,15 +28,11 @@
 //! USB1/EHCI1 -> the blue USB 3.1 Type-A's high-speed pair; the dwc3's own
 //! USB2 PHY -> FE1.1S hub -> the three black USB 2.0 ports and Wi-Fi/BT.
 //!
-//! The xHCI runs USB2-only, as mainline does on this board (minimyth2's
-//! sun60i-a733-cubie-a7a.dts: maximum-speed = "high-speed", only the USB2
-//! PHY, snps,dis_u2_susphy_quirk, snps,dis_enblslpm_quirk). Without the
-//! Cadence combo PHY its PIPE clock comes from the CCU: SERDES
-//! SUBSYS_USB3P1_BGR bit 20 selects USB2_U2_PIPE (CCU 0x1364, PERI0 480 MHz),
-//! with USB2_U3_UTMI (CCU 0x1360) at PERI0 300 MHz. The USB2 PHY's own
-//! reset-n is SUBSYS_USB3P1_BGR bit 4. The xHCI is reported ready only if a
-//! host-controller reset completes, so a dead PIPE clock cannot hang the
-//! payload's xHCI driver.
+//! combo0 provides the blue port's SuperSpeed pair (usb_combo0.rs). The
+//! USB2 hub path uses the real USB2 PHY UTMI clock. A bounded combo0 failure
+//! parks only that PHY and retains the explicit CCU PIPE high-speed fallback;
+//! the separate readiness/status fields never imply SuperSpeed acceptance.
+//! A host reset must complete before EDK2 receives xHCI readiness.
 
 use core::ptr::{addr_of, addr_of_mut};
 
@@ -44,6 +40,9 @@ use cubie_a7a_common::time::udelay;
 use util::mmio::{read32, write32};
 
 use crate::ppu;
+
+#[path = "usb_combo0.rs"]
+mod combo0;
 
 const CCU: usize = 0x0200_2000;
 
@@ -193,12 +192,17 @@ pub struct Ready {
     pub ehci0: bool,
     pub ehci1: bool,
     pub xhci: bool,
+    pub superspeed: bool,
+    /// 0: not attempted, 1: PHY ready, 2/3/4: reset/PLL/PMA failure.
+    pub combo0_status: u32,
 }
 
 static mut READY: Ready = Ready {
     ehci0: false,
     ehci1: false,
     xhci: false,
+    superspeed: false,
+    combo0_status: 0,
 };
 
 /// Result of the last [`init`].
@@ -391,9 +395,9 @@ fn ehci_alive(base: usize) -> bool {
     caplength >= 0x10 && caplength < 0x40 && cap >> 16 != 0 && cap != 0xffff_ffff
 }
 
-/// Put the dwc3 into host mode with only its USB2 PHY in use, then reset
+/// Put the dwc3 into host mode with the selected PHY mode, then reset
 /// the xHCI once to prove the controller (and its PIPE clock) is alive.
-fn dwc3_host_init() -> Result<(), &'static str> {
+fn dwc3_host_init(superspeed: bool) -> Result<(), &'static str> {
     let b = XHCI;
     // PHY soft reset on both PHY interfaces, then a core soft reset.
     set(b + DWC3_GUSB2PHYCFG, GUSB2PHYCFG_PHYSOFTRST);
@@ -408,10 +412,16 @@ fn dwc3_host_init() -> Result<(), &'static str> {
 
     // snps,dis_u2_susphy_quirk and snps,dis_enblslpm_quirk; keep the absent
     // SuperSpeed PHY out of suspend until the reset below has completed.
-    clr(b + DWC3_GUSB2PHYCFG, GUSB2PHYCFG_SUSPHY | GUSB2PHYCFG_ENBLSLPM);
+    clr(
+        b + DWC3_GUSB2PHYCFG,
+        GUSB2PHYCFG_SUSPHY | GUSB2PHYCFG_ENBLSLPM,
+    );
     clr(b + DWC3_GUSB3PIPECTL, GUSB3PIPECTL_SUSPHY);
     let gctl = read32(b + DWC3_GCTL);
-    write32(b + DWC3_GCTL, (gctl & !GCTL_PRTCAPDIR_MASK) | GCTL_PRTCAPDIR_HOST);
+    write32(
+        b + DWC3_GCTL,
+        (gctl & !GCTL_PRTCAPDIR_MASK) | GCTL_PRTCAPDIR_HOST,
+    );
 
     // EL3 runs with the MMU off, where every access is Device memory and
     // must be aligned, so an odd CAPLENGTH is rejected too.
@@ -435,14 +445,19 @@ fn dwc3_host_init() -> Result<(), &'static str> {
         return Err("CNR did not clear within 100 ms");
     }
 
-    // Init done: let the unused SuperSpeed PHY interface suspend.
-    set(b + DWC3_GUSB3PIPECTL, GUSB3PIPECTL_SUSPHY);
+    // A working combo0 remains awake for SuperSpeed. Park only the absent
+    // interface on the explicit high-speed failure fallback.
+    if !superspeed {
+        set(b + DWC3_GUSB3PIPECTL, GUSB3PIPECTL_SUSPHY);
+    }
     Ok(())
 }
 
 /// Bring up all USB host controllers. Never fails the boot: what did not
 /// come up is logged and left out of [`ready`].
 pub fn init() {
+    // Boot CPU only; a failed repeat must not retain an earlier readiness.
+    unsafe { *addr_of_mut!(READY) = Ready::default() };
     // The USB2 PHY block is in PCK-600 domain 8, off at cold boot; until it
     // is on, the PHY MMIO at 0x06B00000 drops writes and reads 0.
     if let Err(e) = ppu::power_on(ppu::USB2) {
@@ -453,14 +468,38 @@ pub fn init() {
     }
     ccu_init();
     phy_init();
+    // Hold the controller while configuring its external combo PHY. Do not
+    // change the shared SERDES reset: combo1 may already own the PCIe link.
+    set(XHCI + DWC3_GCTL, GCTL_CORESOFTRESET);
+    let combo0_status = match combo0::init() {
+        Ok(()) => {
+            // Manual18.2.6.2: real USB2 PHY UTMI + combo0 PIPE, USB2 and SS.
+            clr(SERDES_USB3P1_BGR, USB3P1_PIPE_SEL_U2 | USB3P1_UTMI_SEL_CCU);
+            1
+        }
+        Err(e) => {
+            println!("[main] USB: combo0 {e:?}; explicit high-speed-only fallback");
+            // combo0::init parks only its own PHY; CCU PIPE remains selected.
+            match e {
+                combo0::Error::Reset => 2,
+                combo0::Error::PllEnable => 3,
+                combo0::Error::PmaReady => 4,
+            }
+        }
+    };
 
     let mut r = Ready {
         ehci0: ehci_alive(EHCI0),
         ehci1: ehci_alive(EHCI1),
         xhci: false,
+        superspeed: false,
+        combo0_status,
     };
-    match dwc3_host_init() {
-        Ok(()) => r.xhci = true,
+    match dwc3_host_init(combo0_status == 1) {
+        Ok(()) => {
+            r.xhci = true;
+            r.superspeed = combo0_status == 1;
+        }
         Err(why) => {
             println!(
                 "[main] USB: xHCI {why} (CAP {:#010x}, GCTL {:#010x}); not offered",
@@ -475,7 +514,13 @@ pub fn init() {
         read32(EHCI0 + HCI_UTMI_STAT),
         if r.ehci1 { "up" } else { "dead" },
         read32(EHCI1 + HCI_UTMI_STAT),
-        if r.xhci { "up (USB2-only)" } else { "dead" },
+        if r.superspeed {
+            "up (combo0 SuperSpeed)"
+        } else if r.xhci {
+            "up (high-speed fallback)"
+        } else {
+            "dead"
+        },
     );
     // SAFETY: boot CPU only, before build_dtb reads it.
     unsafe { *addr_of_mut!(READY) = r };
