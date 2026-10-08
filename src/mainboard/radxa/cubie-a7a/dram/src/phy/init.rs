@@ -95,8 +95,9 @@ pub fn load_dmem<H: Hw>(hw: &mut H, p: &mut Para, fw: &PhyFirmware, pstate: u32,
     csr_access(hw, false);
 }
 
-/// Steps C..I for every pstate and the PIE image: train the PHY.
-pub fn init<H: Hw>(hw: &mut H, p: &mut Para, fw: &PhyFirmware, rl: u32) -> Result<(), Error> {
+/// Existing supported native path policy, checked before any clock, rail,
+/// controller or PHY mutation. This is not a fitted-part or stable-rate claim.
+pub fn validate(p: &Para) -> Result<(), Error> {
     if p.tpr10() & (1 << 29) == 0 {
         return Err(Error::Config(
             "only the trained (tpr10[29]) PHY path is supported",
@@ -108,11 +109,18 @@ pub fn init<H: Hw>(hw: &mut H, p: &mut Para, fw: &PhyFirmware, rl: u32) -> Resul
         ));
     }
     for ps in 0..4 {
-        let c = ctx(p, fw, ps);
-        if !(100..=800).contains(&c.mhz) {
+        let div = (p.tpr2() >> (8 * ps)) & 0x1f;
+        let mhz = p.clk() / (div + 1);
+        if !(100..=800).contains(&mhz) {
             return Err(Error::Config("pstate clock outside 100..800 MHz"));
         }
     }
+    Ok(())
+}
+
+/// Steps C..I for every pstate and the PIE image: train the PHY.
+pub fn init<H: Hw>(hw: &mut H, p: &mut Para, fw: &PhyFirmware, rl: u32) -> Result<(), Error> {
+    validate(p)?;
     let c0 = ctx(p, fw, 0);
     prog::run(hw, tables::C_ONCE, &c0, freq::config);
     load_imem(hw, fw);
