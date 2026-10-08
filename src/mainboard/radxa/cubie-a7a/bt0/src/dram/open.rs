@@ -7,9 +7,9 @@
 
 use core::fmt;
 
-use cubie_a7a_dram::{Error, Hw, InitError, Para, PhyFirmware, Rail};
+use cubie_a7a_dram::{Error, InitError, Para, PhyFirmware};
 
-use super::PMIC;
+use super::bt0hw::Bt0Hw;
 use crate::soc;
 
 static IMEM: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/phy-imem.bin"));
@@ -18,55 +18,6 @@ static PIE_A: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/phy-pie-a.bin"))
 static PIE_B: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/phy-pie-b.bin"));
 static PIE_A_1RANK: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/phy-pie-a-1rank.bin"));
 static PIE_B_1RANK: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/phy-pie-b-1rank.bin"));
-
-struct Bt0Hw;
-
-impl Hw for Bt0Hw {
-    fn read32(&mut self, addr: usize) -> u32 {
-        util::mmio::read32(addr)
-    }
-    fn write32(&mut self, addr: usize, val: u32) {
-        util::mmio::write32(addr, val)
-    }
-    fn read16(&mut self, addr: usize) -> u16 {
-        util::mmio::read16(addr)
-    }
-    fn write16(&mut self, addr: usize, val: u16) {
-        util::mmio::write16(addr, val)
-    }
-    fn udelay(&mut self, us: u32) {
-        // This mandatory settling ABI cannot return an error. Never silently
-        // shorten it or proceed with a stalled counter: stop through the
-        // timer-free failure path and the already armed boot watchdog.
-        crate::ccu::delay_us(us).unwrap_or_else(|error| crate::clock_failure(error));
-    }
-    fn now_us(&mut self) -> u64 {
-        soc::ticks() / (soc::TIMER_HZ / 1_000_000)
-    }
-    fn set_voltage(&mut self, rail: Rail, mv: u32) -> bool {
-        let name = rail.pmic_name();
-        println!("[bt0] DRAM: set {name} to {mv} mV");
-        match unsafe { (*core::ptr::addr_of!(PMIC)).as_ref() } {
-            Some(pmic) => match pmic.set_voltage(name, mv, Some(true)) {
-                Ok(()) => true,
-                Err(e) => {
-                    println!("[bt0] DRAM: {name}: {e}");
-                    false
-                }
-            },
-            None => {
-                println!("[bt0] DRAM: no PMIC; voltage request failed");
-                false
-            }
-        }
-    }
-    fn log(&mut self, args: fmt::Arguments) {
-        print!("{args}");
-    }
-    fn kick_watchdog(&mut self) {
-        crate::recovery::kick();
-    }
-}
 
 /// One init attempt with `para`; the size in MiB, or None.
 pub fn init_one(para: &[u32; 32]) -> Option<u32> {

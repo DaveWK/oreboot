@@ -66,7 +66,7 @@ fn main() {
 
     if env::var_os("CARGO_FEATURE_DRAMLIB").is_some() {
         link_dram_library();
-    } else {
+    } else if env::var_os("CARGO_FEATURE_BLOBLESS").is_none() {
         extract_phy_firmware(out);
     }
 }

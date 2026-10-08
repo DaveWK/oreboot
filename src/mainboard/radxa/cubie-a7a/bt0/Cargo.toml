@@ -8,6 +8,9 @@ edition = "2021"
 # DRAM init through Allwinner's closed library (A733_DRAM_LIB) instead of
 # the open driver; firmware de106497 ran this path.
 dramlib = []
+# DRAM without any PHY firmware (no PMU training firmware, no PIE images).
+# Development stage: probes the PHY and halts (src/dram/blobless.rs).
+blobless = []
 
 [dependencies]
 log = { path = "../../../../lib/log" }

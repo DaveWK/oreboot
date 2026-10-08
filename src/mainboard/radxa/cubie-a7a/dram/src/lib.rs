@@ -6,6 +6,7 @@
 //! training firmware is loaded as data (see [`phy`]).
 #![no_std]
 
+pub mod blobless;
 pub mod ccu;
 pub mod ctrl;
 pub mod hw;
@@ -42,23 +43,31 @@ impl From<post::SaveFailure> for InitError {
     }
 }
 
+/// DRAM clocks/resets and the controller set-up that precede the PHY
+/// (the first half of [`core_init`], shared with the firmware-free probes
+/// in [`blobless`]). The caller validates `p` first.
+pub fn controller_pre_phy<H: Hw>(hw: &mut H, p: &mut Para) -> Result<(), Error> {
+    ccu::sys_init(hw, p.clk())?;
+    ctrl::com_pre_init(hw, p);
+    for ch in 0..p.channels() {
+        ctrl::bus_config(hw, ch);
+        hw.set32(ddrc(ch, DDRC_B84), 1);
+        hw.write32(ddrc(ch, DDRC_184), 2);
+        ctrl::com_init(hw, p, ch)?;
+    }
+    ctrl::com_post_init(hw, p);
+    Ok(())
+}
+
 /// Controllers and PHY of every channel: clocks, controller set-up, PHY
 /// training, DFI handshake. Returns after the controllers run normally.
 pub fn core_init<H: Hw>(hw: &mut H, p: &mut Para, fw: &PhyFirmware) -> Result<(), Error> {
     ccu::validate_pll_ddr_rate(p.clk())?;
     phy::init::validate(p)?;
     ctrl::validate_geometry(p)?;
-    ccu::sys_init(hw, p.clk())?;
+    controller_pre_phy(hw, p)?;
     let channels = p.channels();
-    ctrl::com_pre_init(hw, p);
-    for ch in 0..channels {
-        ctrl::bus_config(hw, ch);
-        hw.set32(ddrc(ch, DDRC_B84), 1);
-        hw.write32(ddrc(ch, DDRC_184), 2);
-        ctrl::com_init(hw, p, ch)?;
-    }
     let rl = if p.tpr10() & (1 << 31) != 0 { 14 } else { 13 };
-    ctrl::com_post_init(hw, p);
     phy::init::init(hw, p, fw, rl)?;
     for ch in 0..channels {
         post::timing_after_phy(hw, ch)?;

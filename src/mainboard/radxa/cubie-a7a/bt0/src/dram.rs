@@ -1,10 +1,11 @@
 //! LPDDR5 bring-up: parameter set selection, the init with fallbacks, and
 //! the quick checks around it.
 //!
-//! The init itself runs either through the open driver (crate
-//! `cubie-a7a-dram`, the default: no vendor code, the PHY's firmware loaded
-//! as data) or, with the `dramlib` feature, through Allwinner's closed
-//! library as firmware de106497 did.
+//! The init itself runs through the open driver (crate `cubie-a7a-dram`,
+//! the default: no vendor code, the PHY's firmware loaded as data), with
+//! the `dramlib` feature through Allwinner's closed library as firmware
+//! de106497 did, or with the `blobless` feature without any PHY firmware
+//! (development stage, see `dram/blobless.rs`).
 
 use util::mmio::read32;
 
@@ -13,12 +14,21 @@ use cubie_a7a_dram::sets::{ParamSet, CXMT_4G, HYNIX_4G, PARAM_SETS, SAFE_4G};
 use crate::axp::Axp;
 use crate::soc;
 
+#[cfg(all(feature = "dramlib", feature = "blobless"))]
+compile_error!("features dramlib and blobless select different DRAM backends");
+
+#[cfg(feature = "blobless")]
+mod blobless;
 #[cfg(not(feature = "dramlib"))]
+mod bt0hw;
+#[cfg(not(any(feature = "dramlib", feature = "blobless")))]
 mod open;
 #[cfg(feature = "dramlib")]
 mod vendor;
 
-#[cfg(not(feature = "dramlib"))]
+#[cfg(feature = "blobless")]
+use blobless as backend;
+#[cfg(not(any(feature = "dramlib", feature = "blobless")))]
 use open as backend;
 #[cfg(feature = "dramlib")]
 use vendor as backend;

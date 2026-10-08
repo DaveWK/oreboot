@@ -26,6 +26,12 @@ const IMEM_WORDS: usize = 0x8000;
 const DMEM_WORDS: usize = 0x8000;
 
 fn ctx<'a>(p: &Para, fw: &PhyFirmware<'a>, pstate: u32) -> Ctx<'a> {
+    ctx_with(p, fw.pie, pstate)
+}
+
+/// Programming context of `pstate`. Firmware-free callers pass empty PIE
+/// images and must not run a program containing [`prog::Kind::Blob`].
+pub(crate) fn ctx_with<'a>(p: &Para, pie: [&'a [u8]; 4], pstate: u32) -> Ctx<'a> {
     let div = (p.tpr2() >> (8 * pstate)) & 0x1f;
     Ctx {
         pstate,
@@ -36,7 +42,7 @@ fn ctx<'a>(p: &Para, fw: &PhyFirmware<'a>, pstate: u32) -> Ctx<'a> {
         dx_odt: p.dx_odt(),
         dx_dri: p.dx_dri(),
         ca_dri: p.ca_dri(),
-        pie: fw.pie,
+        pie,
     }
 }
 
