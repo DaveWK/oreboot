@@ -4,7 +4,13 @@ version = "0.1.0"
 authors = ["oreboot authors"]
 edition = "2021"
 
+[features]
+# DRAM init through Allwinner's closed library (A733_DRAM_LIB) instead of
+# the open driver; firmware de106497 ran this path.
+dramlib = []
+
 [dependencies]
 log = { path = "../../../../lib/log" }
 util = { path = "../../../../lib/util" }
 cubie-a7a-common = { path = "../common" }
+cubie-a7a-dram = { path = "../dram" }

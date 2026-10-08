@@ -6,7 +6,7 @@
 //! boot layout table, then warm-resets CPU0 into AArch64 at oreboot main.
 #![no_std]
 #![no_main]
-#![feature(c_variadic)]
+#![cfg_attr(feature = "dramlib", feature(c_variadic))]
 
 #[macro_use]
 extern crate log;
@@ -20,8 +20,7 @@ use cubie_a7a_common::{
     crc32, layout, mem,
     twi::Twi,
     uart::{init_logger, Uart, UART0_BASE},
-    R_TWI0_BASE,
-    Handoff, HANDOFF_MAGIC, HANDOFF_VERSION,
+    Handoff, HANDOFF_MAGIC, HANDOFF_VERSION, R_TWI0_BASE,
 };
 use util::mmio::write32;
 
@@ -245,7 +244,11 @@ fn read_layout(sd: &smhc::Smhc) -> layout::Table {
     let mut bytes = [0u8; layout::TABLE_SIZE];
     // SAFETY: the sector buffer is larger than the table.
     unsafe {
-        core::ptr::copy_nonoverlapping(sector.as_ptr() as *const u8, bytes.as_mut_ptr(), bytes.len())
+        core::ptr::copy_nonoverlapping(
+            sector.as_ptr() as *const u8,
+            bytes.as_mut_ptr(),
+            bytes.len(),
+        )
     };
     bytes[layout::CRC_FIELD_OFFSET..layout::CRC_FIELD_OFFSET + 4].fill(0);
     if table.magic != layout::MAGIC
@@ -253,7 +256,10 @@ fn read_layout(sd: &smhc::Smhc) -> layout::Table {
         || table.count as usize > layout::MAX_ENTRIES
         || crc32(&bytes) != table.crc32
     {
-        println!("[bt0] SD: no valid boot layout table at 0x{:x}", layout::TABLE_OFFSET);
+        println!(
+            "[bt0] SD: no valid boot layout table at 0x{:x}",
+            layout::TABLE_OFFSET
+        );
         halt();
     }
     table

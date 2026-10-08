@@ -57,7 +57,14 @@ const LOW: Range = (500, 1200, 10);
 const MID: Range = (1220, 1540, 20);
 
 static RAILS: &[Rail] = &[
-    rail("dcdc1", 0x12, 0x1f, DCDC_ON_OFF_CTL1, 0, &[(1000, 3800, 100)]),
+    rail(
+        "dcdc1",
+        0x12,
+        0x1f,
+        DCDC_ON_OFF_CTL1,
+        0,
+        &[(1000, 3800, 100)],
+    ),
     rail("dcdc2", 0x13, 0x7f, DCDC_ON_OFF_CTL1, 1, &[LOW, MID]),
     rail("dcdc3", 0x14, 0x7f, DCDC_ON_OFF_CTL1, 2, &[LOW, MID]),
     rail("dcdc4", 0x15, 0x7f, DCDC_ON_OFF_CTL1, 3, &[LOW, MID]),
@@ -77,9 +84,30 @@ static RAILS: &[Rail] = &[
         5,
         &[LOW, MID, (1800, 2400, 20), (2440, 2760, 40)],
     ),
-    rail("dcdc7", 0x18, 0x7f, DCDC_ON_OFF_CTL1, 6, &[LOW, (1220, 1840, 20)]),
-    rail("dcdc8", 0x19, 0x7f, DCDC_ON_OFF_CTL1, 7, &[LOW, MID, (1900, 3400, 100)]),
-    rail("dcdc9", 0x1a, 0x7f, DCDC_ON_OFF_CTL2, 0, &[LOW, MID, (1900, 3400, 100)]),
+    rail(
+        "dcdc7",
+        0x18,
+        0x7f,
+        DCDC_ON_OFF_CTL1,
+        6,
+        &[LOW, (1220, 1840, 20)],
+    ),
+    rail(
+        "dcdc8",
+        0x19,
+        0x7f,
+        DCDC_ON_OFF_CTL1,
+        7,
+        &[LOW, MID, (1900, 3400, 100)],
+    ),
+    rail(
+        "dcdc9",
+        0x1a,
+        0x7f,
+        DCDC_ON_OFF_CTL2,
+        0,
+        &[LOW, MID, (1900, 3400, 100)],
+    ),
     rail("bldo1", 0x2a, 0x1f, LDO_ON_OFF_CTL1, 6, LDO),
     rail("cldo2", 0x30, 0x1f, LDO_ON_OFF_CTL2, 4, LDO),
     rail("cldo5", 0x33, 0x1f, LDO_ON_OFF_CTL2, 7, LDO),
@@ -161,7 +189,11 @@ impl<'a> Axp<'a> {
         let id = self.twi.read_reg(ADDR, REG_PROBE)?;
         println!(
             "[bt0] AXP8191 @0x{ADDR:02x}: reg 0x{REG_PROBE:02x} = 0x{id:02x}{}",
-            if id == PROBE_EXPECTED { "" } else { " (unexpected)" }
+            if id == PROBE_EXPECTED {
+                ""
+            } else {
+                " (unexpected)"
+            }
         );
         let v = self.twi.read_reg(ADDR, DCDC_ON_OFF_CTL1)?;
         self.twi.write_reg(ADDR, DCDC_ON_OFF_CTL1, v | 0x08)?;

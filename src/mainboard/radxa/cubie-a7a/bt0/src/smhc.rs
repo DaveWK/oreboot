@@ -137,7 +137,12 @@ impl Smhc {
         write32(self.base + off, v)
     }
 
-    fn wait<F: Fn(&Self) -> bool>(&self, what: &'static str, us: u64, cond: F) -> Result<(), Error> {
+    fn wait<F: Fn(&Self) -> bool>(
+        &self,
+        what: &'static str,
+        us: u64,
+        cond: F,
+    ) -> Result<(), Error> {
         let t0 = time_us();
         while !cond(self) {
             if time_us() - t0 > us {
@@ -252,7 +257,9 @@ impl Smhc {
             }
         }
         if resp == Resp::R1b {
-            self.wait("card busy", 1_000_000, |s| s.r(STATUS) & STATUS_CARD_BUSY == 0)?;
+            self.wait("card busy", 1_000_000, |s| {
+                s.r(STATUS) & STATUS_CARD_BUSY == 0
+            })?;
         }
         let out = if resp == Resp::R2 {
             [self.r(RESP3), self.r(RESP2), self.r(RESP1), self.r(RESP0)]
@@ -296,10 +303,12 @@ impl Smhc {
         let hcs = if v2 { 1 << 30 } else { 0 };
         let t0 = time_us();
         let ocr = loop {
-            let ocr = self.app_cmd(41, hcs | 0x00ff_8000, Resp::R3).map_err(|e| match e {
-                Error::Cmd { idx: 55, .. } => Error::NoCard,
-                e => e,
-            })?[0];
+            let ocr = self
+                .app_cmd(41, hcs | 0x00ff_8000, Resp::R3)
+                .map_err(|e| match e {
+                    Error::Cmd { idx: 55, .. } => Error::NoCard,
+                    e => e,
+                })?[0];
             if ocr & (1 << 31) != 0 {
                 break ocr;
             }
@@ -320,7 +329,11 @@ impl Smhc {
         self.set_card_clock(0)?;
         println!(
             "[bt0] SD: {} card, RCA {:04x}, OCR {ocr:08x}",
-            if self.high_capacity { "SDHC/SDXC" } else { "SDSC" },
+            if self.high_capacity {
+                "SDHC/SDXC"
+            } else {
+                "SDSC"
+            },
             self.rca
         );
         Ok(())
@@ -332,7 +345,11 @@ impl Smhc {
         assert!(buf.len() % words_per_block == 0);
         for chunk in buf.chunks_mut(words_per_block * MAX_BLOCKS_PER_CMD as usize) {
             let blocks = (chunk.len() / words_per_block) as u32;
-            let addr = if self.high_capacity { lba } else { lba * BLOCK_SIZE as u32 };
+            let addr = if self.high_capacity {
+                lba
+            } else {
+                lba * BLOCK_SIZE as u32
+            };
             let idx = if blocks > 1 { 18 } else { 17 };
             self.cmd_data(idx, addr, Resp::R1, Some(chunk))?;
             lba += blocks;

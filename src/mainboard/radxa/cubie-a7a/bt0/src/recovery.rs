@@ -102,7 +102,10 @@ pub fn boot_vendor_spl(sd: &Smhc, table: &layout::Table) {
     };
     let len = (e.size as usize).next_multiple_of(BLOCK_SIZE);
     if len > SPL_MAX || e.offset as usize % BLOCK_SIZE != 0 {
-        println!("[bt0] recovery: vendor SPL entry is unusable ({} bytes)", e.size);
+        println!(
+            "[bt0] recovery: vendor SPL entry is unusable ({} bytes)",
+            e.size
+        );
         return;
     }
     // SAFETY: STAGING..STAGING+SPL_MAX is unused SRAM above bt0.
@@ -124,7 +127,10 @@ pub fn boot_vendor_spl(sd: &Smhc, table: &layout::Table) {
         }
     }
 
-    println!("[bt0] recovery: starting the vendor SPL ({} KiB)", e.size / 1024);
+    println!(
+        "[bt0] recovery: starting the vendor SPL ({} KiB)",
+        e.size / 1024
+    );
     crate::Uart::attach(crate::UART0_BASE).drain();
     // SAFETY: stub symbols bound a small position-independent routine;
     // STUB is unused SRAM above the staging area.

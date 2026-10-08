@@ -214,3 +214,23 @@ pub fn save_training_results<H: Hw>(hw: &mut H, p: &mut Para) -> Result<(), Erro
     phy::csr_access(hw, false);
     Ok(())
 }
+
+/// MCTL_COM's hardware DFS sequencer program (0x0a021800..0x0a021d3f):
+/// the command list the controller block replays to change the DRAM
+/// frequency (self-refresh entry, clock switch, MR writes, exit). Nothing
+/// starts it during boot; it is written as the vendor init leaves it so a
+/// later frequency change (SCP firmware) finds it. The clock words of the
+/// four pstates hold each pstate's PLL divider ([23:16] = 8 x tpr2 divider).
+pub fn dfs_table<H: Hw>(hw: &mut H, p: &Para) {
+    for &(addr, val) in phy::tables::DFS_TABLE.iter() {
+        let v = match addr {
+            0x0a02_1d30..=0x0a02_1d3c => {
+                let ps = (addr - 0x0a02_1d30) / 4;
+                let div = (p.tpr2() >> (8 * ps)) & 0x1f;
+                (val & !0x00ff_0000) | (div * 8) << 16
+            }
+            _ => val,
+        };
+        hw.write32(addr as usize, v);
+    }
+}

@@ -12,6 +12,7 @@ pub const MSG_TRAINING_FAILED: u32 = 0xff;
 /// Start the firmware loaded in IMEM/DMEM, wait for its final mailbox
 /// message and stop it again. Returns the message.
 pub fn run<H: Hw>(hw: &mut H, pstate: u8) -> Result<u32, Error> {
+    hw.kick_watchdog();
     csr_access(hw, false);
     // Reset and stall the microcontroller, then release both.
     hw.write16(MICRO_RESET, 9);

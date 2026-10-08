@@ -106,7 +106,11 @@ const DSU_PLL: usize = CPU_PLL_CFG_BASE + 0x3000;
 /// [`set_cpu_clocks`] raises them once the rails are up.
 fn set_pll_cpux(hosc_khz: u32) {
     // SyterKit's targets: multiples of 24 MHz, or of 26 MHz otherwise.
-    let (cpu, dsu) = if hosc_khz == 26_000 { (1014, 780) } else { (1008, 744) };
+    let (cpu, dsu) = if hosc_khz == 26_000 {
+        (1014, 780)
+    } else {
+        (1008, 744)
+    };
     for (addr, mhz) in [(CPU_L_PLL, cpu), (CPU_B_PLL, cpu), (DSU_PLL, dsu)] {
         enable_pll(addr, 0, (480 * 1000_u32).div_ceil(hosc_khz), 0, 0);
         set_pll(addr, 0, cpu_pll_n(hosc_khz, mhz), 0, 0);
@@ -158,7 +162,11 @@ pub fn init() {
     // 100 MHz, and the DRAM library only changes the source.
     clr_set_bits(NSI_CLK_REG, NSI_GATE | 0x1f, NSI_UPD);
     while read32(NSI_CLK_REG) & NSI_UPD != 0 {}
-    clr_set_bits(NSI_CLK_REG, 0x7 << 24, NSI_SEL_PERI0_600M | NSI_GATE | NSI_UPD);
+    clr_set_bits(
+        NSI_CLK_REG,
+        0x7 << 24,
+        NSI_SEL_PERI0_600M | NSI_GATE | NSI_UPD,
+    );
     while read32(NSI_CLK_REG) & NSI_UPD != 0 {}
 }
 

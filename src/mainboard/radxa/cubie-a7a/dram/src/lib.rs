@@ -49,6 +49,9 @@ pub fn core_init<H: Hw>(hw: &mut H, p: &mut Para, fw: &PhyFirmware) -> Result<()
             hw.set32(ddrc(ch, PWRCTL), 0x11);
         }
     }
+    if p.tpr13() & 4 != 0 {
+        post::dfs_table(hw, p);
+    }
     Ok(())
 }
 

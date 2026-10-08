@@ -37,6 +37,8 @@ pub trait Hw {
     /// Switch `rail` on at `mv`; false if the PMIC refused.
     fn set_voltage(&mut self, rail: Rail, mv: u32) -> bool;
     fn log(&mut self, args: fmt::Arguments);
+    /// Restart the platform's boot watchdog (long steps: PHY training).
+    fn kick_watchdog(&mut self) {}
 
     fn modify32(&mut self, addr: usize, f: impl FnOnce(u32) -> u32) {
         let v = self.read32(addr);
