@@ -57,18 +57,37 @@ pub enum Step<'a> {
     Launch { rows: &'a [Row], outer: u16 },
 }
 
-/// MR18 before the two calibration-mode bits are asserted. The source of
-/// this value must be the selected part/pstate's verified mode registers.
+/// WL MR18 base, with bit 4 cleared and mode bits 7/6 supplied clear.
+/// Derived from the selected part/pstate's original message-block input.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Mr18Base(u8);
 
 impl Mr18Base {
     pub const fn new(value: u8) -> Option<Self> {
-        if value & 0xc0 != 0 {
+        if value & 0xd0 != 0 {
             None
         } else {
             Some(Self(value))
         }
+    }
+
+    /// WL uses word 0x43/0x44 for channel A/B and its low/high byte for
+    /// rank 0/1. Synthetic bit and isolated-byte probes establish clearing
+    /// bit 4, preserving all other base bits. Reject preasserted mode bits.
+    pub const fn from_message_block(
+        words: &[u16; super::msgblock::WORDS],
+        channel: Channel,
+        rank: Rank,
+    ) -> Option<Self> {
+        let word = match channel {
+            Channel::A => 0x43,
+            Channel::B => 0x44,
+        };
+        let shift = match rank {
+            Rank::R0 => 0,
+            Rank::R1 => 8,
+        };
+        Self::new(((words[word] >> shift) as u8) & !0x10)
     }
 }
 
@@ -209,7 +228,7 @@ pub fn calibration_prefix(
         out(Step::Write(0x10fb5 + db * 0x1000, 0));
     }
     out(Step::Launch {
-        rows: &mr18_rows(rank, mr18_base.0 | 0xc0, false, false),
+        rows: &mr18_rows(rank, mr18_base.0 | 0xc8, false, false),
         outer: 0,
     });
     out(Step::Write(0x1f0a7, 0x6300));
