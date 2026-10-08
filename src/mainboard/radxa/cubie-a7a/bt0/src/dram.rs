@@ -120,8 +120,15 @@ pub fn select() -> &'static ParamSet {
     &PARAM_SETS[idx]
 }
 
-/// Working copy handed to the library, which writes back into it.
-static mut DRAM_PARA: [u32; 32] = [0; 32];
+/// Working copy handed to the library, which writes back into it. The
+/// library's `dram_para_t` is longer than the 32 `sys_config.fex` words:
+/// save_phy_2d_training_result stores the trained PHY delays and MR14/MR15
+/// from word 32 up to word 51, and the LPDDR4 path in init_DRAM fills words
+/// 32..50. A 32-word buffer let it overwrite the logger and the PMIC handle
+/// that follow in .bss (the silent stop after training in the October 7
+/// trials), so leave ample room after the configured words.
+const DRAM_PARA_WORDS: usize = 256;
+static mut DRAM_PARA: [u32; DRAM_PARA_WORDS] = [0; DRAM_PARA_WORDS];
 
 static mut PMIC: Option<Axp<'static>> = None;
 
@@ -146,9 +153,10 @@ pub fn init(pmic: Option<Axp<'static>>, set: &'static ParamSet) -> Option<(u32, 
     for s in core::iter::once(set).chain(fallback.iter().copied()) {
         println!("[bt0] DRAM: init with {} parameters ({} MHz)", s.name, s.para[0]);
         let size = unsafe {
-            let para = core::ptr::addr_of_mut!(DRAM_PARA);
-            *para = s.para;
-            init_DRAM(0, para as *mut c_void)
+            let para = &mut *core::ptr::addr_of_mut!(DRAM_PARA);
+            para.fill(0);
+            para[..s.para.len()].copy_from_slice(&s.para);
+            init_DRAM(0, para.as_mut_ptr() as *mut c_void)
         };
         if size > 0 {
             return Some((size as u32, s.para[0]));
