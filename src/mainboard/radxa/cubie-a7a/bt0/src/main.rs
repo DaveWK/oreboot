@@ -254,45 +254,24 @@ fn read_layout(sd: &smhc::Smhc) -> layout::Table {
         println!("[bt0] SD: reading layout table failed: {e:?}");
         halt();
     }
-    // SAFETY: Table is repr(C), plain integers, and fits in one sector.
-    let table: layout::Table = unsafe { core::ptr::read(sector.as_ptr() as *const layout::Table) };
-    let mut bytes = [0u8; layout::TABLE_SIZE];
-    // SAFETY: the sector buffer is larger than the table.
-    unsafe {
-        core::ptr::copy_nonoverlapping(
-            sector.as_ptr() as *const u8,
-            bytes.as_mut_ptr(),
-            bytes.len(),
-        )
+    // The u32 sector buffer need not satisfy Table's u64 alignment.
+    let bytes = unsafe {
+        core::slice::from_raw_parts(sector.as_ptr().cast::<u8>(), smhc::BLOCK_SIZE)
     };
-    bytes[layout::CRC_FIELD_OFFSET..layout::CRC_FIELD_OFFSET + 4].fill(0);
-    if table.magic != layout::MAGIC
-        || table.version != layout::VERSION
-        || table.count as usize > layout::MAX_ENTRIES
-        || crc32(&bytes) != table.crc32
-    {
-        println!(
-            "[bt0] SD: no valid boot layout table at 0x{:x}",
-            layout::TABLE_OFFSET
-        );
-        halt();
+    match layout::decode(bytes) {
+        Ok(table) => table,
+        Err(error) => {
+            println!("[bt0] invalid boot layout frame: {error:?}");
+            halt();
+        }
     }
-    table
 }
 
-fn load_entry(sd: &smhc::Smhc, e: &layout::Entry, dram_end: usize) {
-    let addr = e.load_addr as usize;
-    let padded = (e.size as usize).next_multiple_of(smhc::BLOCK_SIZE);
-    let ok = addr >= mem::DRAM_BASE
-        && addr % 4 == 0
-        && addr.checked_add(padded).is_some_and(|end| end <= dram_end)
-        && e.offset as usize % smhc::BLOCK_SIZE == 0;
-    if !ok {
-        println!("[bt0] layout: bad entry {e:x?}");
-        halt();
-    }
+fn load_entry(sd: &smhc::Smhc, e: &layout::Entry, addr: usize, padded: usize) {
+    const _: () = assert!(smhc::BLOCK_SIZE as u64 == layout::BLOCK_SIZE);
+    // Called only by layout::load_entries after whole-table preflight.
     let t0 = soc::time_us();
-    // SAFETY: range checked against DRAM above; DRAM is not otherwise used.
+    // SAFETY: whole-table preflight checked bounds, alignment and disjoint loads.
     let dst = unsafe { core::slice::from_raw_parts_mut(addr as *mut u32, padded / 4) };
     if let Err(err) = sd.read_blocks(e.offset / smhc::BLOCK_SIZE as u32, dst) {
         println!("[bt0] SD: read of kind {} failed: {err:?}", e.kind);
@@ -448,13 +427,10 @@ extern "C" fn main() -> ! {
         dram_mhz,
     };
     let mut main_entry = None;
-    for e in &table.entries[..table.count as usize] {
-        if e.kind == layout::KIND_VENDOR_SPL {
-            continue; // recovery only
-        }
-        load_entry(&sd, e, dram_end);
+    if let Err(error) = layout::load_entries(&table, dram_end as u64, |e, addr, padded| {
+        load_entry(&sd, e, addr, padded);
         match e.kind {
-            layout::KIND_MAIN => main_entry = Some(e.load_addr as u32),
+            layout::KIND_MAIN => main_entry = Some(addr as u32),
             layout::KIND_PAYLOAD => {
                 handoff.payload_addr = e.load_addr;
                 handoff.payload_size = e.size as u64;
@@ -463,10 +439,11 @@ extern "C" fn main() -> ! {
                 handoff.dtb_addr = e.load_addr;
                 handoff.dtb_size = e.size as u64;
             }
-            k => {
-                println!("[bt0] layout: ignoring unknown kind {k}");
-            }
+            _ => unreachable!(), // validated kinds; recovery entries skipped
         }
+    }) {
+        println!("[bt0] invalid boot layout: {error:?}");
+        halt();
     }
     let Some(main_entry) = main_entry else {
         println!("[bt0] layout: no oreboot main image");

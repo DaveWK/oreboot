@@ -146,10 +146,363 @@ pub mod layout {
         pub entries: [Entry; MAX_ENTRIES],
     }
 
+    /// Version1 image-builder contract: images occupy the firmware gap,
+    /// after the table, before the first partition at16MiB.
+    pub const IMAGE_START: u64 = 0x0020_0000;
+    pub const IMAGE_END: u64 = 0x0100_0000;
+    pub const BLOCK_SIZE: u64 = 512;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Error {
+        Header,
+        Checksum,
+        UnsupportedFields,
+        UnknownKind,
+        DuplicateKind,
+        MissingStage,
+        EmptyImage,
+        MediaRange,
+        MemoryRange,
+        LinkedAddress,
+        Overlap,
+    }
+
+    /// Decode the media frame without assuming its byte buffer has Table's
+    /// u64 alignment. All fields are plain integers and the length is checked.
+    pub fn decode(bytes: &[u8]) -> Result<Table, Error> {
+        if bytes.len() < TABLE_SIZE {
+            return Err(Error::Header);
+        }
+        // SAFETY: complete repr(C) integer-only frame, possibly unaligned.
+        let table: Table = unsafe { core::ptr::read_unaligned(bytes.as_ptr().cast()) };
+        if table.magic != MAGIC || table.version != VERSION || table.count as usize > MAX_ENTRIES {
+            return Err(Error::Header);
+        }
+        let mut checksum_bytes = [0u8; TABLE_SIZE];
+        checksum_bytes.copy_from_slice(&bytes[..TABLE_SIZE]);
+        checksum_bytes[CRC_FIELD_OFFSET..CRC_FIELD_OFFSET + 4].fill(0);
+        if super::crc32(&checksum_bytes) != table.crc32 {
+            return Err(Error::Checksum);
+        }
+        Ok(table)
+    }
+
+    fn padded(e: &Entry) -> Result<u64, Error> {
+        if e.size == 0 {
+            return Err(Error::EmptyImage);
+        }
+        Ok((u64::from(e.size) + BLOCK_SIZE - 1) & !(BLOCK_SIZE - 1))
+    }
+
+    fn media_range(e: &Entry) -> Result<(u64, u64), Error> {
+        let start = u64::from(e.offset);
+        let end = start.checked_add(padded(e)?).ok_or(Error::MediaRange)?;
+        if start < IMAGE_START || start % BLOCK_SIZE != 0 || end > IMAGE_END {
+            return Err(Error::MediaRange);
+        }
+        Ok((start, end))
+    }
+
+    fn memory_range(e: &Entry, dram_end: u64) -> Result<(u64, u64), Error> {
+        use super::mem;
+        let start = e.load_addr;
+        let end = start.checked_add(padded(e)?).ok_or(Error::MemoryRange)?;
+        // Check the full64-bit address before converting to AArch32 usize.
+        if start & 3 != 0 || usize::try_from(start).is_err() || usize::try_from(end).is_err() {
+            return Err(Error::MemoryRange);
+        }
+        match e.kind {
+            KIND_MAIN => {
+                if start != mem::MAIN_BASE as u64 || padded(e)? > mem::MAIN_MAX_SIZE as u64 {
+                    return Err(Error::LinkedAddress);
+                }
+            }
+            KIND_PAYLOAD => {
+                if start != mem::PAYLOAD_BASE as u64 {
+                    return Err(Error::LinkedAddress);
+                }
+            }
+            KIND_DTB => {
+                if start < mem::PAYLOAD_RAM_BASE as u64 {
+                    return Err(Error::MemoryRange);
+                }
+            }
+            KIND_VENDOR_SPL => {
+                // Existing optional recovery format; never loaded by this path.
+                if start != 0x47000 || padded(e)? > 0x4a000 {
+                    return Err(Error::LinkedAddress);
+                }
+                return Ok((start, end));
+            }
+            _ => return Err(Error::UnknownKind),
+        }
+        if start < mem::DRAM_BASE as u64 || end > dram_end {
+            return Err(Error::MemoryRange);
+        }
+        Ok((start, end))
+    }
+
+    fn overlaps(a: (u64, u64), b: (u64, u64)) -> bool {
+        a.0 < b.1 && b.0 < a.1
+    }
+
+    /// Validate every entry before any image is copied. The table CRC is
+    /// checked by the media reader; this checks the image/loader contract.
+    pub fn validate(table: &Table, dram_end: u64) -> Result<(), Error> {
+        if table.magic != MAGIC || table.version != VERSION || table.count as usize > MAX_ENTRIES {
+            return Err(Error::Header);
+        }
+        if table._reserved != 0 {
+            return Err(Error::UnsupportedFields);
+        }
+        let entries = &table.entries[..table.count as usize];
+        let mut seen = 0u32;
+        for (i, e) in entries.iter().enumerate() {
+            if e.flags != 0 || e._reserved != 0 {
+                return Err(Error::UnsupportedFields);
+            }
+            if !(KIND_MAIN..=KIND_VENDOR_SPL).contains(&e.kind) {
+                return Err(Error::UnknownKind);
+            }
+            let bit = 1 << e.kind;
+            if seen & bit != 0 {
+                return Err(Error::DuplicateKind);
+            }
+            seen |= bit;
+            let media = media_range(e)?;
+            let memory = memory_range(e, dram_end)?;
+            for prior in &entries[..i] {
+                if overlaps(media, media_range(prior)?)
+                    || (e.kind != KIND_VENDOR_SPL
+                        && prior.kind != KIND_VENDOR_SPL
+                        && overlaps(memory, memory_range(prior, dram_end)?))
+                {
+                    return Err(Error::Overlap);
+                }
+            }
+        }
+        let required = (1 << KIND_MAIN) | (1 << KIND_PAYLOAD);
+        if seen & required != required {
+            return Err(Error::MissingStage);
+        }
+        Ok(())
+    }
+
+    /// Actual bt0 load orchestration: no callback can run until the entire
+    /// table passes. Recovery-only entries are deliberately excluded.
+    pub fn load_entries(
+        table: &Table,
+        dram_end: u64,
+        mut load: impl FnMut(&Entry, usize, usize),
+    ) -> Result<(), Error> {
+        validate(table, dram_end)?;
+        for e in &table.entries[..table.count as usize] {
+            if e.kind != KIND_VENDOR_SPL {
+                // validate proved both conversions and the whole extent.
+                load(e, e.load_addr as usize, padded(e)? as usize);
+            }
+        }
+        Ok(())
+    }
+
     pub const TABLE_SIZE: usize = core::mem::size_of::<Table>();
     pub const CRC_FIELD_OFFSET: usize = 16;
     const _: () = assert!(TABLE_SIZE == 24 + 32 * MAX_ENTRIES);
     const _: () = assert!(TABLE_SIZE <= 512);
+
+    #[cfg(test)]
+    mod load_controls {
+        use super::*;
+        use crate::mem;
+        const END: u64 = 0xc000_0000;
+        #[test]
+        fn frame_crc_length_and_unaligned_access() {
+            let mut bytes = [0u8; TABLE_SIZE + 1];
+            let frame = &mut bytes[1..];
+            frame[..8].copy_from_slice(&MAGIC);
+            frame[8..12].copy_from_slice(&VERSION.to_le_bytes());
+            let checksum = crate::crc32(frame);
+            frame[CRC_FIELD_OFFSET..CRC_FIELD_OFFSET + 4].copy_from_slice(&checksum.to_le_bytes());
+            assert_eq!(decode(frame).unwrap().count, 0);
+            assert!(matches!(decode(&frame[..TABLE_SIZE - 1]), Err(Error::Header)));
+            frame[24] ^= 1;
+            assert!(matches!(decode(frame), Err(Error::Checksum)));
+        }
+        fn table() -> Table {
+            let mut t = Table {
+                magic: MAGIC,
+                version: VERSION,
+                count: 2,
+                crc32: 0,
+                _reserved: 0,
+                entries: [Entry::default(); MAX_ENTRIES],
+            };
+            t.entries[0] = Entry {
+                kind: KIND_MAIN,
+                offset: 0x200000,
+                size: 4096,
+                load_addr: mem::MAIN_BASE as u64,
+                ..Entry::default()
+            };
+            t.entries[1] = Entry {
+                kind: KIND_PAYLOAD,
+                offset: 0x300000,
+                size: 1024,
+                load_addr: mem::PAYLOAD_BASE as u64,
+                ..Entry::default()
+            };
+            t
+        }
+        fn rejected_before_load(t: &Table) {
+            let mut calls = 0;
+            assert!(load_entries(t, END, |_, _, _| calls += 1).is_err());
+            assert_eq!(
+                calls, 0,
+                "malformed later entry must not follow an earlier copy"
+            );
+        }
+        #[test]
+        fn linked_stages_and_optional_recovery() {
+            let mut t = table();
+            t.count = 3;
+            t.entries[2] = Entry {
+                kind: KIND_VENDOR_SPL,
+                offset: 0x780000,
+                size: 8192,
+                load_addr: 0x47000,
+                ..Entry::default()
+            };
+            let mut calls = 0;
+            load_entries(&t, END, |e, addr, padded| {
+                assert_ne!(e.kind, KIND_VENDOR_SPL);
+                assert_eq!(addr as u64, e.load_addr);
+                assert_eq!(padded as u64, u64::from(e.size));
+                calls += 1;
+            })
+            .unwrap();
+            assert_eq!(calls, 2);
+        }
+        #[test]
+        fn full_address_and_large_padding_never_alias_or_wrap() {
+            let mut t = table();
+            t.entries[1].load_addr += 1 << 32;
+            rejected_before_load(&t);
+            for size in [0, u32::MAX - 510, u32::MAX] {
+                let mut t = table();
+                t.entries[0].size = size;
+                rejected_before_load(&t);
+            }
+            let mut t = table();
+            t.entries[1].load_addr = u64::MAX - 3;
+            rejected_before_load(&t);
+        }
+        #[test]
+        fn padded_transfer_extent_must_fit_dram() {
+            let mut t = table();
+            t.entries[1].size = 1;
+            let end = t.entries[1].load_addr + 512;
+            assert_eq!(validate(&t, end), Ok(()));
+            let mut calls = 0;
+            assert!(load_entries(&t, end - 1, |_, _, _| calls += 1).is_err());
+            assert_eq!(calls, 0);
+        }
+        #[test]
+        fn media_and_memory_overlap_fail_before_first_copy() {
+            let mut t = table();
+            t.entries[1].offset = t.entries[0].offset + 512;
+            rejected_before_load(&t);
+            let mut t = table();
+            t.count = 3;
+            t.entries[2] = Entry {
+                kind: KIND_DTB,
+                offset: 0x800000,
+                size: 1,
+                load_addr: mem::PAYLOAD_BASE as u64 + 512,
+                ..Entry::default()
+            };
+            rejected_before_load(&t);
+            t.entries[2].load_addr += 512;
+            assert_eq!(validate(&t, END), Ok(())); // touching boundary allowed
+            t.entries[2].load_addr = mem::HANDOFF_ADDR as u64;
+            rejected_before_load(&t);
+        }
+        #[test]
+        fn duplicates_missing_and_unknown_stages_rejected() {
+            let mut t = table();
+            t.count = 1;
+            rejected_before_load(&t);
+            let mut t = table();
+            t.count = 3;
+            t.entries[2] = t.entries[0];
+            rejected_before_load(&t);
+            let mut t = table();
+            t.count = 4;
+            t.entries[2] = Entry {
+                kind: KIND_DTB,
+                offset: 0x800000,
+                size: 512,
+                load_addr: 0x48000000,
+                ..Entry::default()
+            };
+            t.entries[3] = Entry {
+                kind: KIND_DTB,
+                offset: 0x900000,
+                size: 512,
+                load_addr: 0x49000000,
+                ..Entry::default()
+            };
+            rejected_before_load(&t); // distinct extents: duplicate-kind gate matters
+            for kind in [0, 5, u32::MAX] {
+                let mut t = table();
+                t.entries[1].kind = kind;
+                rejected_before_load(&t);
+            }
+        }
+        #[test]
+        fn version1_header_and_unknown_fields_rejected() {
+            let mut t = table();
+            t.magic[0] ^= 1;
+            rejected_before_load(&t);
+            let mut t = table();
+            t.version += 1;
+            rejected_before_load(&t);
+            let mut t = table();
+            t.count = MAX_ENTRIES as u32 + 1;
+            rejected_before_load(&t);
+            let mut t = table();
+            t._reserved = 1;
+            rejected_before_load(&t);
+            let mut t = table();
+            t.entries[1].flags = 1;
+            rejected_before_load(&t);
+            let mut t = table();
+            t.entries[1]._reserved = 1;
+            rejected_before_load(&t);
+        }
+        #[test]
+        fn media_gap_and_linker_address_contract() {
+            for offset in [0, TABLE_OFFSET, 0x300001, 0xfffffe00] {
+                let mut t = table();
+                t.entries[1].offset = offset;
+                rejected_before_load(&t);
+            }
+            let mut t = table();
+            t.entries[0].size = mem::MAIN_MAX_SIZE as u32 + 1;
+            rejected_before_load(&t);
+            let mut t = table();
+            t.entries[0].load_addr += 4;
+            rejected_before_load(&t);
+            let mut t = table();
+            t.entries[1].load_addr += 4;
+            rejected_before_load(&t);
+            let mut t = table();
+            t.entries[1].size = (IMAGE_END - u64::from(t.entries[1].offset)) as u32;
+            assert_eq!(validate(&t, END), Ok(()));
+            t.entries[1].size += 1;
+            rejected_before_load(&t);
+        }
+    }
+
 }
 
 /// Boot-attempt tracking, so a broken oreboot/EDK2 build falls back to the
