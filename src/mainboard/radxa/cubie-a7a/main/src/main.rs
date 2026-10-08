@@ -366,8 +366,8 @@ fn build_dtb(h: &Handoff) -> usize {
     static mut FDT: fdt::Fdt = fdt::Fdt::new();
     // SAFETY: only the boot CPU runs this, once.
     let f = unsafe { &mut *addr_of_mut!(FDT) };
-    let mem_base = mem::PAYLOAD_RAM_BASE as u64;
-    let mem_size = h.dram_base + h.dram_size - mem_base;
+    let (mem_base, mem_size) = mem::payload_region(h.dram_base, h.dram_size)
+        .expect("bt0 handed over an invalid DRAM region");
 
     f.begin_node("");
     f.prop_str("compatible", "radxa,cubie-a7a\0allwinner,sun60i-a733");
@@ -456,6 +456,9 @@ extern "C" fn primary_main(mpidr: u64, core: usize) -> ! {
     let h: Handoff = unsafe { read_volatile(mem::HANDOFF_ADDR as *const Handoff) };
     if h.magic != HANDOFF_MAGIC || h.version != HANDOFF_VERSION {
         panic!("no valid handoff from bt0 at {:#x}", mem::HANDOFF_ADDR);
+    }
+    if !mem::valid_payload_entry(h.dram_base, h.dram_size, h.payload_addr) {
+        panic!("bt0 handed over an invalid payload entry or DRAM extent");
     }
     println!(
         "[main] DRAM {} MiB @ {:#x}, warm reset took {} us",

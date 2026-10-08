@@ -92,7 +92,9 @@ pub fn core_index(mpidr: u64) -> Option<usize> {
 }
 
 fn valid_ns_entry(addr: u64) -> bool {
-    addr >= mem::PAYLOAD_RAM_BASE as u64 && addr % 4 == 0
+    // The handoff remains in EL3-owned RAM for the whole uptime.
+    let h = unsafe { read_volatile(mem::HANDOFF_ADDR as *const cubie_a7a_common::Handoff) };
+    mem::valid_payload_entry(h.dram_base, h.dram_size, addr)
 }
 
 fn cpu_on(target: u64, entry: u64, context: u64) -> i64 {

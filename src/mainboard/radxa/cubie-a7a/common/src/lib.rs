@@ -42,6 +42,55 @@ pub mod mem {
 
     /// First byte the payload may use.
     pub const PAYLOAD_RAM_BASE: usize = EL3_BASE + EL3_SIZE;
+    /// Usable non-secure RAM, excluding resident EL3 firmware. Reject a bad
+    /// bt0 handoff instead of wrapping its advertised end/usable length.
+    pub fn payload_region(dram_base: u64, dram_size: u64) -> Option<(u64, u64)> {
+        if dram_base != DRAM_BASE as u64 {
+            return None;
+        }
+        let base = PAYLOAD_RAM_BASE as u64;
+        let end = dram_base.checked_add(dram_size)?;
+        let size = end.checked_sub(base)?;
+        (size != 0).then_some((base, size))
+    }
+
+    /// A PSCI entry must contain one aligned AArch64 instruction in usable RAM.
+    pub fn valid_payload_entry(dram_base: u64, dram_size: u64, entry: u64) -> bool {
+        let Some((base, size)) = payload_region(dram_base, dram_size) else {
+            return false;
+        };
+        entry >= base && entry % 4 == 0 && entry.checked_add(4).is_some_and(|end| end <= base + size)
+    }
+
+    #[cfg(test)]
+    mod region_tests {
+        use super::*;
+        const BASE: u64 = DRAM_BASE as u64;
+        const SIZE: u64 = 4 << 30;
+        #[test]
+        fn usable_region_excludes_el3() {
+            assert_eq!(payload_region(BASE, SIZE), Some((PAYLOAD_RAM_BASE as u64, SIZE - EL3_SIZE as u64)));
+            assert!(valid_payload_entry(BASE, SIZE, PAYLOAD_RAM_BASE as u64));
+            assert!(!valid_payload_entry(BASE, SIZE, BASE));
+            assert!(!valid_payload_entry(BASE, SIZE, PAYLOAD_RAM_BASE as u64 - 4));
+        }
+        #[test]
+        fn entry_bounds_include_last_instruction_only() {
+            assert!(valid_payload_entry(BASE, SIZE, BASE + SIZE - 4));
+            assert!(!valid_payload_entry(BASE, SIZE, BASE + SIZE));
+            assert!(!valid_payload_entry(BASE, SIZE, u64::MAX - 3));
+            assert!(!valid_payload_entry(BASE, SIZE, PAYLOAD_RAM_BASE as u64 + 1));
+        }
+        #[test]
+        fn malformed_handoff_never_wraps() {
+            for size in [0, EL3_SIZE as u64 - 1, EL3_SIZE as u64, u64::MAX] {
+                assert_eq!(payload_region(BASE, size), None);
+                assert!(!valid_payload_entry(BASE, size, PAYLOAD_BASE as u64));
+            }
+            assert_eq!(payload_region(BASE - 4, SIZE), None);
+        }
+    }
+
     /// Where the EDK2 FD is loaded and entered (its PcdFdBaseAddress).
     pub const PAYLOAD_BASE: usize = 0x4100_0000;
 }
