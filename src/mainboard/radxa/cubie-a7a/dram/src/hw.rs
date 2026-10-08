@@ -9,7 +9,7 @@ use core::fmt;
 pub enum Rail {
     /// VDD2H, the LPDDR5 core/IO supply (DCDC7).
     Vdd2h,
-    /// VDD2L (ELDO1), tied to VDD2H's voltage on the Cubie A7A.
+    /// VDD2L (ELDO1), the separate 900 mV VCC09-VDD2L net.
     Vdd2l,
     /// VDDQ (DCDC6).
     Vddq,
