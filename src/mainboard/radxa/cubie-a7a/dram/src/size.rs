@@ -7,19 +7,52 @@ use crate::para::Para;
 /// bank group) 16-bit words; times ranks and channels; three quarters of
 /// that for the non-binary densities (6/12 GB) unless para2[31:30] says
 /// otherwise.
-pub fn size_mib(p: &Para) -> u32 {
+pub fn checked_size_mib(p: &Para) -> Result<u32, Error> {
     let bits = p.row_bits() + p.bank_bits() + p.col_bits() + p.bg_bits() + p.rank_bits();
     let half_width = p.para2() & 0xf != 0;
-    let shift = if !half_width || p.channels() == 2 {
-        bits - 18
+    let overhead = if !half_width || p.channels() == 2 {
+        18
     } else {
-        bits - 19
+        19
     };
-    let mut mib = 1u32 << shift;
+    let shift = bits
+        .checked_sub(overhead)
+        .ok_or(Error::Config("DRAM geometry below size representation"))?;
+    let mut mib = 1u32
+        .checked_shl(shift)
+        .ok_or(Error::Config("DRAM geometry exceeds size arithmetic"))?;
     if p.tpr13() & (7 << 16) != 0 && p.para2() >> 30 != 2 {
-        mib = (mib * 3) >> 2;
+        mib = mib
+            .checked_mul(3)
+            .ok_or(Error::Config("non-binary DRAM size arithmetic overflow"))?
+            >> 2;
     }
-    mib
+    validate_mib(mib)
+}
+
+fn validate_mib(mib: u32) -> Result<u32, Error> {
+    // para2's handoff size is 15 bits; the bounded smoke check needs at least
+    // two MiB. These are software bounds, not detected physical capacity.
+    if !(2..=0x7fff).contains(&mib) {
+        return Err(Error::Config("DRAM size outside boot handoff field"));
+    }
+    Ok(mib)
+}
+
+/// Respect the explicit size flag or calculate the geometry, rejecting values
+/// that cannot be handed off and checked safely before any hardware setup.
+pub fn boot_size_mib(p: &Para) -> Result<u32, Error> {
+    if p.para2() & (1 << 31) != 0 {
+        validate_mib((p.para2() >> 16) & 0x7fff)
+    } else {
+        checked_size_mib(p)
+    }
+}
+
+/// Compatibility for the reference harness's integer ABI. Invalid geometry
+/// returns zero; the actual boot path uses the checked Result API above.
+pub fn size_mib(p: &Para) -> u32 {
+    checked_size_mib(p).unwrap_or(0)
 }
 
 const DRAM_BASE: usize = 0x4000_0000;

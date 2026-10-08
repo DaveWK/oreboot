@@ -91,6 +91,7 @@ pub fn init<H: Hw>(hw: &mut H, p: &mut Para, fw: &PhyFirmware) -> Result<u32, In
     }
     ccu::validate_pll_ddr_rate(p.clk())?;
     phy::init::validate(p)?;
+    let mib = size::boot_size_mib(p)?;
     ccu::pad_calibration(hw);
     let vddq = power::set_rails(hw, p)?;
     hw.log(format_args!("[dram] VDDQ {vddq} mV\n"));
@@ -101,13 +102,9 @@ pub fn init<H: Hw>(hw: &mut H, p: &mut Para, fw: &PhyFirmware) -> Result<u32, In
             p.set_tpr10(p.tpr10() & !(1 << 29));
         }
     }
-    let mib = if p.para2() & (1 << 31) != 0 {
-        (p.para2() >> 16) & 0x7fff
-    } else {
-        let mib = size::size_mib(p);
+    if p.para2() & (1 << 31) == 0 {
         p.set_para2((p.para2() & 0xffff) | (mib << 16));
-        mib
-    };
+    }
     hw.log(format_args!(
         "[dram] {mib} MiB, para1 {:#x}, para2 {:#x}, tpr13 {:#x}\n",
         p.para1(),
