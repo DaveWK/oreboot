@@ -15,7 +15,7 @@ use util::mmio::read32;
 
 use crate::axp::Axp;
 use crate::ccu;
-use crate::soc::{udelay, SID_BASE};
+use crate::soc::SID_BASE;
 
 struct OperatingPoint {
     cpu_l: u32,
@@ -53,7 +53,7 @@ fn speed_bin() -> u32 {
 
 /// Raise the rails, then the clocks. On any PMIC error the clocks stay at
 /// bt0's 0.8 V reset point (~1 GHz).
-pub fn boost(pmic: &Axp) {
+pub fn boost(pmic: &Axp) -> Result<(), ccu::Error> {
     let bin = speed_bin();
     let (op, which) = if KNOWN_BINS.contains(&bin) {
         (&PERFORMANCE, "performance")
@@ -65,10 +65,10 @@ pub fn boost(pmic: &Axp) {
     for (rail, mv) in [("dcdc5", op.vdd_little), ("dcdc3", op.vdd_big)] {
         if let Err(e) = pmic.set_voltage(rail, mv, None) {
             println!("[bt0] DVFS: setting {rail} to {mv} mV failed ({e}); clocks unchanged");
-            return;
+            return Ok(());
         }
     }
     // DVM slews 10 mV per 7.8 us: 0.8 -> 0.94 V takes ~110 us.
-    udelay(1000);
-    ccu::set_cpu_clocks(op.cpu_l, op.cpu_b, op.dsu);
+    ccu::delay_us(1000)?;
+    ccu::set_cpu_clocks(op.cpu_l, op.cpu_b, op.dsu)
 }

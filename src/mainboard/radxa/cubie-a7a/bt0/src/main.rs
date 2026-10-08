@@ -188,6 +188,21 @@ fn halt() -> ! {
     soc::watchdog_reset()
 }
 
+/// Clock failure can invalidate UART/timer assumptions. Keep the already armed
+/// DCXO watchdog running; record exact failure without any timer delay, UART,
+/// storage access, new PLL gate-off, or attempt to execute vendor fallback.
+/// RTC diagnostic0/1/2 then contain address/lastvalue/phase+readcount; stageE*
+/// distinguishes this from the normal initial-clock snapshots.
+fn clock_failure(error: ccu::Error) -> ! {
+    soc::diag(0, error.addr as u32);
+    soc::diag(1, error.last);
+    soc::diag(2, ((error.phase as u32) << 24) | error.reads);
+    soc::stage(0xe0 | error.phase as u32);
+    loop {
+        unsafe { asm!("wfi") };
+    }
+}
+
 /// The UART runs from SYS_CLK24M, which the A733 derives from its REFPLL at a
 /// fixed 24 MHz even on boards with a 26 MHz crystal such as the Cubie A7A
 /// (A733 manual; same choice as Yixun Lan's U-Boot, COUNTER_FREQUENCY too).
@@ -329,7 +344,10 @@ extern "C" fn main() -> ! {
     soc::diag(1, ccu::apb_uart_clk());
     soc::diag(2, soc::xo_ctrl0());
     recovery::arm_watchdog();
-    soc::diag(0, ccu::ref_pll_init());
+    match ccu::ref_pll_init() {
+        Ok(found) => soc::diag(0, found),
+        Err(error) => clock_failure(error),
+    }
     soc::stage(2);
     let t_start = soc::ticks();
     let version = soc::soc_version();
@@ -367,7 +385,9 @@ extern "C" fn main() -> ! {
     }
     recovery::begin_attempt();
 
-    ccu::init();
+    if let Err(error) = ccu::init() {
+        clock_failure(error);
+    }
 
     soc::stage(5);
     let pmic = init_pmic();
@@ -398,7 +418,9 @@ extern "C" fn main() -> ! {
     // Raise the CPU clocks only now: libdram trained at the boot clocks
     // (as SyterKit and the vendor SPL do).
     if let Some(p) = dram::pmic() {
-        dvfs::boost(p);
+        if let Err(error) = dvfs::boost(p) {
+            clock_failure(error);
+        }
         ccu::dump();
     }
 
