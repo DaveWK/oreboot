@@ -30,6 +30,7 @@ mod pcie;
 mod pmic;
 mod ppu;
 mod psci;
+mod psci_lock;
 mod soc;
 mod usb;
 
@@ -546,13 +547,9 @@ extern "C" fn secondary_main(mpidr: u64, core: usize) -> ! {
 /// later restarts it from reset at `start`.
 pub fn cpu_off() -> i64 {
     let core = current_core();
-    let mut c = psci::cpu(core);
-    if c.gicr != 0 {
-        gic::cpu_off(c.gicr);
+    if let Err(code) = psci::prepare_cpu_off(core) {
+        return code;
     }
-    c.state = State::Off;
-    psci::set_cpu(core, c);
-    soc::cpu_power_off_prepare(core);
     loop {
         unsafe { asm!("dsb sy", "wfi") };
     }

@@ -12,6 +12,7 @@
 //! ```
 #![no_std]
 
+pub mod bakery;
 pub mod ethernet;
 pub mod fwlog;
 pub mod memtest;

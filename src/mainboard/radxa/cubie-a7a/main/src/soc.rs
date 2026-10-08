@@ -95,19 +95,26 @@ fn wait_ppu(n: usize, state: u32) -> Result<(), &'static str> {
 /// Power up core `n` so that it starts in AArch64 EL3 at `entry`
 /// (TF-A `sunxi_cpu_on()` plus the RVBAR programming from
 /// `plat_setup_psci_ops()`).
-pub fn cpu_power_on(n: usize, entry: usize) -> Result<(), &'static str> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PowerOnError {
+    /// No power-on request was issued; retrying later is safe.
+    OffTimeout,
+    /// Request was issued: a late secondary may still start.
+    OnTimeout,
+}
+pub fn cpu_power_on(n: usize, entry: usize) -> Result<(), PowerOnError> {
     write32(rvbar_lo(n), entry as u32);
     write32(rvbar_hi(n), (entry as u64 >> 32) as u32);
     set_bits(initarch(n), AARCH64);
 
-    wait_ppu(n, PPU_STATE_OFF)?;
+    wait_ppu(n, PPU_STATE_OFF).map_err(|_| PowerOnError::OffTimeout)?;
     set_bits(hotplug_powermode(n), POWER_ON);
     set_bits(hotplug_control(n), HOTPLUG_EN);
     let r = wait_ppu(n, PPU_STATE_ON);
     clr_bits(hotplug_control(n), HOTPLUG_EN);
     clr_bits(hotplug_powermode(n), POWER_ON);
     clr_bits(hotplug_control(n), GIC_WAKEUP_DISABLE);
-    r
+    r.map_err(|_| PowerOnError::OnTimeout)
 }
 
 /// Prepare the calling core `n` to power down at its next WFI

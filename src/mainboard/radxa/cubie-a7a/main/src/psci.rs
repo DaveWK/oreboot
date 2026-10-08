@@ -8,7 +8,7 @@ use core::ptr::{addr_of, addr_of_mut, read_volatile, write_volatile};
 
 use cubie_a7a_common::{mem, recovery};
 
-use crate::{soc, Context};
+use crate::{psci_lock, soc, Context};
 
 const SMCCC_VERSION: u32 = 0x8000_0000;
 const SMCCC_ARCH_FEATURES: u32 = 0x8000_0001;
@@ -33,6 +33,7 @@ const NOT_REQUIRED: i64 = -2;
 /// SMCCC_ARCH_FEATURES for a workaround: implemented, not needed on this PE.
 const WA_UNAFFECTED: i64 = 1;
 const INVALID_PARAMETERS: i64 = -2;
+const DENIED: i64 = -3;
 const ALREADY_ON: i64 = -4;
 const ON_PENDING: i64 = -5;
 const INTERNAL_FAILURE: i64 = -6;
@@ -69,16 +70,64 @@ const CPU_INIT: Cpu = Cpu {
     gicr: 0,
 };
 
-// The MMU and caches are off in EL3, so plain volatile accesses are
-// coherent between cores; each field has a single writer at a time.
+// Whole records are read/written only under the bakery guard. The state
+// word additionally has aligned ordered scalar access: AF_INFO can observe
+// exactly one published state without copying a concurrently changing record.
 static mut CPUS: [Cpu; MAX_CPUS] = [CPU_INIT; MAX_CPUS];
 
+fn state(idx: usize) -> State {
+    match unsafe { psci_lock::load32(addr_of!(CPUS[idx].state).cast()) } {
+        0 => State::Off,
+        1 => State::On,
+        2 => State::OnPending,
+        _ => panic!("invalid EL3 CPU state"),
+    }
+}
+// Requires a live guard; do not expose an unlocked aggregate access.
+fn read_cpu(idx: usize) -> Cpu {
+    unsafe {
+        Cpu {
+            state: state(idx),
+            entry: read_volatile(addr_of!(CPUS[idx].entry)),
+            context: read_volatile(addr_of!(CPUS[idx].context)),
+            gicr: read_volatile(addr_of!(CPUS[idx].gicr)),
+        }
+    }
+}
+fn write_cpu(idx: usize, c: Cpu) {
+    unsafe {
+        write_volatile(addr_of_mut!(CPUS[idx].entry), c.entry);
+        write_volatile(addr_of_mut!(CPUS[idx].context), c.context);
+        write_volatile(addr_of_mut!(CPUS[idx].gicr), c.gicr);
+        psci_lock::store32(addr_of_mut!(CPUS[idx].state).cast(), c.state as u32);
+    }
+}
 pub fn cpu(idx: usize) -> Cpu {
-    unsafe { read_volatile(addr_of!(CPUS[idx])) }
+    let _guard = psci_lock::acquire().expect("EL3 CPU-state lock unavailable");
+    read_cpu(idx)
+}
+pub fn set_cpu(idx: usize, c: Cpu) {
+    let _guard = psci_lock::acquire().expect("EL3 CPU-state lock unavailable");
+    write_cpu(idx, c);
 }
 
-pub fn set_cpu(idx: usize, c: Cpu) {
-    unsafe { write_volatile(addr_of_mut!(CPUS[idx]), c) }
+/// Platform preparation completes before Off is published. CPU_ON then waits
+/// for PPU OFF before issuing a request, matching pinned A733 TF-A. Release
+/// the software guard before the caller's final WFI: no powered-off lock owner.
+pub fn prepare_cpu_off(idx: usize) -> Result<(), i64> {
+    let _guard = psci_lock::acquire().map_err(|_| DENIED)?;
+    let mut c = read_cpu(idx);
+    if c.state != State::On {
+        return Err(DENIED);
+    }
+    if c.gicr != 0 {
+        crate::gic::cpu_off(c.gicr);
+    }
+    soc::cpu_power_off_prepare(idx);
+    psci_lock::barrier();
+    c.state = State::Off;
+    write_cpu(idx, c);
+    Ok(())
 }
 
 /// Core index for an MPIDR affinity value as passed by the OS
@@ -93,7 +142,7 @@ pub fn core_index(mpidr: u64) -> Option<usize> {
 
 fn valid_ns_entry(addr: u64) -> bool {
     // The handoff remains in EL3-owned RAM for the whole uptime.
-    let h = unsafe { read_volatile(mem::HANDOFF_ADDR as *const cubie_a7a_common::Handoff) };
+    let h = psci_lock::handoff();
     mem::valid_payload_entry(h.dram_base, h.dram_size, addr)
 }
 
@@ -104,7 +153,10 @@ fn cpu_on(target: u64, entry: u64, context: u64) -> i64 {
     if !valid_ns_entry(entry) {
         return INVALID_ADDRESS;
     }
-    let mut c = cpu(idx);
+    let Ok(_guard) = psci_lock::acquire() else {
+        return DENIED;
+    };
+    let mut c = read_cpu(idx);
     match c.state {
         State::On => return ALREADY_ON,
         State::OnPending => return ON_PENDING,
@@ -113,13 +165,17 @@ fn cpu_on(target: u64, entry: u64, context: u64) -> i64 {
     c.entry = entry;
     c.context = context;
     c.state = State::OnPending;
-    set_cpu(idx, c);
+    write_cpu(idx, c);
     match soc::cpu_power_on(idx, crate::warm_entry_addr()) {
         Ok(()) => SUCCESS,
         Err(why) => {
-            println!("[main] PSCI CPU_ON cpu{idx}: {why}");
-            c.state = State::Off;
-            set_cpu(idx, c);
+            println!("[main] PSCI CPU_ON cpu{idx}: {why:?}");
+            if why == soc::PowerOnError::OffTimeout {
+                c.state = State::Off;
+                write_cpu(idx, c);
+            }
+            // ON timeout is ambiguous: retain Pending so a late secondary can
+            // complete, and no second caller can reprogram an active core.
             INTERNAL_FAILURE
         }
     }
@@ -129,7 +185,7 @@ fn affinity_info(target: u64, lowest_level: u64) -> i64 {
     if lowest_level != 0 {
         return INVALID_PARAMETERS;
     }
-    match core_index(target).map(|i| cpu(i).state) {
+    match core_index(target).map(state) {
         Some(State::On) => AFF_ON,
         Some(State::Off) => AFF_OFF,
         Some(State::OnPending) => AFF_ON_PENDING,
@@ -137,13 +193,14 @@ fn affinity_info(target: u64, lowest_level: u64) -> i64 {
     }
 }
 
-/// CPU_SUSPEND: every requested state is entered as standby (WFI in EL3,
-/// woken by any pending interrupt) and the call returns. The vendor device
-/// trees request power-down states (power_state 0x0010000 / 0x1010000);
-/// returning from those is allowed when the core keeps its context, and
-/// Linux then counts the idle entry as failed without side effects.
-fn cpu_suspend(_power_state: u64) -> i64 {
-    unsafe { core::arch::asm!("dsb sy", "wfi") };
+/// Only original-format, level-zero, state-ID-zero standby is implemented.
+/// Entry/context are ignored for standby. Power-down/cluster idle require a
+/// real save/restore sequence and are rejected instead of reporting success.
+fn cpu_suspend(power_state: u64) -> i64 {
+    if power_state != 0 {
+        return INVALID_PARAMETERS;
+    }
+    psci_lock::standby();
     SUCCESS
 }
 
@@ -164,8 +221,18 @@ fn arch_features(fid: u32) -> i64 {
     }
 }
 
+fn canonical(fid: u32) -> Option<u32> {
+    if fid & SMC64 == 0 {
+        return Some(fid);
+    }
+    let base = fid & !SMC64;
+    matches!(base, CPU_SUSPEND | CPU_ON | AFFINITY_INFO).then_some(base)
+}
 fn features(fid: u32) -> i64 {
-    match fid & !SMC64 {
+    let Some(base) = canonical(fid) else {
+        return NOT_SUPPORTED;
+    };
+    match base {
         // bit 1 clear: original power_state format
         CPU_SUSPEND => 0,
         PSCI_VERSION | CPU_OFF | CPU_ON | AFFINITY_INFO | MIGRATE_INFO_TYPE | SYSTEM_OFF
@@ -186,16 +253,20 @@ pub fn handle_smc(ctx: &mut Context) {
             ctx.x[i] & 0xffff_ffff
         }
     };
-    let ret: i64 = match fid & !SMC64 {
+    let Some(base) = canonical(fid) else {
+        ctx.x[0] = NOT_SUPPORTED as u64;
+        return;
+    };
+    let ret: i64 = match base {
         SMCCC_VERSION => 0x1_0001,
         SMCCC_ARCH_FEATURES => arch_features(arg(1) as u32),
         // The BHB flush already ran on entry; nothing else to do.
         SMCCC_ARCH_WORKAROUND_1 | SMCCC_ARCH_WORKAROUND_3 => SUCCESS,
         PSCI_VERSION => 0x1_0000,
-        CPU_SUSPEND => cpu_suspend(arg(1)),
+        CPU_SUSPEND => cpu_suspend(arg(1) as u32 as u64),
         CPU_OFF => crate::cpu_off(),
         CPU_ON => cpu_on(arg(1), arg(2), arg(3)),
-        AFFINITY_INFO => affinity_info(arg(1), arg(2)),
+        AFFINITY_INFO => affinity_info(arg(1), arg(2) as u32 as u64),
         MIGRATE_INFO_TYPE => 2, // no Trusted OS
         recovery::SIP_BOOT_OK => crate::boot_confirmed(),
         cubie_a7a_common::fwlog::SIP_FWLOG_BASE => cubie_a7a_common::fwlog::CUR_BASE as i64,
