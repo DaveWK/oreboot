@@ -14,6 +14,7 @@
 
 pub mod acsm;
 pub mod coldinit;
+pub mod prefix;
 pub mod freq;
 pub mod fw;
 pub mod init;

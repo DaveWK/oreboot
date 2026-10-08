@@ -288,7 +288,7 @@ pub struct ColdInitReport {
     pub failure: Option<ExecFailure>,
     pub elapsed_us: u64,
     /// AsyncDbyteRxData samples in program order.
-    pub reads: [u16; 80],
+    pub reads: [u16; 192],
     pub n_reads: u16,
 }
 
@@ -300,6 +300,8 @@ struct Executor<'a, H: Hw> {
     hw: &'a mut H,
     r: ColdInitReport,
     loop_run: u16,
+    /// MemResetL state blocking launches expect (2 in reset, 3 released).
+    mem_reset: u16,
 }
 
 impl<H: Hw> Executor<'_, H> {
@@ -349,7 +351,7 @@ impl<H: Hw> Executor<'_, H> {
                     hw: &mut *self.hw,
                     stop,
                     prior_last: 0,
-                    mem_reset: 3,
+                    mem_reset: self.mem_reset,
                 });
                 match run.run(sequence::MAX_POLLS) {
                     Ok(c) => {
@@ -407,10 +409,11 @@ fn run_program<H: Hw>(hw: &mut H, program: impl FnOnce(&mut Executor<H>)) -> Col
             busy_max: 0,
             failure: None,
             elapsed_us: 0,
-            reads: [0; 80],
+            reads: [0; 192],
             n_reads: 0,
         },
         loop_run: 0,
+        mem_reset: 3,
     };
     program(&mut ex);
     let mut r = ex.r;
@@ -436,6 +439,75 @@ pub fn cold_init_cbt<H: Hw>(
             coldinit::cbt_point(d, &mut |s| ex.step(s));
         }
     })
+}
+
+/// Diagnostic run: AsyncDbyteRxData of all four DBYTEs is sampled before the
+/// DevInit prefix, after it (DRAM still in reset), after reset release and
+/// part 1, after part 2 (CBT entered), and after every CBT pattern at each of
+/// `delays`. The provisional [`prefix`](crate::phy::prefix) (impedance and DLL
+/// set-up, DBYTE calibration runs, CKE control) runs first, then the
+/// firmware's pre-release delay launch. Call after [`pre_training`].
+pub fn cold_init_diag<H: Hw>(
+    hw: &mut H,
+    m1: &coldinit::Mrs,
+    m2: &coldinit::Mrs2,
+    delays: &[u16],
+) -> ColdInitReport {
+    use crate::phy::prefix::{PrefixOp, PREFIX};
+    const ALL: [u32; 4] = [0, 1, 2, 3];
+    let sample = |ex: &mut Executor<H>| {
+        for n in ALL {
+            ex.step(coldinit::Step::Read(coldinit::async_rx_data(n)));
+        }
+    };
+    let t0 = hw.now_us();
+    let mut ex = Executor {
+        hw: &mut *hw,
+        r: ColdInitReport {
+            launches: 0,
+            writes: 0,
+            witnessed: 0,
+            busy_max: 0,
+            failure: None,
+            elapsed_us: 0,
+            reads: [0; 192],
+            n_reads: 0,
+        },
+        loop_run: 0,
+        mem_reset: 3,
+    };
+    ex.mem_reset = 2;
+    sample(&mut ex);
+    for op in PREFIX {
+        match *op {
+            PrefixOp::Write(c, v) => ex.step(coldinit::Step::Write(c, v)),
+            PrefixOp::Wait(us) => ex.hw.udelay(us),
+        }
+    }
+    let delay_row = [coldinit::Row::nop(0x1b00), coldinit::Row::EMPTY];
+    ex.step(coldinit::Step::Launch {
+        start: 0,
+        rows: &delay_row,
+    });
+    sample(&mut ex);
+    csr_access(ex.hw, true);
+    ex.hw.write16(csr(CLR_POR_MEM_RESET), 1);
+    ex.hw.write16(csr(CLR_POR_MEM_RESET), 0);
+    ex.hw.udelay(RESET_LOW_US);
+    ex.hw.write16(csr(MEM_RESET_L), 3);
+    ex.hw.udelay(RESET_HIGH_US);
+    ex.mem_reset = 3;
+    coldinit::part1(m1, &mut |s| ex.step(s));
+    sample(&mut ex);
+    coldinit::part2(m2, &mut |s| ex.step(s));
+    sample(&mut ex);
+    for &d in delays {
+        coldinit::cbt_point_bytes(d, &ALL, &mut |s| ex.step(s));
+    }
+    let mut r = ex.r;
+    csr_access(hw, false);
+    r.elapsed_us = hw.now_us().wrapping_sub(t0);
+    r
 }
 
 /// Release the DRAM reset and run part 1 only.

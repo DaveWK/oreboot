@@ -503,6 +503,12 @@ const CBT_STARTS: [u16; 4] = [100, 118, 136, 154];
 /// `delay`, apply, then for each pattern run its launch and read DBYTE 1's
 /// AsyncDbyteRxData.
 pub fn cbt_point(delay: u16, emit: &mut impl FnMut(Step)) {
+    cbt_point_bytes(delay, &[CBT_DBYTE_A], emit)
+}
+
+/// [`cbt_point`] reading AsyncDbyteRxData of each DBYTE in `bytes` after
+/// every pattern (diagnostics: where the CBT feedback appears).
+pub fn cbt_point_bytes(delay: u16, bytes: &[u32], emit: &mut impl FnMut(Step)) {
     for lane in 0..7 {
         emit(Step::Write(ca_delay(0, lane), delay));
     }
@@ -531,6 +537,8 @@ pub fn cbt_point(delay: u16, emit: &mut impl FnMut(Step)) {
             Row::EMPTY,
         ];
         emit(Step::Launch { start, rows: &rows });
-        emit(Step::Read(async_rx_data(CBT_DBYTE_A)));
+        for &n in bytes {
+            emit(Step::Read(async_rx_data(n)));
+        }
     }
 }

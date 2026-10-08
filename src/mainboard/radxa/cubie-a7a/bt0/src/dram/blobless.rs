@@ -54,29 +54,38 @@ pub fn init_one(para: &[u32; 32]) -> Option<u32> {
                     a.ctl, a.stop, a.run, a.last_addr, a.elapsed_us
                 );
             }
-            // DRAM reset released here: cold init parts 1 and 2, CBT entry on
-            // channel A rank 0, then a coarse CA delay sweep. In CBT the DRAM
-            // returns the CA it latched on DQ (read asynchronously).
+            // Diagnostic: DevInit prefix (provisional), reset release, parts 1
+            // and 2, CBT entry on channel A rank 0, then CBT patterns at a few
+            // CA delays, sampling AsyncDbyteRxData of all four DBYTEs.
             let m1 = cubie_a7a_dram::phy::coldinit::Mrs::ORACLE_PSTATE1_CXMT_4G;
             let m2 = cubie_a7a_dram::phy::coldinit::Mrs2::ORACLE_PSTATE1_CXMT_4G;
-            let mut delays = [0u16; 17];
-            for (i, d) in delays.iter_mut().enumerate() {
-                *d = if i < 16 { 32 * i as u16 } else { 511 };
-            }
-            let c = blobless::cold_init_cbt(&mut Bt0Hw, &m1, &m2, &delays);
+            let delays = [0u16, 64, 128, 192, 256, 320, 384, 448, 511];
+            let c = blobless::cold_init_diag(&mut Bt0Hw, &m1, &m2, &delays);
             println!(
-                "[dram] blobless: cold init + CBT: {} launches ({} witnessed, max {} busy polls), {} CSR writes, {} us, failure {:?}",
-                c.launches, c.witnessed, c.busy_max, c.writes, c.elapsed_us, c.failure
+                "[dram] blobless: diag: {} launches ({} witnessed, max {} busy polls), {} CSR writes, {} us, failure {:?}, {} reads",
+                c.launches, c.witnessed, c.busy_max, c.writes, c.elapsed_us, c.failure, c.n_reads
             );
-            for (k, &d) in delays.iter().enumerate() {
-                let r = &c.reads[4 * k..4 * k + 4];
-                if 4 * k as u16 >= c.n_reads {
+            let r = &c.reads;
+            for (k, name) in ["reset", "prefix", "part1", "cbt-entry"].iter().enumerate() {
+                println!(
+                    "[dram] blobless: rx {name:9}: {:04x} {:04x} {:04x} {:04x}",
+                    r[4 * k],
+                    r[4 * k + 1],
+                    r[4 * k + 2],
+                    r[4 * k + 3]
+                );
+            }
+            for (k, d) in delays.iter().enumerate() {
+                let b = 16 + 16 * k;
+                if b + 16 > c.n_reads as usize {
                     break;
                 }
-                println!(
-                    "[dram] blobless: CBT ca delay {d:3}: rx {:04x} {:04x} {:04x} {:04x}",
-                    r[0], r[1], r[2], r[3]
-                );
+                print!("[dram] blobless: CBT ca delay {d:3}:");
+                for p in 0..4 {
+                    let q = &r[b + 4 * p..b + 4 * p + 4];
+                    print!("  p{p} {:04x} {:04x} {:04x} {:04x}", q[0], q[1], q[2], q[3]);
+                }
+                println!();
             }
         }
         Err(e) => {
