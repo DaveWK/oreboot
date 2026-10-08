@@ -55,8 +55,8 @@ impl Hw for Bt0Hw {
                 }
             },
             None => {
-                println!("[bt0] DRAM: no PMIC, voltage request ignored");
-                true
+                println!("[bt0] DRAM: no PMIC; voltage request failed");
+                false
             }
         }
     }
