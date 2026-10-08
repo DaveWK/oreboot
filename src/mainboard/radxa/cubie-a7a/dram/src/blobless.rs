@@ -135,6 +135,20 @@ fn run_checked<H: Hw>(hw: &mut H, prog: &[Op], c: &prog::Ctx, out: &mut Readback
     hw.write16(MICRO_CONT_MUX_SEL, mux);
 }
 
+/// DevInit's mode register values for `pstate` from our own parameters:
+/// the message block (`phy::msgblock::build`, as for the trained path)
+/// through the firmware's per-bit rules ([`coldinit::MrInputs`]). Call
+/// after [`pre_training`] (its timing step fixes up MR1/MR2).
+pub fn mode_registers(p: &mut Para, pstate: u32) -> (coldinit::Mrs, coldinit::Mrs2) {
+    let c = init::ctx_with(p, [&[]; 4], pstate);
+    let rl = if p.tpr10() & (1 << 31) != 0 { 14 } else { 13 };
+    let m = crate::phy::msgblock::build(p, pstate, c.data_mhz, rl);
+    (
+        coldinit::Mrs::from_msgblock(&m),
+        coldinit::Mrs2::from_msgblock(&m),
+    )
+}
+
 /// ACSM sequence memory: row `r` is four halfwords at CSR 0x41000 + 4 r.
 pub const ACSM_MEM: u32 = 0x41000;
 pub const ACSM_START: u32 = 0x20022;

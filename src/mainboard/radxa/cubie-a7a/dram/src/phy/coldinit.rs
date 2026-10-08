@@ -108,6 +108,104 @@ impl Mrs {
     };
 }
 
+/// LPDDR5 MR16: OP[1:0] FSP-WR, OP[3:2] FSP-OP, OP[5:4] CBT mode, OP[6]
+/// VRCG, OP[7] CBT phase (set per block in [`block_entry`]).
+pub const fn mr16(fsp_wr: u8, fsp_op: u8, cbt: u8, vrcg: bool) -> u8 {
+    (fsp_wr & 3) | (fsp_op & 3) << 2 | (cbt & 3) << 4 | (vrcg as u8) << 6
+}
+
+/// Message block words (`phy::msgblock::build`) holding the mode register
+/// inputs: low byte rank 0, high byte rank 1; the word after each is the
+/// second channel's copy.
+pub mod mb {
+    pub const MR1: usize = 0x2d;
+    pub const MR3: usize = 0x31;
+    pub const MR11: usize = 0x35;
+    pub const MR13: usize = 0x39;
+    pub const MR17: usize = 0x41;
+    pub const MR18: usize = 0x43;
+    pub const MR22: usize = 0x4b;
+    pub const MR28: usize = 0x55;
+    pub const MR41: usize = 0x65;
+}
+
+const fn mb_byte(m: &[u16], word: usize, rank: usize) -> u8 {
+    (m[word] >> (8 * rank)) as u8
+}
+
+/// DevInit's MRW values from the message block inputs, rank `rank`. The
+/// per-bit rules were established by flipping each bit of each message
+/// block word in the PMU emulator (oracle) and decoding the MRWs:
+/// MR1 bit 3 is cleared; MR3 bit 7 is set and bit 6 is set when the message
+/// block's MR3 and MR22 bit 6 agree; MR11 keeps OP[7:4]; MR13 bit 6 is set,
+/// bit 4 cleared and bit 5 inverted; MR17 as given; MR18 OP[7:5] as given,
+/// OP[4:0] = 8; MR28 bit 5 cleared; MR41 keeps OP[4:0]. MR16 follows the
+/// FSP/CBT sequence ([`mr16`]).
+pub struct MrInputs<'a>(pub &'a [u16]);
+
+impl MrInputs<'_> {
+    pub const fn mr1(&self, rank: usize) -> u8 {
+        mb_byte(self.0, mb::MR1, rank) & !0x08
+    }
+    pub const fn mr3(&self, rank: usize) -> u8 {
+        let v = mb_byte(self.0, mb::MR3, rank);
+        let agree = (mb_byte(self.0, mb::MR3, 0) ^ mb_byte(self.0, mb::MR22, 0)) & 0x40 == 0;
+        (v & 0x3f) | 0x80 | if agree { 0x40 } else { 0 }
+    }
+    pub const fn mr11(&self, rank: usize) -> u8 {
+        mb_byte(self.0, mb::MR11, rank) & 0xf0
+    }
+    pub const fn mr13(&self, rank: usize) -> u8 {
+        ((mb_byte(self.0, mb::MR13, rank) ^ 0x20) & !0x50) | 0x40
+    }
+    pub const fn mr17(&self, rank: usize) -> u8 {
+        mb_byte(self.0, mb::MR17, rank)
+    }
+    pub const fn mr18(&self, rank: usize) -> u8 {
+        (mb_byte(self.0, mb::MR18, rank) & 0xe0) | 0x08
+    }
+    pub const fn mr28(&self, rank: usize) -> u8 {
+        mb_byte(self.0, mb::MR28, rank) & !0x20
+    }
+    pub const fn mr41(&self, rank: usize) -> u8 {
+        mb_byte(self.0, mb::MR41, rank) & 0x1f
+    }
+}
+
+impl Mrs {
+    /// Part 1 values from the message block (rank 0).
+    pub const fn from_msgblock(m: &[u16]) -> Mrs {
+        let i = MrInputs(m);
+        Mrs {
+            mr16_first: mr16(0, 0, 0, true),
+            mr1: i.mr1(0),
+            mr28: i.mr28(0),
+            mr16_second: mr16(1, 0, 0, true),
+            mr41: i.mr41(0),
+        }
+    }
+}
+
+impl Mrs2 {
+    /// Part 2 and CBT values from the message block (rank 0; MR17 also of
+    /// rank 1).
+    pub const fn from_msgblock(m: &[u16]) -> Mrs2 {
+        let i = MrInputs(m);
+        Mrs2 {
+            mr18: i.mr18(0),
+            mr3: i.mr3(0),
+            mr17: i.mr17(0),
+            mr11: i.mr11(0),
+            mr13: i.mr13(0),
+            mr16_cbt: mr16(1, 0, 2, true),
+            mr16_exit: mr16(1, 0, 0, true),
+            mr16_park: mr16(1, 1, 0, true),
+            mr16_unpark: mr16(0, 0, 0, true),
+            mr17_rank1: i.mr17(1),
+        }
+    }
+}
+
 /// One step of the program. `Launch` loads `rows` from row `start` (stop =
 /// start + len - 1, outer loop 0), runs it and waits for Done. `LaunchLoop`
 /// does the same without waiting: the caller has set ACSMInfiniteOLRC, so the

@@ -57,6 +57,13 @@ pub fn set_channel_timing<H: Hw>(hw: &mut H, p: &mut Para, ch: usize) -> u32 {
     rl
 }
 
+/// Mode register words of the parameter set as the timing step leaves them
+/// for the message block: MR1 [7], MR2 [7] and [3] set.
+pub fn mr_fixup(p: &mut Para) {
+    p.w[9] |= 0x80; // MR1
+    p.w[10] |= 0x88; // MR2
+}
+
 fn set_freq_timing<H: Hw>(hw: &mut H, p: &mut Para, ch: usize, ps: usize, mhz: u32) -> u32 {
     use lp5::*;
     let t = |n| ns(n, mhz);
@@ -103,9 +110,7 @@ fn set_freq_timing<H: Hw>(hw: &mut H, p: &mut Para, ch: usize, ps: usize, mhz: u
     let rd2wr = rl + 3;
     let wr2rd = wtr + 11;
     let mr_wl = rl * 4 - 5;
-    // Mode registers the PHY training firmware programs.
-    p.w[9] |= 0x80; // MR1
-    p.w[10] |= 0x88; // MR2
+    mr_fixup(p);
 
     let rd2pre = rtp;
     let wr2mr = rtp.max(4) + rd2pre + rl + 6;
