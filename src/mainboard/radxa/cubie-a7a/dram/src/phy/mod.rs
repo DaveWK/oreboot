@@ -18,6 +18,7 @@ pub mod fw;
 pub mod init;
 pub mod msgblock;
 pub mod prog;
+pub mod sequence;
 #[rustfmt::skip]
 pub mod tables;
 
@@ -47,8 +48,11 @@ pub const UCCLK_HCLK_ENABLES: usize = csr(0xc0080);
 pub const DMEM: usize = csr(0x58000);
 pub const IMEM: usize = csr(0x50000);
 
-/// MicroContMuxSel: 0 gives the CPU access to the CSRs, 1 hands them to
-/// the PHY (and its microcontroller).
+/// Select host (0) or microcontroller (1) CSR writes. This does not establish
+/// exclusive ownership: the matching LPDDR5 register description in ESWIN's
+/// EIC7700X TRM Part 2, PDF pp. 907-908, retains PIE/DMA access in both modes
+/// and states that DMA can suppress host writes even in host mode. The caller
+/// must establish the appropriate handoff/quiescence contract separately.
 pub fn csr_access<H: Hw>(hw: &mut H, cpu: bool) {
     hw.write16(MICRO_CONT_MUX_SEL, if cpu { 0 } else { 1 });
 }
