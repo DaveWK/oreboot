@@ -22,6 +22,7 @@ pub mod msgblock;
 pub mod prefix;
 pub mod prog;
 pub mod sequence;
+pub mod wckalias;
 pub mod wcklevel;
 #[rustfmt::skip]
 pub mod tables;

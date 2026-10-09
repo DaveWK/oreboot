@@ -4,7 +4,10 @@
 //! halts. DRAM is not brought up yet, so the boot watchdog resets the board
 //! and the next boot takes the recovery path (README, Recovery).
 
-use cubie_a7a_dram::blobless::{self, BlockTrain, Readback};
+#[cfg(not(feature = "wck-alias-probe"))]
+use cubie_a7a_dram::blobless::BlockTrain;
+use cubie_a7a_dram::blobless::{self, Readback};
+#[cfg(not(feature = "wck-alias-probe"))]
 use cubie_a7a_dram::phy::coldinit::CbtBlock;
 use cubie_a7a_dram::Para;
 
@@ -25,6 +28,7 @@ fn report(name: &str, r: &Readback) {
 }
 
 /// Print one CBT block's training result.
+#[cfg(not(feature = "wck-alias-probe"))]
 fn report_block(i: usize, b: &CbtBlock, t: &BlockTrain) {
     let ch = ["A", "B"][b.chan.ac as usize];
     let cs = blobless::CA_SWEEP_STEP as u32;
@@ -92,54 +96,68 @@ pub fn init_one(para: &[u32; 32]) -> Option<u32> {
             );
             report("C_ONCE", &rb[0]);
             report("C_PSTATE", &rb[1]);
-            let mut samples = [None; 8];
-            blobless::acsm_delay_probe(&mut Bt0Hw, &mut samples);
-            for a in samples.iter().flatten() {
+            #[cfg(feature = "wck-alias-probe")]
+            {
+                use cubie_a7a_dram::phy::wckalias;
+                let observation = wckalias::observe(&mut Bt0Hw, id.phy_config, id.pub_rev);
                 println!(
+                    "[dram] WCK alias observation: target {:05x}; {observation:x?}",
+                    wckalias::TARGET_ALIAS
+                );
+                println!(
+                    "[dram] WCK alias: known CSR readback only; no training/analog acceptance"
+                );
+            }
+            #[cfg(not(feature = "wck-alias-probe"))]
+            {
+                let mut samples = [None; 8];
+                blobless::acsm_delay_probe(&mut Bt0Hw, &mut samples);
+                for a in samples.iter().flatten() {
+                    println!(
                     "[dram] blobless: ACSM delay row ctl {:04x} stop {}: {:?}; LastAddr {:04x}, {} us",
                     a.ctl, a.stop, a.run, a.last_addr, a.elapsed_us
                 );
-            }
-            // Cold init to CBT, then our own command bus training on the
-            // DRAM's CBT echo for both channels, ranks and phases.
-            let (m1, m2) = blobless::mode_registers(&mut p, PROBE_PSTATE);
-            println!(
+                }
+                // Cold init to CBT, then our own command bus training on the
+                // DRAM's CBT echo for both channels, ranks and phases.
+                let (m1, m2) = blobless::mode_registers(&mut p, PROBE_PSTATE);
+                println!(
                 "[dram] blobless: MRs from our parameters: {m1:x?} {m2:x?}; oracle constants equal: {}",
                 m1 == cubie_a7a_dram::phy::coldinit::Mrs::ORACLE_PSTATE1_CXMT_4G
                     && m2 == cubie_a7a_dram::phy::coldinit::Mrs2::ORACLE_PSTATE1_CXMT_4G
             );
-            let mut t = blobless::CaTrainReport::EMPTY;
-            blobless::cold_init_ca_train(&mut Bt0Hw, &m1, &m2, &mut t);
-            let e = &t.exec;
-            println!(
+                let mut t = blobless::CaTrainReport::EMPTY;
+                blobless::cold_init_ca_train(&mut Bt0Hw, &m1, &m2, &mut t);
+                let e = &t.exec;
+                println!(
                 "[dram] blobless: CA train: {} blocks, {} launches ({} witnessed, max {} busy polls), {} us, failure {:?}",
                 t.done, e.launches, e.witnessed, e.busy_max, e.elapsed_us, e.failure
             );
-            let d = &t.devinit;
-            println!(
+                let d = &t.devinit;
+                println!(
                 "[dram] blobless: devinit: failure {:?}, ZCalRate {:04x}, ZCalBusy {:04x} -> {:04x} after wait, {} polls",
                 d.failure, d.zcal_rate, d.zcal_busy_start, d.zcal_busy_after_wait, d.zcal_polls
             );
-            println!(
+                println!(
                 "[dram] blobless: devinit: RxReplicaCtl04 {:04x}, after broadcast {:04x?}; DllLockParam {}; LCDL status AC {:04x} DX {:04x}",
                 d.ctl04_before, d.ctl04_after, d.dll_lock_param, d.lcdl_status[0], d.lcdl_status[1]
             );
-            for (n, r) in d.replica.iter().enumerate() {
-                println!(
+                for (n, r) in d.replica.iter().enumerate() {
+                    println!(
                     "[dram] blobless: devinit: DBYTE {n} replica phases {:?} Ph1UI {} select {} ratio {}",
                     r.phases, r.ph1ui, r.select, r.ratio
                 );
-            }
-            for (i, (b, r)) in cubie_a7a_dram::phy::coldinit::CBT_BLOCKS
-                .iter()
-                .zip(t.blocks.iter())
-                .enumerate()
-            {
-                report_block(i, b, r);
-            }
-            for (ch, c) in t.channels.iter().enumerate() {
-                let ls = blobless::LANE_SWEEP_STEP as u32;
-                println!(
+                }
+                for (i, (b, r)) in cubie_a7a_dram::phy::coldinit::CBT_BLOCKS
+                    .iter()
+                    .zip(t.blocks.iter())
+                    .enumerate()
+                {
+                    report_block(i, b, r);
+                }
+                for (ch, c) in t.channels.iter().enumerate() {
+                    let ls = blobless::LANE_SWEEP_STEP as u32;
+                    println!(
                     "[dram] blobless: CA ch {}: lane map agrees {}, delays {:?}, windows {}..+{} {}..+{} {}..+{} {}..+{} {}..+{} {}..+{} {}..+{}",
                     ["A", "B"][ch],
                     c.lane_map_agrees,
@@ -152,6 +170,7 @@ pub fn init_one(para: &[u32; 32]) -> Option<u32> {
                     c.runs[5].0 * ls, c.runs[5].1 * ls,
                     c.runs[6].0 * ls, c.runs[6].1 * ls,
                 );
+                }
             }
         }
         Err(e) => {

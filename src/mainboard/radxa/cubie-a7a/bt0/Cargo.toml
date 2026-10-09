@@ -11,6 +11,8 @@ dramlib = []
 # DRAM without any PHY firmware (no PMU training firmware, no PIE images).
 # Development stage: probes the PHY and halts (src/dram/blobless.rs).
 blobless = []
+# One held-reset alias observation; bypass all ACSM/DevInit/CBT probes.
+wck-alias-probe = ["blobless"]
 
 [dependencies]
 log = { path = "../../../../lib/log" }
