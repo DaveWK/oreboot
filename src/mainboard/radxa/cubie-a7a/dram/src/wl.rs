@@ -20,6 +20,20 @@
 //! data checks) confirms it: it takes the first stable transition of the
 //! measured pass/fail curve, and prefers the hardware counter's delay when
 //! that lies on a measured transition.
+//!
+//! m11 (after the Oct 14 m10 hardware run: flat lane-0 curve, TrainingCntr
+//! moved on lanes 0/4 only, a block-boundary witness false negative):
+//! - every lane's DtsmCmpCount and DtsmErrCount is kept per sweep point
+//!   ([`WlSweep`]); the decision curve is lanes 0 + 4 ([`FEEDBACK_LANES`]);
+//! - [`DtsmSnap`] readbacks after the entry, after the PHY search and after
+//!   three controls at the saved delay: the reference first measurement, a
+//!   second launch without count clear (do counts accumulate?) and one with
+//!   DtsmLaneCtrl0 of all lanes and the count clear written at the per-DBYTE
+//!   base addresses; the sweep then keeps those base enables and clears each
+//!   DBYTE at its base address as well as through the reference broadcast;
+//! - TrainingCntr convergence runs from [`CONVERGENCE_STARTS`], written per
+//!   DBYTE and lane at the base addresses, separate feedback from dither;
+//! - the launch row base follows the live ACSMLastAddr (witness fix).
 
 use crate::hw::Hw;
 use crate::phy::coldinit::Row;
@@ -35,7 +49,8 @@ const ACSM_OUTER_LOOP: u32 = 0x20027;
 const RUN_CTRL: u32 = crate::phy::sequence::RUN_CTRL;
 const DONE: u32 = crate::phy::sequence::DONE;
 const MEM_RESET_L: u32 = 0x20060;
-/// Second row base, so consecutive launches end on different stop rows and
+/// Second row base, used when a launch at row 0 would end on the stop row
+/// ACSMLastAddr already shows, so every launch ends on a new stop row and
 /// ACSMLastAddr can witness a launch that finished before the first poll.
 /// The longest program has 152 rows; rows up to 315 are in use elsewhere.
 const ROW_ALT: u16 = 152;
@@ -57,6 +72,9 @@ const fn training_cntr(db: u32, lane: u32) -> u32 {
 }
 const fn dtsm_err_count(db: u32, lane: u32) -> u32 {
     0x100b7 + 0x1000 * db + 0x100 * lane
+}
+const fn dtsm_cmp_count(db: u32, lane: u32) -> u32 {
+    0x100b6 + 0x1000 * db + 0x100 * lane
 }
 /// Dq0LnSel..Dq7LnSel of DBYTE `db`.
 const fn dq_ln_sel(db: u32, dq: u32) -> u32 {
@@ -151,7 +169,16 @@ impl<'a, H: Hw> WlExec<'a, H> {
             });
             return;
         }
-        let base = if n & 1 == 0 { ROW_ALT } else { 0 };
+        // Choose the row base from the live ACSMLastAddr, so this launch ends
+        // on a different stop row than whatever ran last (also across
+        // blocks: m10 hardware, Oct 14, ch B launch 1 ended where ch A's
+        // last launch had and could not be witnessed).
+        let last_before = self.hw.read16(csr(ACSM_LAST));
+        let base = if last_before == rows.len() as u16 - 1 {
+            ROW_ALT
+        } else {
+            0
+        };
         let stop = base + rows.len() as u16 - 1;
         self.hw.write16(csr(ACSM_START), base);
         self.hw.write16(csr(ACSM_STOP), base);
@@ -200,6 +227,133 @@ impl<'a, H: Hw> WlExec<'a, H> {
 /// `dram_train::edge`).
 pub use dram_train::edge::{decide_legacy as decide, Decision, MAX_EDGES};
 
+/// DTSM lanes per DBYTE (lanes 0..7 DQ, lane 8 the ninth lane).
+pub const LANES: usize = 9;
+
+/// The PHY's feedback lanes in the reference WL set-up: the prefix enables
+/// DtsmLaneCtrl0 and TrainingIncDecDtsmEn on lanes 0 and 4 only, and on
+/// hardware (m10, Oct 14) only these lanes' TrainingCntr moved.
+pub const FEEDBACK_LANES: [usize; 2] = [0, 4];
+
+/// TrainingCntr start values (linear UI/64) of the convergence runs, besides
+/// the reference start 512 (`0x2000`): one coarse UI below and above.
+pub const CONVERGENCE_STARTS: [u16; 2] = [448, 576];
+
+/// One DBYTE's DTSM state (EIC7700X TRM Part 2 register names; the TRM marks
+/// the fields reserved for PHY firmware, so these are observations only).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DtsmSnap {
+    /// DtsmLaneCtrl0_iX (`0x1n0b5 + 0x100 lane`).
+    pub lane_ctrl: [u16; LANES],
+    /// TrainingIncDecDtsmEn_rX (`0x1n0be + 0x100 lane`).
+    pub inc_dec_en: [u16; LANES],
+    /// DtsmCmpCount_iX (`0x1n0b6 + 0x100 lane`).
+    pub cmp: [u16; LANES],
+    /// DtsmErrCount_iX (`0x1n0b7 + 0x100 lane`).
+    pub err: [u16; LANES],
+    /// DtsmGoodCount_iX (`0x1n0b8 + 0x100 lane`).
+    pub good: [u16; LANES],
+    /// TrainingCntr_rX (`0x1n0aa + 0x100 lane`).
+    pub cntr: [u16; LANES],
+    /// DtsmErrCountNZ (`0x1n9b7`).
+    pub err_nz: u16,
+    /// DtsmGoodBar, DtsmErrBar (`0x1n0b9`, `0x1n0ba`).
+    pub bars: [u16; 2],
+    /// DtsmGoodThldXingInd, DtsmErrThldXingInd (`0x1n0bc`, `0x1n0bd`).
+    pub xing: [u16; 2],
+    /// DtsmByteCtrl0/1 (`0x1n0b0`, `0x1n0b1`).
+    pub byte_ctrl: [u16; 2],
+    /// TrainingParam (`0x1n0a7`).
+    pub training_param: u16,
+}
+
+impl DtsmSnap {
+    pub const EMPTY: DtsmSnap = DtsmSnap {
+        lane_ctrl: [0; LANES],
+        inc_dec_en: [0; LANES],
+        cmp: [0; LANES],
+        err: [0; LANES],
+        good: [0; LANES],
+        cntr: [0; LANES],
+        err_nz: 0,
+        bars: [0; 2],
+        xing: [0; 2],
+        byte_ctrl: [0; 2],
+        training_param: 0,
+    };
+}
+
+/// Where in a block a [`DtsmSnap`] pair was taken.
+pub const SNAP_NAMES: [&str; 5] = [
+    "after entry",
+    "after PHY search",
+    "control 1: reference first measurement",
+    "control 2: second launch without clear",
+    "control 3: per-DBYTE base enables, all lanes",
+];
+pub const SNAPS: usize = SNAP_NAMES.len();
+
+/// Compare and error counts of both DBYTEs at one sweep point.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DtsmPoint {
+    pub cmp: [[u16; LANES]; 2],
+    pub err: [[u16; LANES]; 2],
+}
+
+impl DtsmPoint {
+    pub const EMPTY: DtsmPoint = DtsmPoint {
+        cmp: [[0; LANES]; 2],
+        err: [[0; LANES]; 2],
+    };
+}
+
+/// Every lane's counts at every sweep point (kept apart from [`WlBlock`] so
+/// bt0 can hold it outside its 16 KiB stack).
+pub struct WlSweep {
+    pub points: [DtsmPoint; WL_POINTS],
+}
+
+impl WlSweep {
+    pub const EMPTY: WlSweep = WlSweep {
+        points: [DtsmPoint::EMPTY; WL_POINTS],
+    };
+
+    fn clear(&mut self) {
+        for p in self.points.iter_mut() {
+            *p = DtsmPoint::EMPTY;
+        }
+    }
+}
+
+/// One TrainingCntr convergence run: the reference entry, our start value
+/// written per DBYTE and lane at the base addresses, the PHY's own search.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Convergence {
+    /// Start delay (linear UI/64) and its raw TrainingCntr value.
+    pub start: u16,
+    pub start_raw: u16,
+    /// TrainingCntr read back after our start write, per DBYTE and lane.
+    pub start_read: [[u16; LANES]; 2],
+    /// TrainingCntr after the search, per DBYTE and lane.
+    pub after: [[u16; LANES]; 2],
+    /// Decoded result of the feedback lanes, per DBYTE and feedback lane.
+    pub result: [[Option<u16>; 2]; 2],
+    pub launches: u16,
+    pub failure: Option<WlFailure>,
+}
+
+impl Convergence {
+    pub const EMPTY: Convergence = Convergence {
+        start: 0,
+        start_raw: 0,
+        start_read: [[0; LANES]; 2],
+        after: [[0; LANES]; 2],
+        result: [[None; 2]; 2],
+        launches: 0,
+        failure: None,
+    };
+}
+
 /// One channel/rank block.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WlBlock {
@@ -209,13 +363,16 @@ pub struct WlBlock {
     /// Per channel DBYTE (index 0/1 = the channel's lower/upper DBYTE).
     pub saved_delay: [u16; 2],
     pub after_prefix_delay: [u16; 2],
-    pub training_cntr: [[u16; 9]; 2],
+    pub training_cntr: [[u16; LANES]; 2],
     /// TrainingCntr lane 0 converted to a delay (`TxWckDelay`), if in range.
     pub counter_delay: [Option<u16>; 2],
     pub prefix_err: [u16; 2],
-    /// DtsmErrCount lane 0 per sweep point, and the lanes with a nonzero
-    /// count per point (bit per lane 0..8).
+    /// DTSM state per [`SNAP_NAMES`] entry and DBYTE.
+    pub snaps: [[DtsmSnap; 2]; SNAPS],
+    /// Decision curve per sweep point: the error counts of the
+    /// [`FEEDBACK_LANES`] added (saturating). All lanes are in [`WlSweep`].
     pub err: [[u16; WL_POINTS]; 2],
+    /// Lanes with a nonzero error count per point (bit per lane 0..8).
     pub lanes_nz: [[u16; WL_POINTS]; 2],
     pub points: u8,
     pub decision: [Decision; 2],
@@ -228,6 +385,9 @@ pub struct WlBlock {
     pub max_polls: u32,
     pub elapsed_us: u32,
     pub failure: Option<WlFailure>,
+    /// TrainingCntr convergence runs ([`CONVERGENCE_STARTS`]), after the
+    /// sweep and its cleanup.
+    pub convergence: [Convergence; 2],
 }
 
 impl WlBlock {
@@ -238,9 +398,10 @@ impl WlBlock {
             mr18_base: 0,
             saved_delay: [0; 2],
             after_prefix_delay: [0; 2],
-            training_cntr: [[0; 9]; 2],
+            training_cntr: [[0; LANES]; 2],
             counter_delay: [None; 2],
             prefix_err: [0; 2],
+            snaps: [[DtsmSnap::EMPTY; 2]; SNAPS],
             err: [[0; WL_POINTS]; 2],
             lanes_nz: [[0; WL_POINTS]; 2],
             points: 0,
@@ -252,6 +413,7 @@ impl WlBlock {
             max_polls: 0,
             elapsed_us: 0,
             failure: None,
+            convergence: [Convergence::EMPTY; 2],
         }
     }
 }
@@ -304,31 +466,94 @@ pub fn end<H: Hw>(hw: &mut H, saved: &[[u16; 8]; 4]) -> u8 {
     bad
 }
 
+fn dtsm_snap<H: Hw>(ex: &mut WlExec<'_, H>, db: u32) -> DtsmSnap {
+    let base = 0x10000 + 0x1000 * db;
+    let mut s = DtsmSnap::EMPTY;
+    for lane in 0..LANES {
+        let l = base + 0x100 * lane as u32;
+        s.lane_ctrl[lane] = ex.read(l + 0x0b5);
+        s.inc_dec_en[lane] = ex.read(l + 0x0be);
+        s.cmp[lane] = ex.read(l + 0x0b6);
+        s.err[lane] = ex.read(l + 0x0b7);
+        s.good[lane] = ex.read(l + 0x0b8);
+        s.cntr[lane] = ex.read(l + 0x0aa);
+    }
+    s.err_nz = ex.read(base + 0x9b7);
+    s.bars = [ex.read(base + 0x0b9), ex.read(base + 0x0ba)];
+    s.xing = [ex.read(base + 0x0bc), ex.read(base + 0x0bd)];
+    s.byte_ctrl = [ex.read(base + 0x0b0), ex.read(base + 0x0b1)];
+    s.training_param = ex.read(base + 0x0a7);
+    s
+}
+
+fn snap_pair<H: Hw>(ex: &mut WlExec<'_, H>, dbs: [u32; 2]) -> [DtsmSnap; 2] {
+    [dtsm_snap(ex, dbs[0]), dtsm_snap(ex, dbs[1])]
+}
+
+/// The pre-block controls, read from the hardware, and their exact restore.
+struct Saved {
+    dbyte: [[u16; 5]; 4],
+    other: [u16; 9],
+}
+
+impl Saved {
+    fn read<H: Hw>(ex: &mut WlExec<'_, H>) -> Saved {
+        let mut dbyte = [[0u16; 5]; 4];
+        for (db, s) in dbyte.iter_mut().enumerate() {
+            for (v, &off) in s.iter_mut().zip(DBYTE_SAVED.iter()) {
+                *v = ex.read(0x10000 + 0x1000 * db as u32 + off);
+            }
+        }
+        let mut other = [0u16; 9];
+        for (v, &c) in other.iter_mut().zip(OTHER_SAVED.iter()) {
+            *v = ex.read(c);
+        }
+        Saved { dbyte, other }
+    }
+
+    fn reference(&self) -> SavedControls {
+        let mut r = [0u16; 14];
+        r[..5].copy_from_slice(&self.dbyte[0]);
+        r[5..].copy_from_slice(&self.other);
+        SavedControls(r)
+    }
+
+    /// Reference cleanup and its restores, then the exact per-DBYTE and base
+    /// restores of every saved control.
+    fn cleanup<H: Hw>(&self, ex: &mut WlExec<'_, H>, rank: Rank, mr18: Mr18Base) {
+        wcklevel::cleanup(rank, mr18, &self.reference(), &mut |s| ex.step(s));
+        for (db, s) in self.dbyte.iter().enumerate() {
+            for (&v, &off) in s.iter().zip(DBYTE_SAVED.iter()) {
+                ex.write(0x10000 + 0x1000 * db as u32 + off, v);
+            }
+        }
+        for (&v, &c) in self.other.iter().zip(OTHER_SAVED.iter()) {
+            ex.write(c, v);
+        }
+    }
+}
+
 /// Level `out.channel`/`out.rank` (see the module documentation). Call
 /// after CA training succeeded, between [`begin`] and [`end`]. Stops at the
 /// first launch failure, leaving the PHY for the boot watchdog/recovery.
-pub fn level_block<H: Hw>(hw: &mut H, mr18: Mr18Base, out: &mut WlBlock) {
+///
+/// Order (m11): save; reference entry; PHY counter search; three DTSM
+/// controls at the saved delay (reference first measurement, a second launch
+/// without clear, per-DBYTE base enables of all lanes); our sweep with every
+/// lane's compare and error counts; decision on the feedback lanes; cleanup
+/// and exact restores; then one TrainingCntr convergence run per
+/// [`CONVERGENCE_STARTS`] value, each with its own cleanup and restores.
+pub fn level_block<H: Hw>(hw: &mut H, mr18: Mr18Base, out: &mut WlBlock, sweep: &mut WlSweep) {
     let (ch, rank) = (out.channel, out.rank);
     *out = WlBlock::empty(ch, rank);
+    sweep.clear();
     out.mr18_base = mr18.value();
     let dbs = dbytes(ch);
     let t0 = hw.now_us();
     let mut ex = WlExec::new(hw);
 
     // Save what the stage changes, from the hardware.
-    let mut dbyte_saved = [[0u16; 5]; 4];
-    for (db, s) in dbyte_saved.iter_mut().enumerate() {
-        for (v, &off) in s.iter_mut().zip(DBYTE_SAVED.iter()) {
-            *v = ex.read(0x10000 + 0x1000 * db as u32 + off);
-        }
-    }
-    let mut other = [0u16; 9];
-    for (v, &c) in other.iter_mut().zip(OTHER_SAVED.iter()) {
-        *v = ex.read(c);
-    }
-    let mut reference = [0u16; 14];
-    reference[..5].copy_from_slice(&dbyte_saved[0]);
-    reference[5..].copy_from_slice(&other);
+    let saved = Saved::read(&mut ex);
     for (i, &db) in dbs.iter().enumerate() {
         out.saved_delay[i] = ex.read(tx_wck_dly(db, rank));
         if out.saved_delay[i] > MAX_WCK_DELAY {
@@ -339,20 +564,30 @@ pub fn level_block<H: Hw>(hw: &mut H, mr18: Mr18Base, out: &mut WlBlock) {
     }
 
     // Leveling entry and the PHY's own calibration (reference sequence).
-    wcklevel::calibration_prefix(ch, rank, mr18, &mut |s| ex.step(s));
+    wcklevel::calibration_entry(ch, rank, mr18, &mut |s| ex.step(s));
+    out.snaps[0] = snap_pair(&mut ex, dbs);
+    wcklevel::calibration_loops(ch, rank, mr18, &mut |s| ex.step(s));
+    out.snaps[1] = snap_pair(&mut ex, dbs);
     for (i, &db) in dbs.iter().enumerate() {
-        for lane in 0..9 {
-            out.training_cntr[i][lane] = ex.read(training_cntr(db, lane as u32));
-        }
+        out.training_cntr[i] = out.snaps[1][i].cntr;
         out.counter_delay[i] = wcklevel::TxWckDelay::from_training_counter(out.training_cntr[i][0])
             .ok()
             .map(|d| d.encoded());
-        out.prefix_err[i] = ex.read(dtsm_err_count(db, 0));
+        out.prefix_err[i] = out.snaps[1][i].err[0];
         out.after_prefix_delay[i] = ex.read(tx_wck_dly(db, rank));
     }
 
-    // Our sweep with real DTSM feedback, base CSRs only.
+    // DTSM controls at the saved delay, then our sweep, base CSRs only.
     wcklevel::measurement_clocks_start(ch, &mut |s| ex.step(s));
+    for (i, &db) in dbs.iter().enumerate() {
+        ex.write(tx_wck_dly(db, rank), out.saved_delay[i]);
+    }
+    wcklevel::first_measurement(ch, rank, &mut |s| ex.step(s));
+    out.snaps[2] = snap_pair(&mut ex, dbs);
+    wcklevel::measurement_once_no_clear(rank, &mut |s| ex.step(s));
+    out.snaps[3] = snap_pair(&mut ex, dbs);
+    wcklevel::measurement_dbyte_bases(dbs, rank, 1, &mut |s| ex.step(s));
+    out.snaps[4] = snap_pair(&mut ex, dbs);
     for p in 0..WL_POINTS {
         if ex.failure.is_some() {
             break;
@@ -361,28 +596,38 @@ pub fn level_block<H: Hw>(hw: &mut H, mr18: Mr18Base, out: &mut WlBlock) {
         for &db in &dbs {
             ex.write(tx_wck_dly(db, rank), d);
         }
-        if p == 0 {
-            wcklevel::first_measurement(ch, rank, &mut |s| ex.step(s));
-        } else {
-            wcklevel::measurement_once(rank, &mut |s| ex.step(s));
+        for &db in &dbs {
+            wcklevel::clear_counts_dbyte(db, &mut |s| ex.step(s));
         }
+        wcklevel::measurement_once(rank, &mut |s| ex.step(s));
         if ex.failure.is_some() {
             break;
         }
+        let pt = &mut sweep.points[p];
         for (i, &db) in dbs.iter().enumerate() {
             let mut nz = 0;
-            for lane in 0..9 {
-                let c = ex.read(dtsm_err_count(db, lane));
-                if lane == 0 {
-                    out.err[i][p] = c;
-                }
-                if c != 0 {
+            for lane in 0..LANES {
+                pt.cmp[i][lane] = ex.read(dtsm_cmp_count(db, lane as u32));
+                pt.err[i][lane] = ex.read(dtsm_err_count(db, lane as u32));
+                if pt.err[i][lane] != 0 {
                     nz |= 1 << lane;
                 }
             }
+            out.err[i][p] = FEEDBACK_LANES
+                .iter()
+                .fold(0u16, |a, &l| a.saturating_add(pt.err[i][l]));
             out.lanes_nz[i][p] = nz;
         }
         out.points += 1;
+    }
+    // Back to the lane enables the reference measurement left (control 1).
+    for (i, &db) in dbs.iter().enumerate() {
+        for lane in 0..LANES {
+            ex.write(
+                wcklevel::dtsm_lane_ctrl(db, lane as u32),
+                out.snaps[2][i].lane_ctrl[lane],
+            );
+        }
     }
     wcklevel::measurement_clocks_stop(ch, &mut |s| ex.step(s));
 
@@ -396,18 +641,44 @@ pub fn level_block<H: Hw>(hw: &mut H, mr18: Mr18Base, out: &mut WlBlock) {
         ex.write(tx_wck_dly(db, rank), v);
         out.final_delay[i] = ex.read(tx_wck_dly(db, rank));
     }
+    saved.cleanup(&mut ex, rank, mr18);
 
-    // Reference cleanup and its restores, then the exact per-DBYTE and base
-    // restores of every saved control.
-    wcklevel::cleanup(rank, mr18, &SavedControls(reference), &mut |s| ex.step(s));
-    for (db, s) in dbyte_saved.iter().enumerate() {
-        for (&v, &off) in s.iter().zip(DBYTE_SAVED.iter()) {
-            ex.write(0x10000 + 0x1000 * db as u32 + off, v);
+    // TrainingCntr convergence: same entry and search from other starts.
+    for (k, &start) in CONVERGENCE_STARTS.iter().enumerate() {
+        if ex.failure.is_some() {
+            break;
         }
+        let first = ex.launches;
+        let c = &mut out.convergence[k];
+        c.start = start;
+        c.start_raw = wcklevel::TxWckDelay::new(start)
+            .map(|d| d.training_counter())
+            .unwrap_or(0x2000);
+        wcklevel::calibration_entry(ch, rank, mr18, &mut |s| ex.step(s));
+        for (i, &db) in dbs.iter().enumerate() {
+            for lane in 0..LANES {
+                ex.write(training_cntr(db, lane as u32), c.start_raw);
+            }
+            for lane in 0..LANES {
+                c.start_read[i][lane] = ex.read(training_cntr(db, lane as u32));
+            }
+        }
+        wcklevel::calibration_loops(ch, rank, mr18, &mut |s| ex.step(s));
+        for (i, &db) in dbs.iter().enumerate() {
+            for lane in 0..LANES {
+                c.after[i][lane] = ex.read(training_cntr(db, lane as u32));
+            }
+            for (j, &l) in FEEDBACK_LANES.iter().enumerate() {
+                c.result[i][j] = wcklevel::TxWckDelay::from_training_counter(c.after[i][l])
+                    .ok()
+                    .map(|d| d.encoded());
+            }
+        }
+        saved.cleanup(&mut ex, rank, mr18);
+        c.launches = ex.launches - first;
+        c.failure = ex.failure;
     }
-    for (&v, &c) in other.iter().zip(OTHER_SAVED.iter()) {
-        ex.write(c, v);
-    }
+
     out.launches = ex.launches;
     out.writes = ex.writes;
     out.max_launch_us = ex.max_launch_us;

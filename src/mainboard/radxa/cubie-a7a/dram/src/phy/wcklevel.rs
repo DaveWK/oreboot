@@ -140,7 +140,24 @@ fn mr18_rows(rank: Rank, value: u8, long_tail: bool, first_clock: bool) -> [Row;
 /// TxWckDly value is replayed. The caller must preserve the pre-block controls
 /// first, then acquire the actual per-DBYTE TrainingCntr results after this
 /// boundary. MR18 base bits 7/6 are supplied clear by the caller.
+///
+/// Exactly [`calibration_entry`] followed by [`calibration_loops`].
 pub fn calibration_prefix(
+    channel: Channel,
+    rank: Rank,
+    mr18_base: Mr18Base,
+    out: &mut impl FnMut(Step<'_>),
+) {
+    calibration_entry(channel, rank, mr18_base, out);
+    calibration_loops(channel, rank, mr18_base, out);
+}
+
+/// First part of [`calibration_prefix`]: channel selection, the first two
+/// launches (MR18 base | 0x80) and the DTSM/training set-up, ending with the
+/// TrainingCntr start value (`0x1ffaa = 0x2000`, i.e. 512) and TrainingParam
+/// `0x300`. A caller may overwrite the start value per DBYTE/lane at the
+/// base TrainingCntr addresses here, before [`calibration_loops`].
+pub fn calibration_entry(
     channel: Channel,
     rank: Rank,
     mr18_base: Mr18Base,
@@ -227,6 +244,17 @@ pub fn calibration_prefix(
         ],
         out,
     );
+}
+
+/// Second part of [`calibration_prefix`]: count clear, inactive-DBYTE DTSM
+/// lane control, leveling entry (MR18 base | 0xc8), the PHY's own counter
+/// search (outer loops 8, then 10 x 255) and the MR18 restore (base | 0x80).
+pub fn calibration_loops(
+    channel: Channel,
+    rank: Rank,
+    mr18_base: Mr18Base,
+    out: &mut impl FnMut(Step<'_>),
+) {
     clear_counts(out);
     for db in channel.inactive_first_byte()..channel.inactive_first_byte() + 2 {
         out(Step::Write(0x10fb5 + db * 0x1000, 0));
@@ -330,6 +358,56 @@ pub fn measurement_once(rank: Rank, out: &mut impl FnMut(Step<'_>)) {
     });
 }
 
+/// [`measurement_once`] without the count clear: two consecutive launches
+/// then show whether DTSM counts accumulate (a counting/clear control).
+pub fn measurement_once_no_clear(rank: Rank, out: &mut impl FnMut(Step<'_>)) {
+    writes(&[(0x20079, 1), (0x20079, 0)], out);
+    out(Step::Launch {
+        rows: &measurement_program(rank),
+        outer: 0,
+    });
+}
+
+/// DtsmLaneCtrl0_iX of DBYTE `db`, lane `lane` (EIC7700X TRM Part 2,
+/// `0x100b5 + 0x1000 * db + 0x100 * lane`).
+pub const fn dtsm_lane_ctrl(db: u32, lane: u32) -> u32 {
+    0x100b5 + 0x1000 * db + 0x100 * lane
+}
+
+/// DtsmCountClears of DBYTE `db` (`0x100bb + 0x1000 * db`).
+pub const fn dtsm_count_clears(db: u32) -> u32 {
+    0x100bb + 0x1000 * db
+}
+
+/// The reference count-clear pulse ([`clear_counts`]) at one DBYTE's base
+/// DtsmCountClears address instead of the DBYTE-broadcast `0x1f0bb`.
+pub fn clear_counts_dbyte(db: u32, out: &mut impl FnMut(Step<'_>)) {
+    for value in [0, 0x1ff, 0x3ff, 0x1ff, 0] {
+        out(Step::Write(dtsm_count_clears(db), value));
+    }
+}
+
+/// Per-DBYTE base-address DTSM set-up for the channel's two DBYTEs: every
+/// lane 0..8 gets DtsmLaneCtrl0 = `lane_ctrl` (the reference writes 1 to the
+/// enabled lanes) and the count clear pulse, then one measurement launch.
+/// Only documented base addresses are used.
+pub fn measurement_dbyte_bases(
+    dbytes: [u32; 2],
+    rank: Rank,
+    lane_ctrl: u16,
+    out: &mut impl FnMut(Step<'_>),
+) {
+    for db in dbytes {
+        for lane in 0..9 {
+            out(Step::Write(dtsm_lane_ctrl(db, lane), lane_ctrl));
+        }
+    }
+    for db in dbytes {
+        clear_counts_dbyte(db, out);
+    }
+    measurement_once_no_clear(rank, out);
+}
+
 /// Stop the observed verification clocks before restoring delays and normal
 /// cleanup. This is the normal path; it cannot recover an incomplete launch.
 pub fn measurement_clocks_stop(channel: Channel, out: &mut impl FnMut(Step<'_>)) {
@@ -395,6 +473,23 @@ impl TxWckDelay {
 
     pub const fn encoded(self) -> u16 {
         self.0
+    }
+
+    /// A linear delay (UI/64) in the supported range.
+    pub const fn new(delay: u16) -> Option<Self> {
+        if delay > MAX_WCK_DELAY {
+            None
+        } else {
+            Some(Self(delay))
+        }
+    }
+
+    /// The raw TrainingCntr value that [`Self::from_training_counter`]
+    /// converts back to this delay: coarse UI `[10:6]` moved to raw
+    /// `[15:10]`, fine `[5:0]` kept (512 -> `0x2000`, 506 -> `0x1c3a`,
+    /// 518 -> `0x2006`, as read on hardware Oct 14).
+    pub const fn training_counter(self) -> u16 {
+        ((self.0 & 0x0fc0) << 4) | (self.0 & 0x003f)
     }
 
     /// The observed first verification point is half a UI above the initial

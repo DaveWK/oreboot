@@ -113,15 +113,34 @@ fn wck_alias_probe(config: u16, revision: u16) {
     println!("[dram] WCK alias: done; CSR observation only, no training or analog claim");
 }
 
+/// WL result storage, outside the 16 KiB stack (the per-point all-lane
+/// counts are about 6 KiB). bt0 is single-threaded.
+#[cfg(not(feature = "wck-alias-probe"))]
+static mut WL_BLOCK: cubie_a7a_dram::wl::WlBlock = cubie_a7a_dram::wl::WlBlock::empty(
+    cubie_a7a_dram::phy::wcklevel::Channel::A,
+    cubie_a7a_dram::phy::wcklevel::Rank::R0,
+);
+#[cfg(not(feature = "wck-alias-probe"))]
+static mut WL_SWEEP: cubie_a7a_dram::wl::WlSweep = cubie_a7a_dram::wl::WlSweep::EMPTY;
+
 /// WCK2CK leveling on every channel and rank (crate module `wl`): our sweep
-/// of the base TxWckDly CSRs with real DTSM feedback, printed per block.
+/// of the base TxWckDly CSRs with real DTSM feedback, DTSM controls and
+/// TrainingCntr convergence runs, printed per block. Printing kicks the boot
+/// watchdog per line (each line is bounded; the launches kick it as well).
 #[cfg(not(feature = "wck-alias-probe"))]
 fn wck_level(p: &mut Para) {
     use cubie_a7a_dram::phy::wcklevel::{Channel, Rank};
-    use cubie_a7a_dram::wl::{self, WlBlock, WL_POINTS, WL_STEP};
+    use cubie_a7a_dram::wl::{self, SNAP_NAMES, WL_POINTS, WL_STEP};
     let bases = blobless::wl_mr18_bases(p, PROBE_PSTATE);
     let saved = wl::begin(&mut Bt0Hw);
-    println!("[dram] WL: lane maps {saved:x?} saved, identity set; sweep {WL_POINTS} points step {WL_STEP}");
+    println!("[dram] WL: lane maps {saved:x?} saved, identity set; sweep {WL_POINTS} points step {WL_STEP}, feedback lanes {:?}, convergence starts {:?}", wl::FEEDBACK_LANES, wl::CONVERGENCE_STARTS);
+    // SAFETY: bt0 is single-threaded and nothing else refers to these.
+    let (b, sw) = unsafe {
+        (
+            &mut *core::ptr::addr_of_mut!(WL_BLOCK),
+            &mut *core::ptr::addr_of_mut!(WL_SWEEP),
+        )
+    };
     for (k, &(ch, rank)) in wl::BLOCKS.iter().enumerate() {
         let name = (
             if ch == Channel::A { "A" } else { "B" },
@@ -134,30 +153,72 @@ fn wck_level(p: &mut Para) {
             );
             break;
         };
-        let mut b = WlBlock::empty(ch, rank);
-        wl::level_block(&mut Bt0Hw, mr18, &mut b);
+        b.channel = ch;
+        b.rank = rank;
+        wl::level_block(&mut Bt0Hw, mr18, b, sw);
+        let tag = |i: usize| (name.0, name.1, i);
         println!(
             "[dram] WL ch {} rank {}: MR18 base {:02x}, {} launches, {} writes, max {} us / {} polls, {} us, points {}, failure {:?}",
             name.0, name.1, b.mr18_base, b.launches, b.writes, b.max_launch_us, b.max_polls, b.elapsed_us, b.points, b.failure
         );
+        for (n, pair) in b.snaps.iter().enumerate() {
+            for (i, s) in pair.iter().enumerate() {
+                crate::recovery::kick();
+                let (c, r, i) = tag(i);
+                println!(
+                    "[dram] WL ch {c} rank {r} byte {i} snap {n} ({}): lanectrl {:x?} incdec {:x?} cntr {:04x?} cmp {:x?} err {:x?} good {:x?} nz {:x} bars {:x?} xing {:x?} bytectrl {:x?} param {:x}",
+                    SNAP_NAMES[n], s.lane_ctrl, s.inc_dec_en, s.cntr, s.cmp, s.err, s.good, s.err_nz, s.bars, s.xing, s.byte_ctrl, s.training_param
+                );
+            }
+        }
         for i in 0..2 {
+            let (c, r, i) = tag(i);
             println!(
-                "[dram] WL ch {} rank {} byte {i}: saved {:04x}, after prefix {:04x}, TrainingCntr {:04x?} -> {:?}, prefix err {}",
-                name.0, name.1, b.saved_delay[i], b.after_prefix_delay[i], b.training_cntr[i], b.counter_delay[i], b.prefix_err[i]
+                "[dram] WL ch {c} rank {r} byte {i}: saved {:04x}, after prefix {:04x}, TrainingCntr {:04x?} -> {:?}, prefix err {}",
+                b.saved_delay[i], b.after_prefix_delay[i], b.training_cntr[i], b.counter_delay[i], b.prefix_err[i]
             );
+        }
+        for (pt, d) in sw.points.iter().zip(0u16..).take(b.points as usize) {
+            crate::recovery::kick();
             println!(
-                "[dram] WL ch {} rank {} byte {i}: err {:?}",
-                name.0, name.1, b.err[i]
+                "[dram] WL ch {} rank {} p {} d {}: b0 cmp {:x?} err {:x?} b1 cmp {:x?} err {:x?}",
+                name.0,
+                name.1,
+                d,
+                d * WL_STEP,
+                pt.cmp[0],
+                pt.err[0],
+                pt.cmp[1],
+                pt.err[1]
             );
+        }
+        for i in 0..2 {
+            crate::recovery::kick();
+            let (c, r, i) = tag(i);
+            println!("[dram] WL ch {c} rank {r} byte {i}: err04 {:?}", b.err[i]);
             println!(
-                "[dram] WL ch {} rank {} byte {i}: lanes {:x?}",
-                name.0, name.1, b.lanes_nz[i]
+                "[dram] WL ch {c} rank {r} byte {i}: lanes {:x?}",
+                b.lanes_nz[i]
             );
             let d = &b.decision[i];
             println!(
-                "[dram] WL ch {} rank {} byte {i}: threshold {}, edges {:?} ({}), delay {:?}, counter agrees {}, final {:04x}",
-                name.0, name.1, d.threshold, &d.edges[..d.n_edges.min(8) as usize], d.n_edges, d.delay, d.counter_agrees, b.final_delay[i]
+                "[dram] WL ch {c} rank {r} byte {i}: threshold {}, edges {:?} ({}), delay {:?}, counter agrees {}, final {:04x}",
+                d.threshold, &d.edges[..d.n_edges.min(8) as usize], d.n_edges, d.delay, d.counter_agrees, b.final_delay[i]
             );
+        }
+        for cv in b.convergence.iter() {
+            crate::recovery::kick();
+            println!(
+                "[dram] WL ch {} rank {} converge from {} ({:04x}): {} launches, failure {:?}, result {:?}",
+                name.0, name.1, cv.start, cv.start_raw, cv.launches, cv.failure, cv.result
+            );
+            for i in 0..2 {
+                let (c, r, i) = tag(i);
+                println!(
+                    "[dram] WL ch {c} rank {r} byte {i} converge from {}: start read {:04x?} after {:04x?}",
+                    cv.start, cv.start_read[i], cv.after[i]
+                );
+            }
         }
         if b.failure.is_some() {
             break;
