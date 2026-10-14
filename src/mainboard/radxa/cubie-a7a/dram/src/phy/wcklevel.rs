@@ -26,21 +26,21 @@ pub enum Channel {
 }
 
 impl Channel {
-    const fn enables(self) -> (u16, u16) {
+    pub(crate) const fn enables(self) -> (u16, u16) {
         match self {
             Self::A => (3, 0),
             Self::B => (0, 3),
         }
     }
 
-    const fn override_mask(self) -> u16 {
+    pub(crate) const fn override_mask(self) -> u16 {
         match self {
             Self::A => 0xf0,
             Self::B => 0x0f,
         }
     }
 
-    const fn inactive_first_byte(self) -> u32 {
+    pub(crate) const fn inactive_first_byte(self) -> u32 {
         match self {
             Self::A => 2,
             Self::B => 0,
