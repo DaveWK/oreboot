@@ -25,6 +25,7 @@ use crate::hw::Hw;
 use crate::phy::coldinit::Row;
 use crate::phy::wcklevel::{self, Channel, Mr18Base, Rank, SavedControls, Step, MAX_WCK_DELAY};
 use crate::phy::{csr, csr_access, MICRO_RESET};
+use dram_train::launch::LaunchError;
 
 const ACSM_MEM: u32 = 0x41000;
 const ACSM_START: u32 = 0x20022;
@@ -168,118 +169,36 @@ impl<'a, H: Hw> WlExec<'a, H> {
             self.failure = Some(WlFailure::AlreadyRunning(n));
             return;
         }
-        let t0 = self.hw.now_us();
-        self.hw.write16(csr(RUN_CTRL), control | 1);
         // Done reads 1 while idle on this PHY: a busy poll (Done clear) or the
         // LastAddr witness shows that this launch ran.
-        let mut polls: u32 = 0;
-        let result = loop {
-            if self.hw.read16(csr(DONE)) & 1 != 0 {
-                if polls == 0 {
-                    let last = self.hw.read16(csr(ACSM_LAST));
-                    if last != stop || prior_last == stop {
-                        break Err(WlFailure::NoBusyObserved(n));
-                    }
-                }
-                break Ok(());
-            }
-            polls += 1;
-            if self.hw.now_us().wrapping_sub(t0) > LAUNCH_TIMEOUT_US {
-                break Err(WlFailure::Timeout(n));
-            }
-        };
-        let us = self.hw.now_us().wrapping_sub(t0) as u32;
-        self.hw.write16(csr(RUN_CTRL), control & !1);
-        self.max_launch_us = self.max_launch_us.max(us);
-        self.max_polls = self.max_polls.max(polls);
+        let l = dram_train::launch::bounded_launch(
+            self.hw,
+            LAUNCH_TIMEOUT_US,
+            |hw| hw.write16(csr(RUN_CTRL), control | 1),
+            |hw| hw.read16(csr(DONE)) & 1 != 0,
+            |hw| {
+                let last = hw.read16(csr(ACSM_LAST));
+                last == stop && prior_last != stop
+            },
+            |hw| hw.write16(csr(RUN_CTRL), control & !1),
+        );
+        let result = l.result.map_err(|e| match e {
+            LaunchError::Timeout => WlFailure::Timeout(n),
+            LaunchError::NoBusyObserved => WlFailure::NoBusyObserved(n),
+        });
+        self.max_launch_us = self.max_launch_us.max(l.us);
+        self.max_polls = self.max_polls.max(l.polls);
         if let Err(f) = result {
             self.failure = Some(f);
         }
     }
 }
 
-/// Our decision on one DBYTE's measured curve.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Decision {
-    /// Fail threshold: counts above it are "fail" (half the maximum).
-    pub threshold: u16,
-    /// Points (index i: the change happens between i-1 and i) where pass/fail
-    /// changes, and the fail state after each, first [`MAX_EDGES`].
-    pub edges: [(u8, bool); MAX_EDGES],
-    pub n_edges: u8,
-    /// Chosen TxWckDly (linear UI/64), None without a usable transition.
-    pub delay: Option<u16>,
-    /// The hardware counter's delay lies on a measured transition.
-    pub counter_agrees: bool,
-}
-
-pub const MAX_EDGES: usize = 8;
-
-impl Decision {
-    pub const EMPTY: Decision = Decision {
-        threshold: 0,
-        edges: [(0, false); MAX_EDGES],
-        n_edges: 0,
-        delay: None,
-        counter_agrees: false,
-    };
-}
-
-/// Decide from error counts `err` measured at delays `i * step`. A curve
-/// without both pass and fail points has no transition and gives None. The
-/// first fail-to-pass transition with at least two stable points on each
-/// side is taken (delay halfway between its two points). Which polarity is
-/// the CK rising edge is a hypothesis; the full curve is reported so a
-/// hardware result can be re-decided offline. `counter` is the PHY's hardware
-/// result: chosen instead when within two steps of a measured fail-to-pass
-/// transition.
-pub fn decide(err: &[u16], step: u16, counter: Option<u16>) -> Decision {
-    let mut d = Decision::EMPTY;
-    let max = err.iter().copied().max().unwrap_or(0);
-    let min = err.iter().copied().min().unwrap_or(0);
-    if max == min {
-        return d;
-    }
-    d.threshold = max / 2;
-    let fail = |i: usize| err[i] > d.threshold;
-    let mut all = [0usize; 64];
-    let mut n_all = 0;
-    for i in 1..err.len() {
-        if fail(i) != fail(i - 1) {
-            if (d.n_edges as usize) < MAX_EDGES {
-                d.edges[d.n_edges as usize] = (i as u8, fail(i));
-                d.n_edges += 1;
-            }
-            if n_all < all.len() {
-                all[n_all] = i;
-                n_all += 1;
-            }
-        }
-    }
-    let at = |i: usize| (i as u16 * step) - step / 2;
-    if let Some(c) = counter {
-        if all[..n_all]
-            .iter()
-            .any(|&i| !fail(i) && at(i).abs_diff(c) <= 2 * step)
-        {
-            d.counter_agrees = true;
-            d.delay = Some(c);
-            return d;
-        }
-    }
-    for k in 0..n_all {
-        let i = all[k];
-        let prev = if k == 0 { 0 } else { all[k - 1] };
-        let next = if k + 1 < n_all { all[k + 1] } else { err.len() };
-        // Fail -> pass only: the delay at which the DRAM's sampled level
-        // becomes the expected one (hypothesis until a data stage confirms).
-        if !fail(i) && i >= prev + 2 && next >= i + 2 {
-            d.delay = Some(at(i));
-            break;
-        }
-    }
-    d
-}
+/// Our decision on one DBYTE's measured curve: [`decide`] takes the first
+/// fail-to-pass transition with two stable points on each side and prefers
+/// the hardware counter's delay when it lies on such a transition (shared
+/// `dram_train::edge`).
+pub use dram_train::edge::{decide_legacy as decide, Decision, MAX_EDGES};
 
 /// One channel/rank block.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -3,14 +3,14 @@
 
 use core::fmt;
 
-use cubie_a7a_dram::{Hw, Rail};
+use cubie_a7a_dram::{Hw, Rail, RegIo};
 
 use super::PMIC;
 use crate::soc;
 
 pub(super) struct Bt0Hw;
 
-impl Hw for Bt0Hw {
+impl RegIo for Bt0Hw {
     fn read32(&mut self, addr: usize) -> u32 {
         util::mmio::read32(addr)
     }
@@ -32,6 +32,14 @@ impl Hw for Bt0Hw {
     fn now_us(&mut self) -> u64 {
         soc::ticks() / (soc::TIMER_HZ / 1_000_000)
     }
+    fn log(&mut self, args: fmt::Arguments) {
+        print!("{args}");
+    }
+    fn kick_watchdog(&mut self) {
+        crate::recovery::kick();
+    }
+}
+impl Hw for Bt0Hw {
     fn set_voltage(&mut self, rail: Rail, mv: u32) -> bool {
         let name = rail.pmic_name();
         println!("[bt0] DRAM: set {name} to {mv} mV");
@@ -48,11 +56,5 @@ impl Hw for Bt0Hw {
                 false
             }
         }
-    }
-    fn log(&mut self, args: fmt::Arguments) {
-        print!("{args}");
-    }
-    fn kick_watchdog(&mut self) {
-        crate::recovery::kick();
     }
 }

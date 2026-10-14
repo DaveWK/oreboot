@@ -363,6 +363,10 @@ dependencies = [
 [[package]]
 name = "cubie-a7a-dram"
 version = "0.1.0"
+dependencies = [
+ "dram-train",
+ "jedec-lpddr",
+]
 
 [[package]]
 name = "d1-pac"

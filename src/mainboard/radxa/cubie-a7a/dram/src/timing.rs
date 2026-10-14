@@ -11,36 +11,11 @@ use crate::hw::Hw;
 use crate::para::Para;
 
 /// Nanoseconds to controller cycles at `mhz`, rounded up.
-pub const fn ns(t_ns: u32, mhz: u32) -> u32 {
-    (t_ns * mhz).div_ceil(1000)
-}
+pub use jedec_lpddr::timing::ns_to_ck as ns;
 
 /// LPDDR5 device timings (JEDEC LPDDR5/5X, 8 Gb/16 Gb per channel dies), in ns,
 /// as the vendor parameter tables use them.
-mod lp5 {
-    pub const T_FAW: u32 = 20;
-    pub const T_RRD: u32 = 5;
-    pub const T_RCD: u32 = 18;
-    pub const T_XP: u32 = 7;
-    pub const T_WTR_L: u32 = 12;
-    pub const T_RTP: u32 = 8; // 7.5 ns
-    pub const T_RPAB: u32 = 21;
-    pub const T_RAS: u32 = 42;
-    pub const T_REFI: u32 = 3906;
-    pub const T_RFCAB: u32 = 380;
-    /// Power-up: 200 us of RESET/CKE timing for the DFI init counters.
-    pub const T_INIT_200US: u32 = 200_000;
-    pub const T_ZQCAL: u32 = 260;
-    pub const T_XSR_EXTRA: u32 = 90;
-    pub const T_CKE: u32 = 3;
-    pub const T_ESCKE: u32 = 10;
-    pub const T_CCDMW_NS: u32 = 15;
-    pub const T_CMD_1NS: u32 = 1;
-    pub const T_MRW_40: u32 = 40;
-    pub const T_ZQRESET_6US: u32 = 6000;
-    pub const T_ZQLAT_30: u32 = 30;
-    pub const T_ZQCS_50: u32 = 50;
-}
+use jedec_lpddr::lp5::timing as lp5;
 
 /// Write the timing registers of every frequency set of channel `ch`.
 /// Also fixes up the mode-register words of the parameter set the PHY

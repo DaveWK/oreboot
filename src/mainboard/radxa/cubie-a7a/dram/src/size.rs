@@ -8,24 +8,30 @@ use crate::para::Para;
 /// that for the non-binary densities (6/12 GB) unless para2[31:30] says
 /// otherwise.
 pub fn checked_size_mib(p: &Para) -> Result<u32, Error> {
-    let bits = p.row_bits() + p.bank_bits() + p.col_bits() + p.bg_bits() + p.rank_bits();
-    let half_width = p.para2() & 0xf != 0;
-    let overhead = if !half_width || p.channels() == 2 {
-        18
-    } else {
-        19
+    let g = jedec_lpddr::geometry::Geometry {
+        row_bits: p.row_bits(),
+        col_bits: p.col_bits(),
+        bank_bits: p.bank_bits(),
+        bg_bits: p.bg_bits(),
+        rank_bits: p.rank_bits(),
     };
-    let shift = bits
-        .checked_sub(overhead)
-        .ok_or(Error::Config("DRAM geometry below size representation"))?;
-    let mut mib = 1u32
-        .checked_shl(shift)
+    // A 32-bit bus (two x16 channels, or a full-width one) unless a single
+    // half-width channel is populated.
+    let half_width = p.para2() & 0xf != 0;
+    let bus_bytes_log2 = if !half_width || p.channels() == 2 {
+        2
+    } else {
+        1
+    };
+    let bits = g.address_bits() + bus_bytes_log2;
+    if bits < 20 {
+        return Err(Error::Config("DRAM geometry below size representation"));
+    }
+    let mut mib = jedec_lpddr::geometry::size_mib(g.address_bits(), bus_bytes_log2)
         .ok_or(Error::Config("DRAM geometry exceeds size arithmetic"))?;
     if p.tpr13() & (7 << 16) != 0 && p.para2() >> 30 != 2 {
-        mib = mib
-            .checked_mul(3)
-            .ok_or(Error::Config("non-binary DRAM size arithmetic overflow"))?
-            >> 2;
+        mib = jedec_lpddr::geometry::non_binary_mib(mib)
+            .ok_or(Error::Config("non-binary DRAM size arithmetic overflow"))?;
     }
     validate_mib(mib)
 }

@@ -6,3 +6,5 @@ edition = "2021"
 description = "LPDDR5 DRAM init for the Allwinner A733 (Radxa Cubie A7A), without the vendor library"
 
 [dependencies]
+dram-train = { path = "../../../../lib/dram-train" }
+jedec-lpddr = { path = "../../../../lib/jedec-lpddr" }

@@ -20,7 +20,7 @@ pub mod size;
 pub mod timing;
 pub mod wl;
 
-pub use hw::{Error, Hw, Rail};
+pub use hw::{Error, Hw, Rail, RegIo};
 pub use para::Para;
 pub use phy::PhyFirmware;
 

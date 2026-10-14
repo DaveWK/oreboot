@@ -761,7 +761,6 @@ impl CaTrainReport {
 
 /// Combine the four blocks of channel `ch` (indices 4 ch .. 4 ch + 3).
 pub fn combine_channel(blocks: &[BlockTrain; 8], ch: usize) -> ChannelCa {
-    let full = u64::MAX >> (64 - LANE_SWEEP_POINTS);
     let set = &blocks[4 * ch..4 * ch + 4];
     let mut out = ChannelCa {
         lane_map_agrees: true,
@@ -769,20 +768,20 @@ pub fn combine_channel(blocks: &[BlockTrain; 8], ch: usize) -> ChannelCa {
     };
     for lane in 0..7 {
         let bit = set[0].lane_bit[lane];
-        let mut map = full;
-        for b in set {
-            if b.lane_bit[lane] != bit || bit == 0xff {
-                out.lane_map_agrees = false;
-            }
-            map &= b.lane_maps[lane];
+        if set.iter().any(|b| b.lane_bit[lane] != bit) || bit == 0xff {
+            out.lane_map_agrees = false;
         }
         let pref = set[0].lane_delay[lane] as u32 / LANE_SWEEP_STEP as u32;
-        out.runs[lane] = coldinit::run_near(map as u128, LANE_SWEEP_POINTS, pref);
-        let (s, l) = out.runs[lane];
-        out.delay[lane] = if l == 0 {
+        let w = dram_train::window::intersect_near(
+            set.iter().map(|b| b.lane_maps[lane] as u128),
+            LANE_SWEEP_POINTS,
+            pref,
+        );
+        out.runs[lane] = w.as_tuple();
+        out.delay[lane] = if w.is_empty() {
             set[0].lane_delay[lane]
         } else {
-            (((s + l / 2) % LANE_SWEEP_POINTS) as u16) * LANE_SWEEP_STEP
+            w.center(LANE_SWEEP_POINTS) as u16 * LANE_SWEEP_STEP
         };
     }
     out
