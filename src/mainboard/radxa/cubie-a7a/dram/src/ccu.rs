@@ -58,7 +58,7 @@ pub const PLL_LOCK_MAX_READS: u32 = 10_000;
 /// section4.1.6.1 requires stored PLL_N11..254. These are PLL programming
 /// limits, not a DRAM-part operating limit or a measured stable rate.
 pub fn validate_pll_ddr_rate(mhz: u32) -> Result<(), Error> {
-    if !(1_260..=2_520).contains(&mhz) || mhz % 24 != 0 {
+    if !(1_260..=2_520).contains(&mhz) || !mhz.is_multiple_of(24) {
         return Err(Error::Config("PLL DDR rate outside exact 24 MHz VCO grid"));
     }
     let stored_n = mhz / 24 - 1;

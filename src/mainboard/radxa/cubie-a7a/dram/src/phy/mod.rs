@@ -85,15 +85,24 @@ pub fn mb_byte<H: Hw>(hw: &mut H, off: usize) -> u32 {
     }
 }
 
-/// DBYTE `db` trained delay CSR of `lane` (0..8, the ninth being DMI):
-/// CSR 0x1n04e + 0x100 * lane (low) and the next CSR (high).
-pub const fn dbyte_lane_delay(db: u32, lane: u32) -> usize {
+/// DBYTE `db` VrefDAC0 of `lane` (0..8, the ninth being DMI): CSR
+/// 0x1n04e + 0x100 * lane; VrefDAC1 is the next CSR (EIC7700X TRM Part 2
+/// register list, same DWC LPDDR5/4 PHY family: VrefDAC0_rY_pX 0x1004e,
+/// VrefDAC1_rY_pX 0x1004f, "control for DQ Receiver"). The vendor sequence
+/// saves these per lane after training; they are receiver Vref settings,
+/// not delays.
+pub const fn dbyte_vref_dac(db: u32, lane: u32) -> usize {
     csr(0x1004e + 0x1000 * db + 0x100 * lane)
 }
 
-/// The PHY's trained read pointer init (MASTER 0x20002 [3:0]) and DBYTE0's
-/// receive-enable timing (0x1002a), from which the controller's DFI read
-/// data enable delay follows.
+/// PclkPtrInitVal (MASTER 0x20002 [3:0], command FIFO read pointer init)
+/// and DBYTE 0's TxWckDlyTg0 (0x1002a), from which the
+/// vendor sequence derives the controller's DFI read data enable delay
+/// (`post`). 0x1002a is the rank-0 write WCK delay (EIC7700X TRM Part 2:
+/// TxWckDlyTg0_pX, "Write WCK Delay (Timing Group DEST=0)", coarse [10:6] UI,
+/// fine [5:0] UI/64, reset 0x200), not the receive-enable delay
+/// (RxEnDlyTg0_pX is 0x10020). In LPDDR5 the read data returns relative to
+/// WCK, which is presumably why the vendor formula uses it.
 pub fn read_latency_csrs<H: Hw>(hw: &mut H) -> (u32, u32) {
     csr_access(hw, true);
     let a = hw.read16(csr(0x20002)) as u32;

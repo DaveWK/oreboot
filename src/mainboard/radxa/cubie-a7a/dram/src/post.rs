@@ -205,12 +205,15 @@ impl SaveFailure {
     }
 }
 
-/// Store per-lane delays (DBYTE +0x4e/+0x4f, nine lanes) in words 32..49 and
+/// Store per-lane VrefDAC0/1 (DBYTE +0x4e/+0x4f, nine lanes) in words 32..49 and
 /// each rank's MR14/MR15 in words 50/51, preserving the inherited ABI.
 /// Stage results until every operation and restoration succeeds. On any
 /// error, invalidate the output, attempt MR16=4 on each possibly changed rank,
 /// and return CSR ownership through the existing baseline close operation.
 /// A successful restore command is not proof of physical state recovery.
+// no_std without an allocator: the failure record cannot be boxed, and it
+// stays on the caller's stack only on the error path.
+#[allow(clippy::result_large_err)]
 pub fn save_training_results<H: Hw>(hw: &mut H, p: &mut Para) -> Result<(), SaveFailure> {
     p.w[32..52].fill(0);
     let mut staged = [0u32; 20];
@@ -221,7 +224,7 @@ pub fn save_training_results<H: Hw>(hw: &mut H, p: &mut Para) -> Result<(), Save
             for (half, word) in [(0, 0), (2, 9)] {
                 let mut v = 0;
                 for db in 0..4 {
-                    let a = phy::dbyte_lane_delay(db, lane) + half;
+                    let a = phy::dbyte_vref_dac(db, lane) + half;
                     v |= (hw.read16(a) as u32 & 0x7f) << (8 * db);
                 }
                 staged[word + lane as usize] = v;

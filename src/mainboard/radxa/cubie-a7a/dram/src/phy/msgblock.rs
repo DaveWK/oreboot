@@ -70,9 +70,7 @@ pub fn build(p: &mut Para, pstate: u32, data_mhz: u32, rl: u32) -> [u16; WORDS] 
     m[0x3a] = m[0x39];
     if p.tpr10() & (1 << 29) != 0 {
         // MR14 (VREF(DQ)) for both ranks.
-        for k in 0x3b..=0x3e {
-            m[k] = mr2(p.w[18]);
-        }
+        m[0x3b..=0x3e].fill(mr2(p.w[18]));
     }
     m[0x3f] = mr2(p.w[19]); // MR16
     m[0x40] = m[0x3f];

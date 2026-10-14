@@ -100,8 +100,8 @@ pub fn load_dmem<H: Hw>(hw: &mut H, p: &mut Para, fw: &PhyFirmware, pstate: u32,
     hw.udelay(1);
     let data = fw.dmem.len() / 2;
     for k in 0..DMEM_WORDS {
-        let v = if k < msgblock::WORDS {
-            mb[k]
+        let v = if let Some(&word) = mb.get(k) {
+            word
         } else if k - msgblock::WORDS < data {
             let i = 2 * (k - msgblock::WORDS);
             u16::from_le_bytes([fw.dmem[i], fw.dmem[i + 1]])

@@ -197,8 +197,9 @@ impl<P: Port> DirectRun<P> {
             self.port
                 .write_control(control | RUN_BIT)
                 .map_err(Cause::Port)?;
-            let mut busy_polls = 0;
             for count in 1..=polls {
+                // Every earlier poll of this launch read Done clear.
+                let busy_polls = count - 1;
                 let raw_done = self.port.read_done().map_err(Cause::Port)?;
                 if raw_done & DONE_BIT != 0 {
                     let witnessed = busy_polls == 0;
@@ -213,7 +214,6 @@ impl<P: Port> DirectRun<P> {
                         witnessed,
                     });
                 }
-                busy_polls += 1;
             }
             Err(Cause::Timeout)
         })();
