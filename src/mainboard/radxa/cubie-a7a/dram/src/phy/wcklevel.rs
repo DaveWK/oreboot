@@ -63,6 +63,10 @@ pub enum Step<'a> {
 pub struct Mr18Base(u8);
 
 impl Mr18Base {
+    pub const fn value(self) -> u8 {
+        self.0
+    }
+
     pub const fn new(value: u8) -> Option<Self> {
         if value & 0xd0 != 0 {
             None
@@ -416,6 +420,13 @@ pub fn cleanup(
     saved: &SavedControls,
     out: &mut impl FnMut(Step<'_>),
 ) {
+    cleanup_sequence(rank, mr18_base, out);
+    restore_saved(saved, out);
+}
+
+/// [`cleanup`] up to, not including, the restoration of the saved controls:
+/// mode exits, the MR18 restore and the closing launches.
+pub fn cleanup_sequence(rank: Rank, mr18_base: Mr18Base, out: &mut impl FnMut(Step<'_>)) {
     writes(
         &[
             (0x1f00b, 0),
@@ -451,6 +462,10 @@ pub fn cleanup(
         &[(0x20079, 1), (0x20079, 0), (0x2f0a0, 1), (0x2f0a0, 0)],
         out,
     );
+}
+
+/// The reference's restoration of [`SavedControls`] (its broadcast targets).
+pub fn restore_saved(saved: &SavedControls, out: &mut impl FnMut(Step<'_>)) {
     for (target, index) in [
         (0x1f097, 0),
         (0x1f093, 1),

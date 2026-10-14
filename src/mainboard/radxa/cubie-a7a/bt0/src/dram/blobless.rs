@@ -73,6 +73,100 @@ fn report_block(i: usize, b: &CbtBlock, t: &BlockTrain) {
     );
 }
 
+/// The held-reset TxWckDly alias probe (feature `wck-alias-probe`): the
+/// write trials first, printed, then the alias reads, printed last.
+#[cfg(feature = "wck-alias-probe")]
+fn wck_alias_probe(config: u16, revision: u16) {
+    use cubie_a7a_dram::phy::wckalias::{self, Trial, ALIASES, DELAYS};
+    let trial = |name: &str, t: &Trial| {
+        println!(
+            "[dram] WCK alias: {name} write {:05x}={:04x}: changed {:02x} after {:04x?} restored {:02x} mismatch",
+            t.address, t.written, t.changed_mask, t.after, t.restore_mismatch_mask
+        );
+    };
+    println!("[dram] WCK alias: base {DELAYS:05x?}");
+    let r = wckalias::observe(&mut Bt0Hw, config, revision);
+    println!(
+        "[dram] WCK alias: refusal {:?}, before {:04x?}, stopped {:?}, mux {:?}",
+        r.refusal, r.before, r.stopped, r.mux_restore
+    );
+    if let Some(c) = &r.control {
+        trial("control", c);
+    }
+    for (k, t) in r.aliases.iter().enumerate() {
+        if let Some(t) = t {
+            trial("alias", t);
+            println!(
+                "[dram] WCK alias: {:05x} lands only on {:05x}: {}",
+                ALIASES[k],
+                DELAYS[k],
+                t.lands_only_on(k)
+            );
+        }
+    }
+    println!("[dram] WCK alias: reading the alias addresses {ALIASES:05x?}");
+    let a = wckalias::read_aliases(&mut Bt0Hw, config, revision);
+    println!(
+        "[dram] WCK alias: alias reads {:04x?}, base after {:04x?}, refusal {:?}, mux {:?}",
+        a.values, a.base, a.refusal, a.mux_restore
+    );
+    println!("[dram] WCK alias: done; CSR observation only, no training or analog claim");
+}
+
+/// WCK2CK leveling on every channel and rank (crate module `wl`): our sweep
+/// of the base TxWckDly CSRs with real DTSM feedback, printed per block.
+#[cfg(not(feature = "wck-alias-probe"))]
+fn wck_level(p: &mut Para) {
+    use cubie_a7a_dram::phy::wcklevel::{Channel, Rank};
+    use cubie_a7a_dram::wl::{self, WlBlock, WL_POINTS, WL_STEP};
+    let bases = blobless::wl_mr18_bases(p, PROBE_PSTATE);
+    let saved = wl::begin(&mut Bt0Hw);
+    println!("[dram] WL: lane maps {saved:x?} saved, identity set; sweep {WL_POINTS} points step {WL_STEP}");
+    for (k, &(ch, rank)) in wl::BLOCKS.iter().enumerate() {
+        let name = (
+            if ch == Channel::A { "A" } else { "B" },
+            if rank == Rank::R0 { 0 } else { 1 },
+        );
+        let Some(mr18) = bases[k] else {
+            println!(
+                "[dram] WL ch {} rank {}: no MR18 base; stopping",
+                name.0, name.1
+            );
+            break;
+        };
+        let mut b = WlBlock::empty(ch, rank);
+        wl::level_block(&mut Bt0Hw, mr18, &mut b);
+        println!(
+            "[dram] WL ch {} rank {}: MR18 base {:02x}, {} launches, {} writes, max {} us / {} polls, {} us, points {}, failure {:?}",
+            name.0, name.1, b.mr18_base, b.launches, b.writes, b.max_launch_us, b.max_polls, b.elapsed_us, b.points, b.failure
+        );
+        for i in 0..2 {
+            println!(
+                "[dram] WL ch {} rank {} byte {i}: saved {:04x}, after prefix {:04x}, TrainingCntr {:04x?} -> {:?}, prefix err {}",
+                name.0, name.1, b.saved_delay[i], b.after_prefix_delay[i], b.training_cntr[i], b.counter_delay[i], b.prefix_err[i]
+            );
+            println!(
+                "[dram] WL ch {} rank {} byte {i}: err {:?}",
+                name.0, name.1, b.err[i]
+            );
+            println!(
+                "[dram] WL ch {} rank {} byte {i}: lanes {:x?}",
+                name.0, name.1, b.lanes_nz[i]
+            );
+            let d = &b.decision[i];
+            println!(
+                "[dram] WL ch {} rank {} byte {i}: threshold {}, edges {:?} ({}), delay {:?}, counter agrees {}, final {:04x}",
+                name.0, name.1, d.threshold, &d.edges[..d.n_edges.min(8) as usize], d.n_edges, d.delay, d.counter_agrees, b.final_delay[i]
+            );
+        }
+        if b.failure.is_some() {
+            break;
+        }
+    }
+    let bad = wl::end(&mut Bt0Hw, &saved);
+    println!("[dram] WL: lane maps restored, mismatch mask {bad:x}");
+}
+
 /// Probe the PHY with `para`, print the result and stop.
 pub fn init_one(para: &[u32; 32]) -> Option<u32> {
     let mut p = Para::from_sysconfig(para);
@@ -97,17 +191,7 @@ pub fn init_one(para: &[u32; 32]) -> Option<u32> {
             report("C_ONCE", &rb[0]);
             report("C_PSTATE", &rb[1]);
             #[cfg(feature = "wck-alias-probe")]
-            {
-                use cubie_a7a_dram::phy::wckalias;
-                let observation = wckalias::observe(&mut Bt0Hw, id.phy_config, id.pub_rev);
-                println!(
-                    "[dram] WCK alias observation: target {:05x}; {observation:x?}",
-                    wckalias::TARGET_ALIAS
-                );
-                println!(
-                    "[dram] WCK alias: known CSR readback only; no training/analog acceptance"
-                );
-            }
+            wck_alias_probe(id.phy_config, id.pub_rev);
             #[cfg(not(feature = "wck-alias-probe"))]
             {
                 let mut samples = [None; 8];
@@ -170,6 +254,11 @@ pub fn init_one(para: &[u32; 32]) -> Option<u32> {
                     c.runs[5].0 * ls, c.runs[5].1 * ls,
                     c.runs[6].0 * ls, c.runs[6].1 * ls,
                 );
+                }
+                if t.done == 8 && t.exec.failure.is_none() {
+                    wck_level(&mut p);
+                } else {
+                    println!("[dram] WL: skipped, CA training incomplete");
                 }
             }
         }

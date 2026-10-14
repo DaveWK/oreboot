@@ -140,13 +140,31 @@ fn run_checked<H: Hw>(hw: &mut H, prog: &[Op], c: &prog::Ctx, out: &mut Readback
 /// through the firmware's per-bit rules ([`coldinit::MrInputs`]). Call
 /// after [`pre_training`] (its timing step fixes up MR1/MR2).
 pub fn mode_registers(p: &mut Para, pstate: u32) -> (coldinit::Mrs, coldinit::Mrs2) {
-    let c = init::ctx_with(p, [&[]; 4], pstate);
-    let rl = if p.tpr10() & (1 << 31) != 0 { 14 } else { 13 };
-    let m = crate::phy::msgblock::build(p, pstate, c.data_mhz, rl);
+    let m = message_block(p, pstate);
     (
         coldinit::Mrs::from_msgblock(&m),
         coldinit::Mrs2::from_msgblock(&m),
     )
+}
+
+/// The message block for `pstate` from our parameters, as the trained path
+/// builds it (`phy::msgblock::build`): the source of the mode register
+/// inputs. Nothing is loaded into the PHY.
+pub fn message_block(p: &mut Para, pstate: u32) -> [u16; crate::phy::msgblock::WORDS] {
+    let c = init::ctx_with(p, [&[]; 4], pstate);
+    let rl = if p.tpr10() & (1 << 31) != 0 { 14 } else { 13 };
+    crate::phy::msgblock::build(p, pstate, c.data_mhz, rl)
+}
+
+/// WCK2CK leveling MR18 bases per [`crate::wl::BLOCKS`] entry, from the
+/// message block (`wcklevel::Mr18Base::from_message_block`).
+pub fn wl_mr18_bases(p: &mut Para, pstate: u32) -> [Option<crate::phy::wcklevel::Mr18Base>; 4] {
+    let m = message_block(p, pstate);
+    let mut out = [None; 4];
+    for (o, &(ch, rank)) in out.iter_mut().zip(crate::wl::BLOCKS.iter()) {
+        *o = crate::phy::wcklevel::Mr18Base::from_message_block(&m, ch, rank);
+    }
+    out
 }
 
 /// ACSM sequence memory: row `r` is four halfwords at CSR 0x41000 + 4 r.

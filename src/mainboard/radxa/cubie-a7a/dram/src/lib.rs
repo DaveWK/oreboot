@@ -18,6 +18,7 @@ pub mod power;
 pub mod sets;
 pub mod size;
 pub mod timing;
+pub mod wl;
 
 pub use hw::{Error, Hw, Rail};
 pub use para::Para;
@@ -87,6 +88,9 @@ pub fn core_init<H: Hw>(hw: &mut H, p: &mut Para, fw: &PhyFirmware) -> Result<()
 
 /// Bring up LPDDR5 with parameter set `p`. Returns the size in MiB; `p`
 /// then also holds the size (para2) and the training results.
+// no_std without an allocator: InitError carries the SaveFailure record by
+// value (see post::save_training_results).
+#[allow(clippy::result_large_err)]
 pub fn init<H: Hw>(hw: &mut H, p: &mut Para, fw: &PhyFirmware) -> Result<u32, InitError> {
     hw.log(format_args!(
         "[dram] open LPDDR5 init: {} MHz, type {}\n",

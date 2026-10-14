@@ -255,9 +255,8 @@ fn read_layout(sd: &smhc::Smhc) -> layout::Table {
         halt();
     }
     // The u32 sector buffer need not satisfy Table's u64 alignment.
-    let bytes = unsafe {
-        core::slice::from_raw_parts(sector.as_ptr().cast::<u8>(), smhc::BLOCK_SIZE)
-    };
+    let bytes =
+        unsafe { core::slice::from_raw_parts(sector.as_ptr().cast::<u8>(), smhc::BLOCK_SIZE) };
     match layout::decode(bytes) {
         Ok(table) => table,
         Err(error) => {
