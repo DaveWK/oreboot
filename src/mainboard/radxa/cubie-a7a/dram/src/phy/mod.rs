@@ -21,6 +21,7 @@ pub mod init;
 pub mod msgblock;
 pub mod prefix;
 pub mod prog;
+pub mod rxen;
 pub mod sequence;
 pub mod wckalias;
 pub mod wcklevel;

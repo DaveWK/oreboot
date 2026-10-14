@@ -583,14 +583,16 @@ pub fn restore_saved(saved: &SavedControls, out: &mut impl FnMut(Step<'_>)) {
 }
 
 impl Rank {
-    const fn cs(self) -> u8 {
+    /// Chip-select mask of the rank in ACSM rows (bit 0 rank 0, bit 1 rank 1).
+    pub(crate) const fn cs(self) -> u8 {
         match self {
             Self::R0 => 1,
             Self::R1 => 2,
         }
     }
 
-    const fn control(self) -> u16 {
+    /// ACSM row control bit of the rank (0x10 on rank-1 command rows).
+    pub(crate) const fn control(self) -> u16 {
         match self {
             Self::R0 => 0,
             Self::R1 => 0x10,
