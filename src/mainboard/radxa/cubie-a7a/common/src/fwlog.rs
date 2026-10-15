@@ -12,7 +12,7 @@
 //! The area format and operations are the shared `bootlog::ring` (format
 //! [`ring::A7A`]); this module keeps the A7A addresses and the sink
 //! selection. Layout of each area (little endian; EDK2's
-//! OrebootLogSerialPortLib and the Linux reader mirror it; docs/fwlog.md):
+//! OrebootLogSerialPortLib and the Linux reader mirror it; bootlog README):
 //!
 //! | Offset | Size | Field |
 //! |---|---|---|
