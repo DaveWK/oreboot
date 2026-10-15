@@ -202,8 +202,8 @@ fn wck_level(p: &mut Para) {
             );
             let d = &b.decision[i];
             println!(
-                "[dram] WL ch {c} rank {r} byte {i}: threshold {}, edges {:?} ({}), delay {:?}, counter agrees {}, final {:04x}",
-                d.threshold, &d.edges[..d.n_edges.min(8) as usize], d.n_edges, d.delay, d.counter_agrees, b.final_delay[i]
+                "[dram] WL ch {c} rank {r} byte {i}: sweep cross-check {:?}, threshold {}, edges {:?} ({}), delay {:?}, counter on edge {}",
+                b.verdict[i], d.threshold, &d.edges[..d.n_edges.min(8) as usize], d.n_edges, d.delay, d.counter_agrees
             );
         }
         for cv in b.convergence.iter() {
@@ -219,6 +219,14 @@ fn wck_level(p: &mut Para) {
                     cv.start, cv.start_read[i], cv.after[i]
                 );
             }
+        }
+        for i in 0..2 {
+            crate::recovery::kick();
+            let (c, r, i) = tag(i);
+            println!(
+                "[dram] WL ch {c} rank {r} byte {i}: result (PHY counter fixed point) {:?}, final {:04x}",
+                b.counter[i], b.final_delay[i]
+            );
         }
         if b.failure.is_some() {
             break;

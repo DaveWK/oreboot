@@ -16,10 +16,18 @@
 //! result. The PHY's TrainingCntr (`0x1n0aa`) after its calibration is read
 //! as an independent cross-check only.
 //!
-//! The decision ([`decide`]) is provisional until a later stage (read/write
-//! data checks) confirms it: it takes the first stable transition of the
-//! measured pass/fail curve, and prefers the hardware counter's delay when
-//! that lies on a measured transition.
+//! **WL result (orchestrator DECISIONS, Oct 14, "A7A m12 WL result"):** the
+//! PHY's own WCK2CK counter fixed point. The counter search runs from three
+//! starts (512, then [`CONVERGENCE_STARTS`]); when every start gives the
+//! same value on both feedback lanes within [`COUNTER_TOLERANCE`]
+//! (`dram_train::edge::converge`), that value is written to TxWckDly. It is
+//! provisional until the write-centring data stage confirms it. Our own
+//! delay sweep is a cross-check, not a gate: its curve is judged by
+//! `dram_train::edge::decide_explain` with the v1.0.0 default policy
+//! ([`SWEEP_POLICY`], noise band from the per-point full scale) and only the
+//! verdict and delay are reported. The legacy rule (two stable points, the
+//! counter accepted near any transition) took the counter on 2 of the 8 m11
+//! sweep curves only because of noise; the default declines all of them.
 //!
 //! m11 (after the Oct 14 m10 hardware run: flat lane-0 curve, TrainingCntr
 //! moved on lanes 0/4 only, a block-boundary witness false negative):
@@ -221,11 +229,34 @@ impl<'a, H: Hw> WlExec<'a, H> {
     }
 }
 
-/// Our decision on one DBYTE's measured curve: [`decide`] takes the first
-/// fail-to-pass transition with two stable points on each side and prefers
-/// the hardware counter's delay when it lies on such a transition (shared
-/// `dram_train::edge`).
-pub use dram_train::edge::{decide_legacy as decide, Decision, MAX_EDGES};
+use dram_train::edge::{self as edge, DecidePolicy, Polarity};
+/// The sweep cross-check's decision on one DBYTE's curve (shared
+/// `dram_train::edge`, v1.0.0 default policy).
+pub use dram_train::edge::{Decision, Verdict, MAX_EDGES};
+
+/// Compares per sweep point on each feedback lane (one finite measurement
+/// launch; m11: DtsmCmpCount 16 per lane), and the full-scale error count
+/// of a point on the decision curve ([`FEEDBACK_LANES`] added).
+pub const COMPARES_PER_LANE: u16 = 16;
+pub const SWEEP_FULL_SCALE: u16 = COMPARES_PER_LANE * FEEDBACK_LANES.len() as u16;
+
+/// How the sweep cross-check reads its curve: the v1.0.0 default (4 stable
+/// points each side, 1-2 point flips and a 25-75 % band are noise, at most
+/// 10 % noise) with the band taken from the full scale of one launch.
+pub const SWEEP_POLICY: DecidePolicy = DecidePolicy {
+    full_scale: Some(SWEEP_FULL_SCALE),
+    ..DecidePolicy::DEFAULT
+};
+
+/// The counter values of all starts and both feedback lanes must lie within
+/// this many UI/64 to be the WL result (m10/m11: identical within a boot,
+/// within 2 across boots).
+pub const COUNTER_TOLERANCE: u16 = 2;
+
+/// The sweep cross-check of one DBYTE's curve, with the verdict.
+pub fn decide(err: &[u16], counter: Option<u16>) -> (Decision, Verdict) {
+    edge::decide_explain(err, WL_STEP, counter, Polarity::FailToPass, &SWEEP_POLICY)
+}
 
 /// DTSM lanes per DBYTE (lanes 0..7 DQ, lane 8 the ninth lane).
 pub const LANES: usize = 9;
@@ -375,9 +406,14 @@ pub struct WlBlock {
     /// Lanes with a nonzero error count per point (bit per lane 0..8).
     pub lanes_nz: [[u16; WL_POINTS]; 2],
     pub points: u8,
+    /// The sweep cross-check per DBYTE (not applied).
     pub decision: [Decision; 2],
-    /// TxWckDly read back after writing the result (or the saved value when
-    /// there is no decision).
+    pub verdict: [Option<Verdict>; 2],
+    /// The counter's values from all starts and both feedback lanes, judged
+    /// by `dram_train::edge::converge`; `agreed` is the WL result.
+    pub counter: [Option<edge::Convergence>; 2],
+    /// TxWckDly read back after writing the result (the agreed counter
+    /// value, or the saved value when the starts disagree).
     pub final_delay: [u16; 2],
     pub launches: u16,
     pub writes: u16,
@@ -406,6 +442,8 @@ impl WlBlock {
             lanes_nz: [[0; WL_POINTS]; 2],
             points: 0,
             decision: [Decision::EMPTY; 2],
+            verdict: [None; 2],
+            counter: [None; 2],
             final_delay: [0; 2],
             launches: 0,
             writes: 0,
@@ -631,15 +669,15 @@ pub fn level_block<H: Hw>(hw: &mut H, mr18: Mr18Base, out: &mut WlBlock, sweep: 
     }
     wcklevel::measurement_clocks_stop(ch, &mut |s| ex.step(s));
 
-    // Decide and apply (the saved value when there is no decision).
+    // The sweep cross-check (reported, not applied); the saved delay back.
     let n = out.points as usize;
     for (i, &db) in dbs.iter().enumerate() {
         if n == WL_POINTS {
-            out.decision[i] = decide(&out.err[i][..n], WL_STEP, out.counter_delay[i]);
+            let (d, v) = decide(&out.err[i][..n], out.counter_delay[i]);
+            out.decision[i] = d;
+            out.verdict[i] = Some(v);
         }
-        let v = out.decision[i].delay.unwrap_or(out.saved_delay[i]);
-        ex.write(tx_wck_dly(db, rank), v);
-        out.final_delay[i] = ex.read(tx_wck_dly(db, rank));
+        ex.write(tx_wck_dly(db, rank), out.saved_delay[i]);
     }
     saved.cleanup(&mut ex, rank, mr18);
 
@@ -677,6 +715,28 @@ pub fn level_block<H: Hw>(hw: &mut H, mr18: Mr18Base, out: &mut WlBlock, sweep: 
         saved.cleanup(&mut ex, rank, mr18);
         c.launches = ex.launches - first;
         c.failure = ex.failure;
+    }
+
+    // The WL result: the counter fixed point when every start and both
+    // feedback lanes agree; otherwise the saved delay stays.
+    if ex.failure.is_none() {
+        for (i, &db) in dbs.iter().enumerate() {
+            let mut runs = [None; 2 * (1 + CONVERGENCE_STARTS.len())];
+            for (j, &l) in FEEDBACK_LANES.iter().enumerate() {
+                runs[j] = wcklevel::TxWckDelay::from_training_counter(out.training_cntr[i][l])
+                    .ok()
+                    .map(|d| d.encoded());
+                for (k, c) in out.convergence.iter().enumerate() {
+                    runs[2 * (k + 1) + j] = c.result[i][j];
+                }
+            }
+            out.counter[i] = edge::converge(&runs, COUNTER_TOLERANCE);
+            let v = out.counter[i]
+                .and_then(|c| c.agreed)
+                .unwrap_or(out.saved_delay[i]);
+            ex.write(tx_wck_dly(db, rank), v);
+            out.final_delay[i] = ex.read(tx_wck_dly(db, rank));
+        }
     }
 
     out.launches = ex.launches;
