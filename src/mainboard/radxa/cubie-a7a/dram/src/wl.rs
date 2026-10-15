@@ -164,12 +164,12 @@ impl<'a, H: Hw> WlExec<'a, H> {
         }
     }
 
-    fn read(&mut self, c: u32) -> u16 {
+    pub(crate) fn read(&mut self, c: u32) -> u16 {
         csr_access(self.hw, true);
         self.hw.read16(csr(c))
     }
 
-    fn write(&mut self, c: u32, v: u16) {
+    pub(crate) fn write(&mut self, c: u32, v: u16) {
         if self.failure.is_some() {
             return;
         }

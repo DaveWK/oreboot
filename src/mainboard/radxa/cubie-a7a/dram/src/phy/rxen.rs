@@ -18,15 +18,13 @@
 //! [`fine_setup`] and [`apply`] emit as [`Step`]s; the TrainingCntr values
 //! and the applied RxEnDly are search state, passed in by the caller.
 //!
-//! Command codes: first-edge CA values of the LPDDR5 two-edge truth table
-//! (JEDEC LPDDR5/5X; as printed in LiteDRAM 74522f7 `phy/lpddr5/commands.py`):
-//! CAS with WS_FS `0x4c`, RDC `0x50`, CAS with WS_WR/WS_RD/WS_FS `0x7c`, NOP
-//! `0x00`, second edge 0. They are the reference's row data, kept here as
-//! observed values. A shared LPDDR5 command encoder for `jedec_lpddr` is
-//! requested (orchestrator PROGRESS, REQ-A7A-01); these constants move to it
-//! when it exists.
+//! Command codes: the first-edge CA values of CAS (with WS_FS, and with
+//! WS_WR/WS_RD/WS_FS) and RDC from `jedec_lpddr::lp5::cmd` (JEDEC LPDDR5/5X
+//! truth table); the second edges are 0, as the reference's rows carry them.
+
 use super::coldinit::{mrw_ddr, Row};
 use super::wcklevel::{clear_counts, Channel, Rank, Step};
+use jedec_lpddr::lp5::cmd;
 
 /// Mode register inputs of the read enable entry ([`entry`]), in order.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -82,9 +80,30 @@ impl ModeMrs {
     };
 }
 
-const CA_CAS_FS: u16 = 0x4c;
-const CA_RDC: u16 = 0x50;
-const CA_CAS_ALL: u16 = 0x7c;
+/// First-edge CA of a CAS with the given WCK sync bits.
+const fn cas(ws_wr: bool, ws_rd: bool, ws_fs: bool) -> u16 {
+    match (cmd::Cas {
+        ws_wr,
+        ws_rd,
+        ws_fs,
+        dc: 0,
+        wrx: false,
+        wxsa: false,
+        wxsb: false,
+    })
+    .encode()
+    {
+        Some(e) => e.rise as u16,
+        None => panic!("DC is 4 bits"),
+    }
+}
+/// CAS with fast WCK sync (WS_FS): `0x4c`.
+const CA_CAS_FS: u16 = cas(false, false, true);
+/// RDC (read DQ calibration): `0x50`.
+const CA_RDC: u16 = cmd::RDC.rise as u16;
+/// CAS with WS_WR, WS_RD and WS_FS: `0x7c`.
+const CA_CAS_ALL: u16 = cas(true, true, true);
+const _: () = assert!(CA_CAS_FS == 0x4c && CA_RDC == 0x50 && CA_CAS_ALL == 0x7c);
 
 const fn cs_bits(rank: Rank) -> u16 {
     (rank.cs() as u16) << 14

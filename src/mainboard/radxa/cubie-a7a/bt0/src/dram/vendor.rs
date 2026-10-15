@@ -39,7 +39,8 @@ pub fn init_one(para: &[u32; 32]) -> Option<u32> {
 }
 
 /// AV.3 (feature `av3-dump`): after the vendor library's training, print
-/// the trained values of pstate 0 for comparison with our own stages
+/// the trained values of every pstate (AV.3b; AV.3 read pstate 0 only) for
+/// comparison with our own stages
 /// (orchestrator vendor-baseline BASELINE.md, part B). Reads named PHY CSRs
 /// one at a time (EIC7700X TRM Part 2 register names, same PHY family);
 /// the only writes are the CSR access mux and the PState select, both put
@@ -56,34 +57,37 @@ fn av3_dump(size: c_int) {
     let mux = r16(MICRO_CONT_MUX_SEL);
     w16(MICRO_CONT_MUX_SEL, 0);
     let pstate = r16(PSTATE);
-    println!("[av3] MicroContMuxSel {mux:04x}, PState {pstate:04x}; reading pstate 0");
-    w16(PSTATE, 0);
+    println!("[av3] MicroContMuxSel {mux:04x}, PState {pstate:04x}; reading pstates 0-3");
     let dbyte = |db: usize, off: usize| phy(0x10000 + 0x1000 * db + off);
-    for db in 0..4 {
-        crate::recovery::kick();
-        println!(
-            "[av3] DBYTE {db}: TxWckDlyTg0/1 {:04x} {:04x} RxEnDlyTg0/1 {:04x} {:04x}",
-            r16(dbyte(db, 0x02a)),
-            r16(dbyte(db, 0x02b)),
-            r16(dbyte(db, 0x020)),
-            r16(dbyte(db, 0x021)),
-        );
-        // Per lane 0..8 (lane 8: DMI) at + 0x100 * lane.
-        for (name, off) in [
-            ("RxClkT2UIDlyTg0", 0x010),
-            ("RxClkT2UIDlyTg1", 0x011),
-            ("RxClkC2UIDlyTg0", 0x012),
-            ("RxClkC2UIDlyTg1", 0x013),
-            ("TxDqDlyTg0", 0x026),
-            ("TxDqDlyTg1", 0x027),
-            ("VrefDAC0", 0x04e),
-            ("VrefDAC1", 0x04f),
-        ] {
-            let mut v = [0u16; 9];
-            for (lane, x) in v.iter_mut().enumerate() {
-                *x = r16(dbyte(db, off + 0x100 * lane));
+    for ps in 0..4u16 {
+        w16(PSTATE, ps);
+        println!("[av3] pstate {ps} (PState reads {:04x})", r16(PSTATE));
+        for db in 0..4 {
+            crate::recovery::kick();
+            println!(
+                "[av3] p{ps} DBYTE {db}: TxWckDlyTg0/1 {:04x} {:04x} RxEnDlyTg0/1 {:04x} {:04x}",
+                r16(dbyte(db, 0x02a)),
+                r16(dbyte(db, 0x02b)),
+                r16(dbyte(db, 0x020)),
+                r16(dbyte(db, 0x021)),
+            );
+            // Per lane 0..8 (lane 8: DMI) at + 0x100 * lane.
+            for (name, off) in [
+                ("RxClkT2UIDlyTg0", 0x010),
+                ("RxClkT2UIDlyTg1", 0x011),
+                ("RxClkC2UIDlyTg0", 0x012),
+                ("RxClkC2UIDlyTg1", 0x013),
+                ("TxDqDlyTg0", 0x026),
+                ("TxDqDlyTg1", 0x027),
+                ("VrefDAC0", 0x04e),
+                ("VrefDAC1", 0x04f),
+            ] {
+                let mut v = [0u16; 9];
+                for (lane, x) in v.iter_mut().enumerate() {
+                    *x = r16(dbyte(db, off + 0x100 * lane));
+                }
+                println!("[av3] p{ps} DBYTE {db} {name}: {v:04x?}");
             }
-            println!("[av3] DBYTE {db} {name}: {v:04x?}");
         }
     }
     w16(PSTATE, pstate);

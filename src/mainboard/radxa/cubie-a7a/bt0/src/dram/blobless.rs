@@ -241,6 +241,84 @@ fn wck_level(p: &mut Para) {
     }
     let bad = wl::end(&mut Bt0Hw, &saved);
     println!("[dram] WL: lane maps restored, mismatch mask {bad:x}");
+    if b.failure.is_none() {
+        read_enable();
+    } else {
+        println!("[dram] RD: skipped, WL incomplete");
+    }
+}
+
+#[cfg(not(feature = "wck-alias-probe"))]
+static mut RD_BLOCK: cubie_a7a_dram::rd::RdBlock = cubie_a7a_dram::rd::RdBlock::empty(
+    cubie_a7a_dram::phy::wcklevel::Channel::A,
+    cubie_a7a_dram::phy::wcklevel::Rank::R0,
+);
+
+/// m13: read enable measured on every channel and rank (crate module `rd`):
+/// the counter sweep (reference TrainingParam) and the RxEnDly sweep
+/// (TrainingParam 0) with all-lane DTSM counts, the PHY's fine search as
+/// the cross-check, the saved RxEnDly restored. Printed per block.
+#[cfg(not(feature = "wck-alias-probe"))]
+fn read_enable() {
+    use cubie_a7a_dram::phy::wcklevel::{Channel, Rank};
+    use cubie_a7a_dram::rd::{self, Sweep};
+    use cubie_a7a_dram::wl;
+    println!(
+        "[dram] RD: read enable, sweeps {} points step {} (T: TrainingCntr, param {:x}; R: RxEnDly, param 0), fine offsets {:?}",
+        rd::POINTS, rd::STEP, rd::PARAM_REFERENCE, rd::FINE_OFFSETS
+    );
+    // SAFETY: bt0 is single-threaded and nothing else refers to it.
+    let b = unsafe { &mut *core::ptr::addr_of_mut!(RD_BLOCK) };
+    let mut prev = None;
+    for &(ch, rank) in wl::BLOCKS.iter() {
+        let c = if ch == Channel::A { "A" } else { "B" };
+        let r = if rank == Rank::R0 { 0 } else { 1 };
+        b.channel = ch;
+        b.rank = rank;
+        rd::measure_block(&mut Bt0Hw, b, prev);
+        prev = Some(rank);
+        println!(
+            "[dram] RD ch {c} rank {r}: {} launches, {} writes, max {} us, {} us, failure {:?}; RxEnDly saved {:04x?} final {:04x?}; TrainingParam saved {:x?} final {:x?}",
+            b.launches, b.writes, b.max_launch_us, b.elapsed_us, b.failure, b.saved_rx_en, b.final_rx_en, b.saved_param, b.final_param
+        );
+        for (name, s) in [("T", &b.t), ("R", &b.r)] {
+            let s: &Sweep = s;
+            for p in 0..s.points as usize {
+                crate::recovery::kick();
+                println!(
+                    "[dram] RD ch {c} rank {r} {name} p {p} d {}: cmp {} {} err {:x?} {:x?}",
+                    p as u16 * rd::STEP,
+                    s.cmp[p][0][0],
+                    s.cmp[p][1][0],
+                    s.err[p][0],
+                    s.err[p][1]
+                );
+            }
+            for i in 0..2 {
+                crate::recovery::kick();
+                println!(
+                    "[dram] RD ch {c} rank {r} {name} byte {i}: param {:x} mode {:?} curve {:?} window {:?} fail-to-pass {:?} pass-to-fail {:?}",
+                    s.param[i], s.mode[i], s.curve[i], s.window[i],
+                    s.fail_to_pass[i].map(|(d, v)| (v, d.delay)),
+                    s.pass_to_fail[i].map(|(d, v)| (v, d.delay))
+                );
+            }
+        }
+        for f in b.fine.iter() {
+            println!(
+                "[dram] RD ch {c} rank {r} fine from {:04x}: after {:04x?} -> {:?}",
+                f.start, f.after, f.delay
+            );
+        }
+        println!(
+            "[dram] RD ch {c} rank {r}: fine searches {:?}",
+            b.fine_agree
+        );
+        if b.failure.is_some() {
+            break;
+        }
+    }
+    println!("[dram] RD: done");
 }
 
 /// Probe the PHY with `para`, print the result and stop.

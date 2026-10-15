@@ -15,6 +15,7 @@ pub mod para;
 pub mod phy;
 pub mod post;
 pub mod power;
+pub mod rd;
 pub mod sets;
 pub mod size;
 pub mod timing;
