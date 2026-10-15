@@ -123,9 +123,11 @@ static mut WL_BLOCK: cubie_a7a_dram::wl::WlBlock = cubie_a7a_dram::wl::WlBlock::
 #[cfg(not(feature = "wck-alias-probe"))]
 static mut WL_SWEEP: cubie_a7a_dram::wl::WlSweep = cubie_a7a_dram::wl::WlSweep::EMPTY;
 
-/// WCK2CK leveling on every channel and rank (crate module `wl`): our sweep
-/// of the base TxWckDly CSRs with real DTSM feedback, DTSM controls and
-/// TrainingCntr convergence runs, printed per block. Printing kicks the boot
+/// WCK2CK leveling on every channel and rank (crate module `wl`): the PHY
+/// counter fixed point as the result, our sweep of the base TxWckDly CSRs
+/// with real DTSM feedback as the cross-check (TrainingParam 0, knob
+/// checks), DTSM controls and the convergence and framing runs, printed per
+/// block. Printing kicks the boot
 /// watchdog per line (each line is bounded; the launches kick it as well).
 #[cfg(not(feature = "wck-alias-probe"))]
 fn wck_level(p: &mut Para) {
@@ -133,7 +135,7 @@ fn wck_level(p: &mut Para) {
     use cubie_a7a_dram::wl::{self, SNAP_NAMES, WL_POINTS, WL_STEP};
     let bases = blobless::wl_mr18_bases(p, PROBE_PSTATE);
     let saved = wl::begin(&mut Bt0Hw);
-    println!("[dram] WL: lane maps {saved:x?} saved, identity set; sweep {WL_POINTS} points step {WL_STEP}, feedback lanes {:?}, convergence starts {:?}", wl::FEEDBACK_LANES, wl::CONVERGENCE_STARTS);
+    println!("[dram] WL: lane maps {saved:x?} saved, identity set; sweep {WL_POINTS} points step {WL_STEP}, feedback lanes {:?}, convergence starts {:?}, framing starts {:?}, knob {} launches at counter -/+ {}", wl::FEEDBACK_LANES, wl::CONVERGENCE_STARTS, wl::FRAME_STARTS, wl::KNOB_LAUNCHES, wl::KNOB_OFFSET);
     // SAFETY: bt0 is single-threaded and nothing else refers to these.
     let (b, sw) = unsafe {
         (
@@ -200,6 +202,11 @@ fn wck_level(p: &mut Para) {
                 "[dram] WL ch {c} rank {r} byte {i}: lanes {:x?}",
                 b.lanes_nz[i]
             );
+            let k = &b.knob[i];
+            println!(
+                "[dram] WL ch {c} rank {r} byte {i}: knob param {:x} mode {:?} curve {:?} two-point at {:?} err {:?} -> {:?}",
+                k.training_param, k.mode, k.curve, k.settings, k.err, k.two_point
+            );
             let d = &b.decision[i];
             println!(
                 "[dram] WL ch {c} rank {r} byte {i}: sweep cross-check {:?}, threshold {}, edges {:?} ({}), delay {:?}, counter on edge {}",
@@ -224,8 +231,8 @@ fn wck_level(p: &mut Para) {
             crate::recovery::kick();
             let (c, r, i) = tag(i);
             println!(
-                "[dram] WL ch {c} rank {r} byte {i}: result (PHY counter fixed point) {:?}, final {:04x}",
-                b.counter[i], b.final_delay[i]
+                "[dram] WL ch {c} rank {r} byte {i}: result (PHY counter fixed point) {:?}, limits {:?}, final {:04x}; framing (all starts) {:?}",
+                b.counter[i], b.knob[i].limits, b.final_delay[i], b.frame[i]
             );
         }
         if b.failure.is_some() {

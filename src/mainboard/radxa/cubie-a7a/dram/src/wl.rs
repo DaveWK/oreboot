@@ -42,12 +42,32 @@
 //! - TrainingCntr convergence runs from [`CONVERGENCE_STARTS`], written per
 //!   DBYTE and lane at the base addresses, separate feedback from dither;
 //! - the launch row base follows the live ACSMLastAddr (witness fix).
+//!
+//! m12 (after m11: DTSM live, the counter converges, our sweep flat):
+//! - TrainingParam is set to 0 right before the measurement clocks start,
+//!   as the reference does ([`wcklevel::measurement_training_param`]); the
+//!   calibration leaves it at `0x300`, where the training counter, not
+//!   TxWckDly, sets the delay in use. Its per-DBYTE readback is a mode check;
+//! - knob-response checks (`dram_train::sanity`) before the sweep
+//!   cross-check decides: TrainingParam mode, a saturated curve, and a
+//!   two-point test of [`KNOB_LAUNCHES`] launches each at the first counter
+//!   value -/+ [`KNOB_OFFSET`]. A failed check is reported instead of a
+//!   sweep decision; the WL result is not gated by them (DECISIONS), except
+//!   that a counter value at a range limit is not applied;
+//! - framing check: four more counter searches from [`FRAME_STARTS`], one
+//!   CK away at the 2:1 leveling ratio and at the 4:1 operating ratio. They
+//!   are reported (does a start one CK away find another edge?), not part of
+//!   the result;
+//! - the leveling programs keep MR18 OP[7] = 1 (WCK:CK 2:1) while leveling
+//!   and the cleanup restores the base (4:1); host controls check the MR18
+//!   values the programs carry.
 
 use crate::hw::Hw;
 use crate::phy::coldinit::Row;
 use crate::phy::wcklevel::{self, Channel, Mr18Base, Rank, SavedControls, Step, MAX_WCK_DELAY};
 use crate::phy::{csr, csr_access, MICRO_RESET};
 use dram_train::launch::LaunchError;
+use dram_train::sanity::{self, SanityError};
 
 const ACSM_MEM: u32 = 0x41000;
 const ACSM_START: u32 = 0x20022;
@@ -83,6 +103,10 @@ const fn dtsm_err_count(db: u32, lane: u32) -> u32 {
 }
 const fn dtsm_cmp_count(db: u32, lane: u32) -> u32 {
     0x100b6 + 0x1000 * db + 0x100 * lane
+}
+/// TrainingParam of DBYTE `db` (`0x1n0a7`).
+const fn training_param_csr(db: u32) -> u32 {
+    0x100a7 + 0x1000 * db
 }
 /// Dq0LnSel..Dq7LnSel of DBYTE `db`.
 const fn dq_ln_sel(db: u32, dq: u32) -> u32 {
@@ -267,8 +291,68 @@ pub const LANES: usize = 9;
 pub const FEEDBACK_LANES: [usize; 2] = [0, 4];
 
 /// TrainingCntr start values (linear UI/64) of the convergence runs, besides
-/// the reference start 512 (`0x2000`): one coarse UI below and above.
+/// the reference start 512 (`0x2000`): one coarse UI below and above. These
+/// three starts decide the WL result.
 pub const CONVERGENCE_STARTS: [u16; 2] = [448, 576];
+
+/// Framing-check starts (reported, not part of the result): one CK from 512
+/// at the 2:1 leveling ratio (1 CK = 2 tWCK = 4 UI = 256 UI/64) and at the
+/// 4:1 operating ratio (8 UI = 512). A start that converges elsewhere shows
+/// another edge one CK away.
+pub const FRAME_STARTS: [u16; 4] = [256, 768, 0, 1024];
+
+/// All convergence runs of a block, in order: the result starts, then the
+/// framing starts.
+pub const RUNS: usize = CONVERGENCE_STARTS.len() + FRAME_STARTS.len();
+pub const fn run_start(k: usize) -> u16 {
+    if k < CONVERGENCE_STARTS.len() {
+        CONVERGENCE_STARTS[k]
+    } else {
+        FRAME_STARTS[k - CONVERGENCE_STARTS.len()]
+    }
+}
+
+/// Knob two-point test: independent measurement launches at each of the two
+/// settings, the first counter value minus and plus [`KNOB_OFFSET`] (one UI:
+/// before and after a fail-to-pass edge at the counter).
+pub const KNOB_LAUNCHES: usize = 4;
+pub const KNOB_OFFSET: u16 = 64;
+
+/// The knob-response checks of one DBYTE (`dram_train::sanity`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Knob {
+    /// TrainingParam (`0x1n0a7`) read back after the write of 0.
+    pub training_param: u16,
+    pub mode: Result<(), SanityError>,
+    /// The sweep curve changes at all.
+    pub curve: Result<(), SanityError>,
+    /// Settings of the two-point test (UI/64) and the feedback-lane error
+    /// sum of each launch there; None without a first counter value.
+    pub settings: Option<[u16; 2]>,
+    pub err: [[u16; KNOB_LAUNCHES]; 2],
+    pub two_point: Option<Result<(), SanityError>>,
+    /// The agreed counter value against the range limits.
+    pub limits: Option<Result<(), SanityError>>,
+}
+
+impl Knob {
+    pub const EMPTY: Knob = Knob {
+        training_param: 0,
+        mode: Ok(()),
+        curve: Ok(()),
+        settings: None,
+        err: [[0; KNOB_LAUNCHES]; 2],
+        two_point: None,
+        limits: None,
+    };
+    /// The first failed check that voids the sweep cross-check.
+    pub fn sweep_error(&self) -> Option<SanityError> {
+        self.mode
+            .err()
+            .or(self.curve.err())
+            .or(self.two_point.and_then(|r| r.err()))
+    }
+}
 
 /// One DBYTE's DTSM state (EIC7700X TRM Part 2 register names; the TRM marks
 /// the fields reserved for PHY firmware, so these are observations only).
@@ -412,6 +496,11 @@ pub struct WlBlock {
     /// The counter's values from all starts and both feedback lanes, judged
     /// by `dram_train::edge::converge`; `agreed` is the WL result.
     pub counter: [Option<edge::Convergence>; 2],
+    /// The same over the result and the framing starts (all agree: no other
+    /// edge within one CK).
+    pub frame: [Option<edge::Convergence>; 2],
+    /// Knob-response checks per DBYTE.
+    pub knob: [Knob; 2],
     /// TxWckDly read back after writing the result (the agreed counter
     /// value, or the saved value when the starts disagree).
     pub final_delay: [u16; 2],
@@ -421,9 +510,9 @@ pub struct WlBlock {
     pub max_polls: u32,
     pub elapsed_us: u32,
     pub failure: Option<WlFailure>,
-    /// TrainingCntr convergence runs ([`CONVERGENCE_STARTS`]), after the
-    /// sweep and its cleanup.
-    pub convergence: [Convergence; 2],
+    /// TrainingCntr convergence runs ([`CONVERGENCE_STARTS`], then
+    /// [`FRAME_STARTS`]), after the sweep and its cleanup.
+    pub convergence: [Convergence; RUNS],
 }
 
 impl WlBlock {
@@ -444,6 +533,8 @@ impl WlBlock {
             decision: [Decision::EMPTY; 2],
             verdict: [None; 2],
             counter: [None; 2],
+            frame: [None; 2],
+            knob: [Knob::EMPTY; 2],
             final_delay: [0; 2],
             launches: 0,
             writes: 0,
@@ -451,7 +542,7 @@ impl WlBlock {
             max_polls: 0,
             elapsed_us: 0,
             failure: None,
-            convergence: [Convergence::EMPTY; 2],
+            convergence: [Convergence::EMPTY; RUNS],
         }
     }
 }
@@ -532,6 +623,9 @@ fn snap_pair<H: Hw>(ex: &mut WlExec<'_, H>, dbs: [u32; 2]) -> [DtsmSnap; 2] {
 struct Saved {
     dbyte: [[u16; 5]; 4],
     other: [u16; 9],
+    /// TrainingParam (`0x1n0a7`) per DBYTE: the entry and the m12 measurement
+    /// change it, the reference cleanup does not restore it.
+    training_param: [u16; 4],
 }
 
 impl Saved {
@@ -546,7 +640,15 @@ impl Saved {
         for (v, &c) in other.iter_mut().zip(OTHER_SAVED.iter()) {
             *v = ex.read(c);
         }
-        Saved { dbyte, other }
+        let mut training_param = [0u16; 4];
+        for (db, v) in training_param.iter_mut().enumerate() {
+            *v = ex.read(training_param_csr(db as u32));
+        }
+        Saved {
+            dbyte,
+            other,
+            training_param,
+        }
     }
 
     fn reference(&self) -> SavedControls {
@@ -568,6 +670,9 @@ impl Saved {
         for (&v, &c) in self.other.iter().zip(OTHER_SAVED.iter()) {
             ex.write(c, v);
         }
+        for (db, &v) in self.training_param.iter().enumerate() {
+            ex.write(training_param_csr(db as u32), v);
+        }
     }
 }
 
@@ -575,12 +680,14 @@ impl Saved {
 /// after CA training succeeded, between [`begin`] and [`end`]. Stops at the
 /// first launch failure, leaving the PHY for the boot watchdog/recovery.
 ///
-/// Order (m11): save; reference entry; PHY counter search; three DTSM
-/// controls at the saved delay (reference first measurement, a second launch
-/// without clear, per-DBYTE base enables of all lanes); our sweep with every
-/// lane's compare and error counts; decision on the feedback lanes; cleanup
-/// and exact restores; then one TrainingCntr convergence run per
-/// [`CONVERGENCE_STARTS`] value, each with its own cleanup and restores.
+/// Order (m12): save; reference entry; PHY counter search; TrainingParam 0
+/// and its mode check; three DTSM controls at the saved delay (reference
+/// first measurement, a second launch without clear, per-DBYTE base enables
+/// of all lanes); our sweep with every lane's compare and error counts; the
+/// knob two-point launches; knob checks and the sweep cross-check on the
+/// feedback lanes; cleanup and exact restores; then one TrainingCntr
+/// convergence run per [`CONVERGENCE_STARTS`] and [`FRAME_STARTS`] value,
+/// each with its own cleanup and restores; the result.
 pub fn level_block<H: Hw>(hw: &mut H, mr18: Mr18Base, out: &mut WlBlock, sweep: &mut WlSweep) {
     let (ch, rank) = (out.channel, out.rank);
     *out = WlBlock::empty(ch, rank);
@@ -615,7 +722,15 @@ pub fn level_block<H: Hw>(hw: &mut H, mr18: Mr18Base, out: &mut WlBlock, sweep: 
         out.after_prefix_delay[i] = ex.read(tx_wck_dly(db, rank));
     }
 
-    // DTSM controls at the saved delay, then our sweep, base CSRs only.
+    // TrainingParam 0 before the clocks start (reference a07 launch 4180),
+    // checked per DBYTE; then DTSM controls at the saved delay and our sweep,
+    // base CSRs only.
+    wcklevel::measurement_training_param(&mut |s| ex.step(s));
+    for (i, &db) in dbs.iter().enumerate() {
+        let k = &mut out.knob[i];
+        k.training_param = ex.read(training_param_csr(db));
+        k.mode = sanity::mode("TrainingParam", k.training_param as u32, 0xffff, 0);
+    }
     wcklevel::measurement_clocks_start(ch, &mut |s| ex.step(s));
     for (i, &db) in dbs.iter().enumerate() {
         ex.write(tx_wck_dly(db, rank), out.saved_delay[i]);
@@ -658,6 +773,39 @@ pub fn level_block<H: Hw>(hw: &mut H, mr18: Mr18Base, out: &mut WlBlock, sweep: 
         }
         out.points += 1;
     }
+    // Knob two-point test around the first counter value (lanes as in the
+    // sweep): independent launches at -/+ KNOB_OFFSET.
+    let settings = |c: Option<u16>| {
+        c.map(|c| {
+            [
+                c.saturating_sub(KNOB_OFFSET),
+                (c + KNOB_OFFSET).min(MAX_WCK_DELAY),
+            ]
+        })
+    };
+    for i in 0..2 {
+        out.knob[i].settings = settings(out.counter_delay[i]);
+    }
+    if out.knob.iter().any(|k| k.settings.is_some()) {
+        for side in 0..2 {
+            for n in 0..KNOB_LAUNCHES {
+                if ex.failure.is_some() {
+                    break;
+                }
+                for (i, &db) in dbs.iter().enumerate() {
+                    let d = out.knob[i].settings.map_or(out.saved_delay[i], |s| s[side]);
+                    ex.write(tx_wck_dly(db, rank), d);
+                    wcklevel::clear_counts_dbyte(db, &mut |s| ex.step(s));
+                }
+                wcklevel::measurement_once(rank, &mut |s| ex.step(s));
+                for (i, &db) in dbs.iter().enumerate() {
+                    out.knob[i].err[side][n] = FEEDBACK_LANES.iter().fold(0u16, |a, &l| {
+                        a.saturating_add(ex.read(dtsm_err_count(db, l as u32)))
+                    });
+                }
+            }
+        }
+    }
     // Back to the lane enables the reference measurement left (control 1).
     for (i, &db) in dbs.iter().enumerate() {
         for lane in 0..LANES {
@@ -669,10 +817,20 @@ pub fn level_block<H: Hw>(hw: &mut H, mr18: Mr18Base, out: &mut WlBlock, sweep: 
     }
     wcklevel::measurement_clocks_stop(ch, &mut |s| ex.step(s));
 
-    // The sweep cross-check (reported, not applied); the saved delay back.
+    // Knob checks, then the sweep cross-check (reported, not applied; no
+    // decision when a check failed); the saved delay back.
     let n = out.points as usize;
+    let knob_done = ex.failure.is_none();
     for (i, &db) in dbs.iter().enumerate() {
+        let k = &mut out.knob[i];
         if n == WL_POINTS {
+            k.curve = sanity::curve(&out.err[i][..n]);
+        }
+        if knob_done && k.settings.is_some() {
+            let pass = |side: usize| k.err[side].map(|e| e == 0);
+            k.two_point = Some(sanity::two_point(&pass(0), &pass(1)));
+        }
+        if n == WL_POINTS && k.sweep_error().is_none() {
             let (d, v) = decide(&out.err[i][..n], out.counter_delay[i]);
             out.decision[i] = d;
             out.verdict[i] = Some(v);
@@ -681,11 +839,13 @@ pub fn level_block<H: Hw>(hw: &mut H, mr18: Mr18Base, out: &mut WlBlock, sweep: 
     }
     saved.cleanup(&mut ex, rank, mr18);
 
-    // TrainingCntr convergence: same entry and search from other starts.
-    for (k, &start) in CONVERGENCE_STARTS.iter().enumerate() {
+    // TrainingCntr convergence: same entry and search from other starts
+    // (the result starts, then the framing starts).
+    for k in 0..RUNS {
         if ex.failure.is_some() {
             break;
         }
+        let start = run_start(k);
         let first = ex.launches;
         let c = &mut out.convergence[k];
         c.start = start;
@@ -717,11 +877,14 @@ pub fn level_block<H: Hw>(hw: &mut H, mr18: Mr18Base, out: &mut WlBlock, sweep: 
         c.failure = ex.failure;
     }
 
-    // The WL result: the counter fixed point when every start and both
-    // feedback lanes agree; otherwise the saved delay stays.
+    // The WL result: the counter fixed point when the result starts and
+    // both feedback lanes agree, and it is not at a range limit; otherwise
+    // the saved delay stays. The framing starts are judged the same way and
+    // only reported.
     if ex.failure.is_none() {
+        const RESULT_RUNS: usize = 2 * (1 + CONVERGENCE_STARTS.len());
         for (i, &db) in dbs.iter().enumerate() {
-            let mut runs = [None; 2 * (1 + CONVERGENCE_STARTS.len())];
+            let mut runs = [None; 2 * (1 + RUNS)];
             for (j, &l) in FEEDBACK_LANES.iter().enumerate() {
                 runs[j] = wcklevel::TxWckDelay::from_training_counter(out.training_cntr[i][l])
                     .ok()
@@ -730,10 +893,14 @@ pub fn level_block<H: Hw>(hw: &mut H, mr18: Mr18Base, out: &mut WlBlock, sweep: 
                     runs[2 * (k + 1) + j] = c.result[i][j];
                 }
             }
-            out.counter[i] = edge::converge(&runs, COUNTER_TOLERANCE);
-            let v = out.counter[i]
-                .and_then(|c| c.agreed)
-                .unwrap_or(out.saved_delay[i]);
+            out.counter[i] = edge::converge(&runs[..RESULT_RUNS], COUNTER_TOLERANCE);
+            out.frame[i] = edge::converge(&runs, COUNTER_TOLERANCE);
+            let agreed = out.counter[i].and_then(|c| c.agreed);
+            out.knob[i].limits = agreed.map(|v| sanity::limits(v as u32, 0, MAX_WCK_DELAY as u32));
+            let v = match (agreed, out.knob[i].limits) {
+                (Some(v), Some(Ok(()))) => v,
+                _ => out.saved_delay[i],
+            };
             ex.write(tx_wck_dly(db, rank), v);
             out.final_delay[i] = ex.read(tx_wck_dly(db, rank));
         }

@@ -13,6 +13,10 @@ dramlib = []
 blobless = []
 # One held-reset alias observation; bypass all ACSM/DevInit/CBT probes.
 wck-alias-probe = ["blobless"]
+# AV.3 measurement boot: the vendor library trains, bt0 prints the trained
+# per-DBYTE/lane PHY delays of pstate 0 (read-only, named CSRs) and halts
+# into the vendor recovery. Comparison data only; never shipped.
+av3-dump = ["dramlib"]
 
 [dependencies]
 bootlog = { path = "../../../../lib/bootlog" }

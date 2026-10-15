@@ -282,6 +282,15 @@ pub fn calibration_loops(
     });
 }
 
+/// TrainingParam (`0x1f0a7`, the DBYTE broadcast of `0x1n0a7`) to 0, as the
+/// reference does right before the measurement clocks start (a07 launch
+/// 4180). The calibration leaves it at `0x300`, where the PHY's training
+/// counter, not TxWckDly, sets the delay in use (m11: a flat sweep with
+/// `param 300` in every snapshot).
+pub fn measurement_training_param(out: &mut impl FnMut(Step<'_>)) {
+    out(Step::Write(0x1f0a7, 0));
+}
+
 /// Start the observed verification clocks after the caller has supplied valid
 /// per-DBYTE delays. The finite eight-row transition is followed by full-speed
 /// ACSM with the observed WCK static pulse timing. No feedback is synthesized.
