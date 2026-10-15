@@ -1,0 +1,49 @@
+[package]
+name = "spacemit-k1x-bt0"
+version = "0.1.0"
+authors = ["oreboot Authors"]
+edition = "2021"
+
+[dependencies]
+embedded-hal = "=1.0.0"
+embedded-hal-nb = "=1.0.0"
+nb = "1"
+riscv = "0.10.1"
+spin = "0.9"
+fdt = "0.1.5"
+
+log = { path = "../../../../lib/log" }
+util = { path = "../../../../lib/util" }
+# ore-edk2-boot crates (patches/ore-edk2-boot/pin.env; `make crates` links them)
+dram-train = { path = "../../../../lib/dram-train" }
+jedec-lpddr = { path = "../../../../lib/jedec-lpddr" }
+memtest = { path = "../../../../lib/memtest" }
+startup = { path = "../../../../lib/startup" }
+cache = { path = "../../../../lib/cache" }
+fdt-checked = { path = "../../../../lib/fdt-checked" }
+sha256 = { path = "../../../../lib/sha256" }
+sparse = { path = "../../../../lib/sparse" }
+storage = { path = "../../../../lib/storage" }
+fit = { path = "../../../../lib/fit" }
+opensbi-handoff = { path = "../../../../lib/opensbi-handoff" }
+tlv-eeprom = { path = "../../../../lib/tlv-eeprom" }
+regio = { path = "../../../../lib/regio" }
+uart-16550 = { path = "../../../../lib/uart-16550" }
+sdhci = { path = "../../../../lib/sdhci" }
+ci-udc = { path = "../../../../lib/ci-udc", features = ["fastboot"] }
+usb-device = { path = "../../../../lib/usb-device" }
+fastboot = { path = "../../../../lib/fastboot" }
+
+[features]
+# Our own training is the only training in this tree (BLOB-03 dropped).
+default = ["own-training"]
+# Our own DRAM training (the only training in this tree).
+own-training = []
+# Print the same per-point training report after either training (windows,
+# Vref, MR14 read-back, cycles), for side-by-side comparison.
+train-report = []
+# Also test all DRAM after the last training point.
+train-memtest = ["train-report"]
+# Our training plus the engine characterisation, report and full memory test
+# (hardware probe).
+train-probe = ["own-training", "train-report", "train-memtest"]

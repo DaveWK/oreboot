@@ -9,6 +9,7 @@ mod target;
 mod util;
 
 mod qemu;
+mod spacemit;
 mod starfive;
 mod sunxi;
 
@@ -38,6 +39,20 @@ enum Commands {
     Asm,
     /// Debug code using gdb, as supported by the platform
     Gdb,
+    /// Pack a local payload with the published K1 development keys; no device IO
+    K1xPack {
+        input: std::path::PathBuf,
+        output: std::path::PathBuf,
+    },
+    /// Derive or check the intentionally public K1 development fixtures
+    K1xDevKeys {
+        /// Compare the derived keys with the committed ones instead
+        #[clap(long)]
+        check: bool,
+        /// Alternate directory for disposable public development-key checks
+        #[clap(long)]
+        directory: Option<std::path::PathBuf>,
+    },
 }
 
 #[derive(Clone)]
@@ -116,6 +131,20 @@ fn main() {
         .filter_level(args.verbose.log_level_filter())
         .init();
     info!("=== oreboot build system ===");
+    match &args.command {
+        Commands::K1xDevKeys { check, directory } => {
+            spacemit::k1x_dev_keys(*check, directory.clone());
+            return;
+        }
+        Commands::K1xPack { input, output } => {
+            if let Err(e) = spacemit::k1x_pack(input, output) {
+                error!("K1 development pack failed: {e}");
+                process::exit(1);
+            }
+            return;
+        }
+        _ => {}
+    }
     let cur_path = env::current_dir().unwrap();
     let target = if let Some(target) = target::parse_target(
         &cur_path,
