@@ -8,3 +8,6 @@ description = "LPDDR5 DRAM init for the Allwinner A733 (Radxa Cubie A7A), withou
 [dependencies]
 dram-train = { path = "../../../../lib/dram-train" }
 jedec-lpddr = { path = "../../../../lib/jedec-lpddr" }
+dram-ctrl = { path = "../../../../lib/dram-ctrl" }
+dwc-ddrctl = { path = "../../../../lib/dwc-ddrctl" }
+memtest = { path = "../../../../lib/memtest" }

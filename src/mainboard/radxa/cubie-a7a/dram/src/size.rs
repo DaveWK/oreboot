@@ -64,42 +64,24 @@ pub fn size_mib(p: &Para) -> u32 {
 const DRAM_BASE: usize = 0x4000_0000;
 /// Existing boot smoke-test footprint per region. This bounds software work;
 /// it is not full-RAM coverage or an independently measured timing margin.
-pub const MAX_QUICK_WORDS: usize = 4096;
+pub use memtest::MAX_QUICK_WORDS;
 
-/// Write `words` incrementing patterns at the start of DRAM and at its
-/// middle (`mib / 2`), read both back. Catches a dead or swapped channel,
-/// rank or high address line, not marginal timing.
+/// The boot smoke check (`memtest::quick`) at the A733's DRAM base: `words`
+/// incrementing patterns at the start of DRAM and at its middle (`mib / 2`),
+/// both read back. Catches a dead or swapped channel, rank or high address
+/// line, not marginal timing. `mib` 2..=4096 (the AArch32 boot consumer's
+/// addresses stay 32-bit), `words` 1..=[`MAX_QUICK_WORDS`].
 pub fn quick_test<H: Hw>(hw: &mut H, mib: u32, words: usize) -> Result<(), Error> {
-    // The AArch32 boot consumer checks at most the first 4096 MiB, using two
-    // disjoint <=16KiB regions at base and midpoint. Reject empty checks,
-    // overlapping/invalid regions and oversized work before the first access.
-    // These limits keep every address representable on the actual 32-bit CPU.
-    if !(2..=4096).contains(&mib) || words == 0 || words > MAX_QUICK_WORDS {
-        return Err(Error::Config(
-            "quick-test size/word count outside bounded boot footprint",
-        ));
-    }
-    let half = ((mib / 2) as usize) << 20;
-    for i in 0..words {
-        hw.write32(DRAM_BASE + 4 * i, 0x0123_4567u32.wrapping_add(i as u32));
-        hw.write32(
-            DRAM_BASE + half + 4 * i,
-            0xfedc_ba98u32.wrapping_add(i as u32),
-        );
-    }
-    for i in 0..words {
-        for (base, pat) in [(DRAM_BASE + half, 0xfedc_ba98u32), (DRAM_BASE, 0x0123_4567)] {
-            let addr = base + 4 * i;
-            let expected = pat.wrapping_add(i as u32);
-            let got = hw.read32(addr);
-            if got != expected {
-                return Err(Error::Test {
-                    addr,
-                    expected,
-                    got,
-                });
-            }
-        }
-    }
-    Ok(())
+    memtest::quick(hw, DRAM_BASE, mib, words).map_err(|e| match e {
+        memtest::QuickError::Config(m) => Error::Config(m),
+        memtest::QuickError::Mismatch {
+            addr,
+            expected,
+            got,
+        } => Error::Test {
+            addr,
+            expected,
+            got,
+        },
+    })
 }

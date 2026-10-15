@@ -7,8 +7,10 @@
 //! time below is in nanoseconds and rounded up to whole controller cycles.
 
 use crate::ctrl::{ddrc, freq, DDRC_D00, DFIMISC};
-use crate::hw::Hw;
+use crate::hw::{Error, Hw};
 use crate::para::Para;
+use dram_ctrl::values::{Name, Values};
+use dwc_ddrctl::timing::dramset1tmg;
 
 /// Nanoseconds to controller cycles at `mhz`, rounded up.
 pub use jedec_lpddr::timing::ns_to_ck as ns;
@@ -20,16 +22,17 @@ use jedec_lpddr::lp5::timing as lp5;
 /// Write the timing registers of every frequency set of channel `ch`.
 /// Also fixes up the mode-register words of the parameter set the PHY
 /// firmware trains with (MR1 [7], MR2 [7]/[3]) and returns the read latency
-/// it chose (13 nCK, 14 with tpr10[31]).
-pub fn set_channel_timing<H: Hw>(hw: &mut H, p: &mut Para, ch: usize) -> u32 {
+/// it chose (13 nCK, 14 with tpr10[31]). A DRAMSET1TMG value that does not
+/// fit its field is an error (never truncated).
+pub fn set_channel_timing<H: Hw>(hw: &mut H, p: &mut Para, ch: usize) -> Result<u32, Error> {
     let multi = p.tpr13() & 5 == 5;
     let mut rl = 13;
     for ps in (0..=if multi { 3 } else { 0 }).rev() {
         let mhz = p.clk() / (((p.tpr2() >> (8 * ps)) & 0x1f) + 1);
-        rl = set_freq_timing(hw, p, ch, ps, mhz);
+        rl = set_freq_timing(hw, p, ch, ps, mhz)?;
         hw.udelay(20);
     }
-    rl
+    Ok(rl)
 }
 
 /// Mode register words of the parameter set as the timing step leaves them
@@ -39,7 +42,13 @@ pub fn mr_fixup(p: &mut Para) {
     p.w[10] |= 0x88; // MR2
 }
 
-fn set_freq_timing<H: Hw>(hw: &mut H, p: &mut Para, ch: usize, ps: usize, mhz: u32) -> u32 {
+fn set_freq_timing<H: Hw>(
+    hw: &mut H,
+    p: &mut Para,
+    ch: usize,
+    ps: usize,
+    mhz: u32,
+) -> Result<u32, Error> {
     use lp5::*;
     let t = |n| ns(n, mhz);
     let long_rl = p.tpr10() & (1 << 31) != 0;
@@ -97,12 +106,33 @@ fn set_freq_timing<H: Hw>(hw: &mut H, p: &mut Para, ch: usize, ps: usize, mhz: u
     let rd_tphy = cmd_q + 11;
     let wr_tphy = cmd_q + 2 + rd2wr;
 
+    // DRAMSET1TMG0/1/2/4 through the DesignWare packing table (write
+    // latency 7, tCCD 4); TMG3 and the rest are A733 values.
+    let mut v = Values::default();
+    v.set(Name::Ras, ras)
+        .set(Name::RasMax, ras_max)
+        .set(Name::Faw, faw)
+        .set(Name::Wr2Pre, wr2pre)
+        .set(Name::Rc, rc)
+        .set(Name::Rd2Pre, rd2pre)
+        .set(Name::Xp, xp)
+        .set(Name::Wr2Rd, wr2rd)
+        .set(Name::Rd2Wr, rd2wr)
+        .set(Name::ReadLatency, rl)
+        .set(Name::WriteLatency, 7)
+        .set(Name::Rp, rp)
+        .set(Name::Rrd, rrd)
+        .set(Name::Ccd, 4)
+        .set(Name::Rcd, rcd);
+    let tmg = dram_ctrl::pack::pack(&dram_ctrl::dwc::DRAMSET1TMG, &v)
+        .map_err(|_| Error::Config("DRAMSET1TMG value outside its field"))?;
+    let tmg = |n| tmg.get(dramset1tmg(n)).unwrap_or(0);
     let f = |off| freq(ch, ps, off);
-    hw.write32(f(0x00), ras | (ras_max << 8) | (faw << 16) | (wr2pre << 24));
-    hw.write32(f(0x04), rc | (rd2pre << 8) | (xp << 16));
-    hw.write32(f(0x08), wr2rd | (rd2wr << 8) | (rl << 16) | (7 << 24));
+    hw.write32(f(dramset1tmg(0)), tmg(0));
+    hw.write32(f(dramset1tmg(1)), tmg(1));
+    hw.write32(f(dramset1tmg(2)), tmg(2));
     hw.write32(f(0x0c), mrd | (wr2mr << 8) | (10 << 16));
-    hw.write32(f(0x10), rp | (rrd << 8) | (4 << 16) | (rcd << 24));
+    hw.write32(f(dramset1tmg(4)), tmg(4));
     hw.write32(f(0x14), esck | (ccdmw << 8) | (rrd_min3 << 16) | (2 << 24));
     hw.write32(f(0x18), xp + 2);
     hw.write32(f(0x1c), cke);
@@ -164,5 +194,5 @@ fn set_freq_timing<H: Hw>(hw: &mut H, p: &mut Para, ch: usize, ps: usize, mhz: u
     hw.write32(f(0xb04), 0x1024_100a);
     hw.write32(f(0xb08), 0x33);
     hw.write32(f(0xb80), 0x17_0000);
-    rl
+    Ok(rl)
 }

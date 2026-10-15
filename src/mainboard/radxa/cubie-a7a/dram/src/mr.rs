@@ -1,10 +1,10 @@
 //! LPDDR5 mode register access through the controller (MRCTRL0/1, MRSTAT),
-//! the shared DesignWare path (`dram_train::dwc_mr`) on the A733's two
+//! the shared DesignWare path (`dwc_ddrctl::mr`) on the A733's two
 //! controllers.
 
 use crate::ctrl::{ddrc, MRCTRL0, MRCTRL1, MRSTAT};
 use crate::hw::{Error, Hw};
-use dram_train::dwc_mr::{self, Ctrl, MrError};
+use dwc_ddrctl::mr::{self as dwc_mr, Ctrl, MrError};
 
 /// The A733's controllers: channel registers at `ddrc`, MRR data in
 /// MCTL_COM +0x2c [15:8] for channel 0, +0x40 [15:8] for channel 1.

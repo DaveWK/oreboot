@@ -2,92 +2,29 @@
 //! results folded into the pstate 0 timings, the AXI/NSI port set-up and the
 //! training-result save.
 
-use crate::ctrl::{
-    ddrc, freq, sw_done, DDRC_208, DDRC_B84, DDRC_B88, DFIMISC, DFISTAT, PWRCTL, STAT, SWCTL,
-    SWSTAT,
-};
+use crate::ctrl::{ddrc, sw_done, DDRC_208, DDRC_B84, DDRC_B88, DFIMISC, MAP, SWCTL, SWSTAT};
 use crate::hw::{wait, Error, Hw};
 use crate::para::Para;
 use crate::phy;
+use dwc_ddrctl::dfi::{self, Cdd, DfiError};
 
 const T: u64 = 100_000;
 
-/// DFI initialisation of all channels: start it, wait for the PHY to report
-/// dfi_init_complete, release the PHY's R_PRCM isolation, leave the
-/// controller's self-refresh and wait for normal operation.
+/// DFI initialisation of all channels (`dwc_ddrctl::dfi::dfi_init`): start
+/// it, wait for the PHY to report dfi_init_complete, release the PHY's
+/// R_PRCM isolation (+0x250 [0]), leave the controller's self-refresh and
+/// wait for normal operation.
 pub fn dfi_init<H: Hw>(hw: &mut H, channels: usize) -> Result<(), Error> {
-    if !(1..=2).contains(&channels) {
-        return Err(Error::Config(
-            "DFI channel count outside controller instances",
-        ));
-    }
-    for ch in 0..channels {
-        hw.write32(ddrc(ch, SWCTL), 0);
-    }
-    for ch in 0..channels {
-        hw.set32(ddrc(ch, DFIMISC), 0x1001);
-    }
-    for ch in 0..channels {
-        hw.set32(ddrc(ch, DFIMISC), crate::ctrl::DFI_INIT_START);
-    }
-    for ch in 0..channels {
-        hw.write32(ddrc(ch, SWCTL), 1);
-    }
-    for ch in 0..channels {
-        wait(hw, "SWSTAT.sw_done_ack", T, |hw| {
-            hw.read32(ddrc(ch, SWSTAT)) & 1 != 0
-        })?;
-    }
-    for ch in 0..channels {
-        wait(hw, "DFISTAT.dfi_init_complete", T, |hw| {
-            hw.read32(ddrc(ch, DFISTAT)) & 1 != 0
-        })?;
-    }
-    hw.udelay(50);
-    hw.set32(0x0701_0250, 1);
-    hw.udelay(2000);
-    for ch in 0..channels {
-        hw.write32(ddrc(ch, SWCTL), 0);
-    }
-    for ch in 0..channels {
-        hw.clr32(ddrc(ch, DFIMISC), crate::ctrl::DFI_INIT_START);
-    }
-    for ch in 0..channels {
-        hw.clr32(ddrc(ch, PWRCTL), 0x800);
-    }
-    for ch in 0..channels {
-        // STAT: selfref_type [5:4] back to 0, then operating_mode normal.
-        wait(hw, "STAT.selfref_type", T, |hw| {
-            hw.read32(ddrc(ch, STAT)) & 0x30 == 0
-        })?;
-        wait(hw, "STAT.operating_mode", T, |hw| {
-            hw.read32(ddrc(ch, STAT)) & 3 == 1
-        })?;
-    }
-    hw.udelay(50);
-    for ch in 0..channels {
-        hw.clr32(ddrc(ch, DFIMISC), crate::ctrl::DFI_INIT_COMPLETE_EN);
-    }
-    for ch in 0..channels {
-        hw.write32(ddrc(ch, SWCTL), 1);
-    }
-    for ch in 0..channels {
-        wait(hw, "SWSTAT.sw_done_ack", T, |hw| {
-            hw.read32(ddrc(ch, SWSTAT)) & 1 != 0
-        })?;
-    }
-    hw.udelay(2);
-    Ok(())
+    dfi::dfi_init(hw, &MAP, channels, 2, T, |hw| hw.set32(0x0701_0250, 1)).map_err(|e| match e {
+        DfiError::Config(m) => Error::Config(m),
+        DfiError::Timeout(m) => Error::Timeout(m),
+    })
 }
 
 /// Larger of the two bytes of the message-block halfword holding byte
 /// offsets `a` and `b`... (bytes of the training firmware's message block).
 fn mb_max<H: Hw>(hw: &mut H, a: usize, b: usize) -> u32 {
     phy::mb_byte(hw, a).max(phy::mb_byte(hw, b))
-}
-
-fn sat_add(field: u32, add: u32, max: u32) -> u32 {
-    (field + add).min(max)
 }
 
 /// Fold the trained critical delay differences (CDD) between ranks from the
@@ -97,12 +34,14 @@ pub fn timing_after_phy<H: Hw>(hw: &mut H, ch: usize) -> Result<(), Error> {
     phy::dmem_access(hw, true);
     // Read-to-read, write-to-write, read-to-write and write-to-read CDDs,
     // each the worst case over the rank/channel combinations.
-    let rr = mb_max(hw, 0x30, 0x31).max(mb_max(hw, 0x4b, 0x4c));
-    let rr_alt = mb_max(hw, 0x26, 0x27).max(mb_max(hw, 0x41, 0x42));
-    let ww = mb_max(hw, 0x29, 0x2a).max(mb_max(hw, 0x44, 0x45));
-    let ww_alt = mb_max(hw, 0x2d, 0x2e).max(mb_max(hw, 0x48, 0x49));
-    let rw = mb_max(hw, 0x28, 0x2b).max(mb_max(hw, 0x43, 0x46));
-    let wr = mb_max(hw, 0x2c, 0x2f).max(mb_max(hw, 0x47, 0x4a));
+    let cdd = Cdd {
+        rr: mb_max(hw, 0x30, 0x31).max(mb_max(hw, 0x4b, 0x4c)),
+        rr_alt: mb_max(hw, 0x26, 0x27).max(mb_max(hw, 0x41, 0x42)),
+        ww: mb_max(hw, 0x29, 0x2a).max(mb_max(hw, 0x44, 0x45)),
+        ww_alt: mb_max(hw, 0x2d, 0x2e).max(mb_max(hw, 0x48, 0x49)),
+        rw: mb_max(hw, 0x28, 0x2b).max(mb_max(hw, 0x43, 0x46)),
+        wr: mb_max(hw, 0x2c, 0x2f).max(mb_max(hw, 0x47, 0x4a)),
+    };
     phy::dmem_access(hw, false);
 
     hw.set32(ddrc(ch, DDRC_B84), 1);
@@ -117,25 +56,10 @@ pub fn timing_after_phy<H: Hw>(hw: &mut H, ch: usize) -> Result<(), Error> {
     wait(hw, "SWSTAT.sw_done_ack clear", T, |hw| {
         hw.read32(ddrc(ch, SWSTAT)) & 1 == 0
     })?;
-    let f = |off| freq(ch, 0, off);
-    let pair = |v: u32, hi: u32, lo: u32| {
-        (v & 0xffff_0000) | (sat_add((v >> 8) & 0xff, hi, 0xff) << 8) | sat_add(v & 0xff, lo, 0xff)
-    };
-    hw.modify32(f(0xd04), |v| pair(v, rr, rr_alt));
-    hw.modify32(f(0xd08), |v| pair(v, ww, ww_alt));
-    hw.modify32(f(0x08), |v| pair(v, rw, wr));
-    hw.modify32(f(0x60), |v| {
-        (v & !0xff_0000) | (sat_add((v >> 16) & 0xff, ww, 0xff) << 16)
-    });
-    hw.modify32(f(0x24), |v| (v & !0xff) | sat_add(v & 0xff, ww_alt, 0xff));
-    hw.modify32(f(0x584), |v| {
-        (v & !0x1f_0000) | (sat_add((v >> 16) & 0xff, rr, 31) << 16)
-    });
+    dfi::fold_cdd(hw, &MAP, ch, &cdd);
     let (ptr_init, rcv) = phy::read_latency_csrs(hw);
-    hw.modify32(f(0x588), |v| {
-        let rden = ((rcv >> 1) & 0xf) + (((ptr_init & 0xf) + 1) >> 3) * 4 + 21;
-        (v & !0x3f_0000) | (rden << 16)
-    });
+    let rden = ((rcv >> 1) & 0xf) + (((ptr_init & 0xf) + 1) >> 3) * 4 + 21;
+    dfi::set_rddata_en(hw, &MAP, ch, rden);
     sw_done(hw, ch)?;
     hw.clr32(ddrc(ch, DDRC_B84), 1);
     Ok(())

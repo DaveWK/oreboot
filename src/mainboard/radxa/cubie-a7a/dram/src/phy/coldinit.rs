@@ -26,6 +26,9 @@
 //! register values are inputs ([`Mrs`], [`Mrs2`]); the CA search on the
 //! echo is ours (`blobless::cold_init_ca_train`).
 
+use jedec_lpddr::lp5::cmd::{self, CaEdges};
+use jedec_lpddr::lp5::mr::Mr16;
+
 /// One ACSM memory row.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Row(pub [u16; 4]);
@@ -66,13 +69,23 @@ impl Row {
     }
 }
 
+/// The two CA edge pairs of an MRW (`jedec_lpddr::lp5::cmd::mrw`; MA
+/// masked to its 7 bits as the rows carry it).
+const fn mrw_edges(ma: u8, op: u8) -> [CaEdges; 2] {
+    match cmd::mrw(ma & 0x7f, op) {
+        Ok(e) => e,
+        Err(_) => panic!("MA is 7 bits"),
+    }
+}
+
 /// LPDDR5 MRW as four rows: MRW-1 code, MA, MRW-2 code with OP[7], OP[6:0].
 pub const fn mrw(cs: u8, ma: u8, op: u8) -> [Row; 4] {
+    let [w1, w2] = mrw_edges(ma, op);
     [
-        Row::cmd(cs, 0x58),
-        Row::cmd(0, ma),
-        Row::cmd(cs, 0x08 | ((op >> 7) << 6)),
-        Row::cmd(0, op & 0x7f),
+        Row::cmd(cs, w1.rise),
+        Row::cmd(0, w1.fall),
+        Row::cmd(cs, w2.rise),
+        Row::cmd(0, w2.fall),
     ]
 }
 
@@ -80,9 +93,10 @@ pub const fn mrw(cs: u8, ma: u8, op: u8) -> [Row; 4] {
 /// OP[6:0]), CS on both: the form the oracle uses for rank 0 while rank 1 is
 /// in command bus training.
 pub const fn mrw_ddr(cs: u8, ma: u8, op: u8) -> [Row; 2] {
+    let [w1, w2] = mrw_edges(ma, op);
     [
-        Row::ca2(cs, 0x58, ma),
-        Row::ca2(cs, 0x08 | ((op >> 7) << 6), op & 0x7f),
+        Row::ca2(cs, w1.rise, w1.fall),
+        Row::ca2(cs, w2.rise, w2.fall),
     ]
 }
 
@@ -108,10 +122,18 @@ impl Mrs {
     };
 }
 
-/// LPDDR5 MR16: OP[1:0] FSP-WR, OP[3:2] FSP-OP, OP[5:4] CBT mode, OP[6]
-/// VRCG, OP[7] CBT phase (set per block in [`block_entry`]).
+/// LPDDR5 MR16 (`jedec_lpddr::lp5::mr::Mr16`): OP[1:0] FSP-WR, OP[3:2]
+/// FSP-OP, OP[5:4] CBT mode, OP[6] VRCG; OP[7] CBT phase is set per block in
+/// [`block_entry`].
 pub const fn mr16(fsp_wr: u8, fsp_op: u8, cbt: u8, vrcg: bool) -> u8 {
-    (fsp_wr & 3) | (fsp_op & 3) << 2 | (cbt & 3) << 4 | (vrcg as u8) << 6
+    Mr16 {
+        fsp_wr,
+        fsp_op,
+        cbt,
+        vrcg,
+        cbt_phase: false,
+    }
+    .encode()
 }
 
 /// Message block words (`phy::msgblock::build`) holding the mode register

@@ -1,7 +1,6 @@
 //! Original LPDDR5 MRW CA/CS payload construction, without command execution.
 //!
-//! CA protocol: LiteDRAM 74522f715d7b10163ef6f6caa09887a90874be83,
-//! `litedram/phy/lpddr5/commands.py`, MRW-1/MRW-2 truth table. Packing
+//! CA values: `jedec_lpddr::lp5::cmd::mrw` (MRW-1/MRW-2). Packing
 //! corresponds to the A733 static record writer and the independent NXP
 //! imx-oei 9aea3350e643da86081c9dfaf3a6e1a84a583bfd LPDDR5 timing sources:
 //! two seven-bit CA edges and two CS bits occupy record halfwords 0 and 4.
@@ -30,16 +29,17 @@ impl MrWritePayload {
     /// inferred. The caller must establish that the selected device(s), MR and
     /// operand are valid for the fitted part and current FSP.
     pub const fn new(address: u8, operand: u8, cs_mask: u8) -> Result<Self, PayloadError> {
-        if address > 127 {
-            return Err(PayloadError::ModeAddress);
-        }
+        let [w1, w2] = match jedec_lpddr::lp5::cmd::mrw(address, operand) {
+            Ok(e) => e,
+            Err(_) => return Err(PayloadError::ModeAddress),
+        };
         if cs_mask == 0 || cs_mask > 3 {
             return Err(PayloadError::ChipSelect);
         }
         let cs = (cs_mask as u16) << 14;
         Ok(Self {
-            first: cs | ((address as u16) << 7) | 0x58,
-            second: cs | (((operand & 0x7f) as u16) << 7) | (((operand >> 7) as u16) << 6) | 0x08,
+            first: cs | ((w1.fall as u16) << 7) | w1.rise as u16,
+            second: cs | ((w2.fall as u16) << 7) | w2.rise as u16,
         })
     }
 
