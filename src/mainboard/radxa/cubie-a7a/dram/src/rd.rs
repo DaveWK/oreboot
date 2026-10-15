@@ -106,6 +106,22 @@ impl Sweep {
         pass_to_fail: [None; 2],
     };
 
+    /// Back to [`Self::EMPTY`] in place (bt0 keeps this in a static; a
+    /// temporary of this size would not fit its stack).
+    pub fn clear(&mut self) {
+        for p in 0..POINTS {
+            self.cmp[p] = [[0; LANES]; 2];
+            self.err[p] = [[0; LANES]; 2];
+        }
+        self.points = 0;
+        self.param = [0; 2];
+        self.mode = [Ok(()); 2];
+        self.curve = [Ok(()); 2];
+        self.window = [(0, 0); 2];
+        self.fail_to_pass = [None; 2];
+        self.pass_to_fail = [None; 2];
+    }
+
     /// The decision curve of DBYTE `i` (lanes 0 + 4, saturating).
     pub fn curve_of(&self, i: usize) -> [u16; POINTS] {
         let mut c = [0u16; POINTS];
@@ -177,6 +193,28 @@ impl RdBlock {
     }
 }
 
+impl RdBlock {
+    /// Back to [`RdBlock::empty`] for `channel`/`rank`, in place: the block
+    /// is about 12 KiB, more than bt0 can hold as a stack temporary.
+    pub fn reset(&mut self, channel: Channel, rank: Rank) {
+        self.channel = channel;
+        self.rank = rank;
+        self.saved_rx_en = [0; 2];
+        self.final_rx_en = [0; 2];
+        self.saved_param = [0; 4];
+        self.final_param = [0; 4];
+        self.t.clear();
+        self.r.clear();
+        self.fine = [Fine::EMPTY; 3];
+        self.fine_agree = [None; 2];
+        self.launches = 0;
+        self.writes = 0;
+        self.max_launch_us = 0;
+        self.elapsed_us = 0;
+        self.failure = None;
+    }
+}
+
 /// Launches per block: the next-rank mode launch (not on the first block),
 /// entry 1, warm-up 2, two sweeps, three fine searches, the exit mode launch.
 pub const BLOCK_LAUNCHES: usize = 1 + 1 + 2 + 2 * POINTS + FINE_OFFSETS.len() + 1;
@@ -237,9 +275,10 @@ fn judge(s: &mut Sweep) {
 /// previous block's rank (None for the first block): a different rank adds
 /// the reference's [`rxen::rank_switch`], and every block but the first
 /// opens with the reference's next-rank mode launch.
+#[inline(never)]
 pub fn measure_block<H: Hw>(hw: &mut H, out: &mut RdBlock, prev: Option<Rank>) {
     let (ch, rank) = (out.channel, out.rank);
-    *out = RdBlock::empty(ch, rank);
+    out.reset(ch, rank);
     let dbs = dbytes(ch);
     let t0 = hw.now_us();
     let mut ex = WlExec::new(hw);

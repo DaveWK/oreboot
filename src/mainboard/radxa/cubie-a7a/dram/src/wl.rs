@@ -545,6 +545,41 @@ impl WlBlock {
             convergence: [Convergence::EMPTY; RUNS],
         }
     }
+
+    /// Back to [`WlBlock::empty`] in place, field by field: a temporary
+    /// of the whole block (about 3 KiB) would sit in the caller's frame on
+    /// bt0's 16 KiB stack.
+    pub fn reset(&mut self, channel: Channel, rank: Rank) {
+        self.channel = channel;
+        self.rank = rank;
+        self.mr18_base = 0;
+        self.saved_delay = [0; 2];
+        self.after_prefix_delay = [0; 2];
+        self.training_cntr = [[0; LANES]; 2];
+        self.counter_delay = [None; 2];
+        self.prefix_err = [0; 2];
+        for pair in self.snaps.iter_mut() {
+            *pair = [DtsmSnap::EMPTY; 2];
+        }
+        self.err = [[0; WL_POINTS]; 2];
+        self.lanes_nz = [[0; WL_POINTS]; 2];
+        self.points = 0;
+        self.decision = [Decision::EMPTY; 2];
+        self.verdict = [None; 2];
+        self.counter = [None; 2];
+        self.frame = [None; 2];
+        self.knob = [Knob::EMPTY; 2];
+        self.final_delay = [0; 2];
+        self.launches = 0;
+        self.writes = 0;
+        self.max_launch_us = 0;
+        self.max_polls = 0;
+        self.elapsed_us = 0;
+        self.failure = None;
+        for c in self.convergence.iter_mut() {
+            *c = Convergence::EMPTY;
+        }
+    }
 }
 
 /// The reference block order: rank 0 channel A, B, then rank 1 A, B.
@@ -688,9 +723,10 @@ impl Saved {
 /// feedback lanes; cleanup and exact restores; then one TrainingCntr
 /// convergence run per [`CONVERGENCE_STARTS`] and [`FRAME_STARTS`] value,
 /// each with its own cleanup and restores; the result.
+#[inline(never)]
 pub fn level_block<H: Hw>(hw: &mut H, mr18: Mr18Base, out: &mut WlBlock, sweep: &mut WlSweep) {
     let (ch, rank) = (out.channel, out.rank);
-    *out = WlBlock::empty(ch, rank);
+    out.reset(ch, rank);
     sweep.clear();
     out.mr18_base = mr18.value();
     let dbs = dbytes(ch);

@@ -130,6 +130,7 @@ static mut WL_SWEEP: cubie_a7a_dram::wl::WlSweep = cubie_a7a_dram::wl::WlSweep::
 /// block. Printing kicks the boot
 /// watchdog per line (each line is bounded; the launches kick it as well).
 #[cfg(not(feature = "wck-alias-probe"))]
+#[inline(never)]
 fn wck_level(p: &mut Para) {
     use cubie_a7a_dram::phy::wcklevel::{Channel, Rank};
     use cubie_a7a_dram::wl::{self, SNAP_NAMES, WL_POINTS, WL_STEP};
@@ -259,6 +260,7 @@ static mut RD_BLOCK: cubie_a7a_dram::rd::RdBlock = cubie_a7a_dram::rd::RdBlock::
 /// (TrainingParam 0) with all-lane DTSM counts, the PHY's fine search as
 /// the cross-check, the saved RxEnDly restored. Printed per block.
 #[cfg(not(feature = "wck-alias-probe"))]
+#[inline(never)]
 fn read_enable() {
     use cubie_a7a_dram::phy::wcklevel::{Channel, Rank};
     use cubie_a7a_dram::rd::{self, Sweep};
