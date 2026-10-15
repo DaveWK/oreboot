@@ -15,6 +15,7 @@ blobless = []
 wck-alias-probe = ["blobless"]
 
 [dependencies]
+bootlog = { path = "../../../../lib/bootlog" }
 log = { path = "../../../../lib/log" }
 util = { path = "../../../../lib/util" }
 cubie-a7a-common = { path = "../common" }

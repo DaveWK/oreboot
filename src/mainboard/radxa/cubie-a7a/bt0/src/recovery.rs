@@ -9,6 +9,7 @@
 
 use core::arch::global_asm;
 
+use bootlog::progress;
 use cubie_a7a_common::{layout, recovery};
 use util::mmio::{read32, write32};
 
@@ -36,18 +37,29 @@ const WDT_KEY: u32 = 0x16aa_0000;
 /// 26 MHz crystal.
 const WDT_INTERVAL_16S: u32 = 0xb << 4;
 
+/// The attempt marker: RTC GP_DATA_REG6, kept across watchdog resets.
+struct RtcGpr;
+
+impl progress::Marker for RtcGpr {
+    fn read(&mut self) -> u32 {
+        read32(recovery::RTC_GPR)
+    }
+    fn write(&mut self, v: u32) {
+        write32(recovery::RTC_GPR, v)
+    }
+}
+
 /// True if the last boot set the attempt marker and never confirmed.
-/// Clears the marker, so a failed fallback leads back to oreboot.
+/// Clears the marker, so a failed fallback leads back to oreboot (shared
+/// `bootlog::progress`).
 pub fn previous_boot_failed() -> bool {
-    let failed = read32(recovery::RTC_GPR) == recovery::ATTEMPT;
-    write32(recovery::RTC_GPR, 0);
-    failed
+    progress::previous_boot_failed(&mut RtcGpr, recovery::ATTEMPT)
 }
 
 /// Mark this boot as in progress and arm WDT0 to reset the whole system if
 /// nothing confirms it in time.
 pub fn begin_attempt() {
-    write32(recovery::RTC_GPR, recovery::ATTEMPT);
+    progress::begin_attempt(&mut RtcGpr, recovery::ATTEMPT);
     arm_watchdog();
 }
 

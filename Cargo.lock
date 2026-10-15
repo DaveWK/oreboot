@@ -865,6 +865,7 @@ dependencies = [
 name = "oreboot-cubie-a7a-bt0"
 version = "0.1.0"
 dependencies = [
+ "bootlog",
  "cubie-a7a-common",
  "cubie-a7a-dram",
  "log 0.1.0",
