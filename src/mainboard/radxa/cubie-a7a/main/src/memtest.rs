@@ -5,7 +5,7 @@
 
 use core::arch::asm;
 use cubie_a7a_common::{
-    memtest::{self, Memory, Pattern, Plan, Report},
+    memtest::{self, Memory, Pattern, Report},
     Handoff,
 };
 
@@ -20,7 +20,7 @@ struct Map {
 }
 impl Map {
     fn enter(end: u64) -> Result<Self, &'static str> {
-        let (sctlr, mair, tcr, ttbr): (u64,u64,u64,u64);
+        let (sctlr, mair, tcr, ttbr): (u64, u64, u64, u64);
         unsafe {
             asm!("mrs {s}, sctlr_el3", "mrs {m}, mair_el3", "mrs {t}, tcr_el3", "mrs {b}, ttbr0_el3", s=out(reg)sctlr,m=out(reg)mair,t=out(reg)tcr,b=out(reg)ttbr);
         }
@@ -75,7 +75,7 @@ impl Memory for Dram {
     }
 }
 pub fn run(h: &Handoff) -> Result<(), &'static str> {
-    let plan = Plan::from_handoff(h)?;
+    let plan = memtest::plan_from_handoff(h)?;
     for r in plan.ranges() {
         println!("[main] memtest: test {:#x}..{:#x}", r.start, r.end);
     }

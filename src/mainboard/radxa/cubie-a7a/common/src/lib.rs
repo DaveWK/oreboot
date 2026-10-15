@@ -12,14 +12,17 @@
 //! ```
 #![no_std]
 
-pub mod bakery;
 pub mod ethernet;
 pub mod fwlog;
 pub mod memtest;
-pub mod sha256;
+pub mod mmio;
 pub mod time;
 pub mod twi;
 pub mod uart;
+
+// ore-edk2-boot shared crates used as they are.
+pub use bakery;
+pub use sha256;
 
 /// R_TWI0, the PMIC's I2C bus.
 pub const R_TWI0_BASE: usize = 0x0708_3000;
@@ -60,7 +63,9 @@ pub mod mem {
         let Some((base, size)) = payload_region(dram_base, dram_size) else {
             return false;
         };
-        entry >= base && entry % 4 == 0 && entry.checked_add(4).is_some_and(|end| end <= base + size)
+        entry >= base
+            && entry % 4 == 0
+            && entry.checked_add(4).is_some_and(|end| end <= base + size)
     }
 
     #[cfg(test)]
@@ -70,17 +75,28 @@ pub mod mem {
         const SIZE: u64 = 4 << 30;
         #[test]
         fn usable_region_excludes_el3() {
-            assert_eq!(payload_region(BASE, SIZE), Some((PAYLOAD_RAM_BASE as u64, SIZE - EL3_SIZE as u64)));
+            assert_eq!(
+                payload_region(BASE, SIZE),
+                Some((PAYLOAD_RAM_BASE as u64, SIZE - EL3_SIZE as u64))
+            );
             assert!(valid_payload_entry(BASE, SIZE, PAYLOAD_RAM_BASE as u64));
             assert!(!valid_payload_entry(BASE, SIZE, BASE));
-            assert!(!valid_payload_entry(BASE, SIZE, PAYLOAD_RAM_BASE as u64 - 4));
+            assert!(!valid_payload_entry(
+                BASE,
+                SIZE,
+                PAYLOAD_RAM_BASE as u64 - 4
+            ));
         }
         #[test]
         fn entry_bounds_include_last_instruction_only() {
             assert!(valid_payload_entry(BASE, SIZE, BASE + SIZE - 4));
             assert!(!valid_payload_entry(BASE, SIZE, BASE + SIZE));
             assert!(!valid_payload_entry(BASE, SIZE, u64::MAX - 3));
-            assert!(!valid_payload_entry(BASE, SIZE, PAYLOAD_RAM_BASE as u64 + 1));
+            assert!(!valid_payload_entry(
+                BASE,
+                SIZE,
+                PAYLOAD_RAM_BASE as u64 + 1
+            ));
         }
         #[test]
         fn malformed_handoff_never_wraps() {
@@ -106,7 +122,6 @@ pub mod layout {
     pub const TABLE_OFFSET: u32 = 0x001f_f000;
     pub const MAGIC: [u8; 8] = *b"A7ABOOT1";
     pub const VERSION: u32 = 1;
-    pub const MAX_ENTRIES: usize = 8;
 
     /// AArch64 EL3 firmware: oreboot main. Entered via RVBAR after the warm
     /// reset into AArch64.
@@ -119,32 +134,10 @@ pub mod layout {
     /// when the previous oreboot boot never confirmed ([`super::recovery`]).
     pub const KIND_VENDOR_SPL: u32 = 4;
 
-    #[repr(C)]
-    #[derive(Clone, Copy, Debug, Default)]
-    pub struct Entry {
-        pub kind: u32,
-        pub flags: u32,
-        /// Byte offset on the medium, 512-byte aligned.
-        pub offset: u32,
-        /// Size in bytes.
-        pub size: u32,
-        pub load_addr: u64,
-        /// CRC-32 (IEEE) of the image; 0 skips verification.
-        pub crc32: u32,
-        pub _reserved: u32,
-    }
-
-    #[repr(C)]
-    #[derive(Clone, Copy, Debug)]
-    pub struct Table {
-        pub magic: [u8; 8],
-        pub version: u32,
-        pub count: u32,
-        /// CRC-32 over the whole table with this field set to 0.
-        pub crc32: u32,
-        pub _reserved: u32,
-        pub entries: [Entry; MAX_ENTRIES],
-    }
+    use bootlayout::{Contract, KindRule, Place};
+    /// The table format, decoding and the stage checks are the shared
+    /// `bootlayout` crate; [`CONTRACT`] is the A7A's part.
+    pub use bootlayout::{Entry, Error, Table, CRC_FIELD_OFFSET, MAX_ENTRIES, TABLE_SIZE};
 
     /// Version1 image-builder contract: images occupy the firmware gap,
     /// after the table, before the first partition at16MiB.
@@ -152,140 +145,60 @@ pub mod layout {
     pub const IMAGE_END: u64 = 0x0100_0000;
     pub const BLOCK_SIZE: u64 = 512;
 
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub enum Error {
-        Header,
-        Checksum,
-        UnsupportedFields,
-        UnknownKind,
-        DuplicateKind,
-        MissingStage,
-        EmptyImage,
-        MediaRange,
-        MemoryRange,
-        LinkedAddress,
-        Overlap,
-    }
+    const KINDS: [KindRule; 4] = [
+        KindRule {
+            kind: KIND_MAIN,
+            place: Place::Exact {
+                addr: super::mem::MAIN_BASE as u64,
+                max_size: Some(super::mem::MAIN_MAX_SIZE as u64),
+            },
+        },
+        KindRule {
+            kind: KIND_PAYLOAD,
+            place: Place::Exact {
+                addr: super::mem::PAYLOAD_BASE as u64,
+                max_size: None,
+            },
+        },
+        KindRule {
+            kind: KIND_DTB,
+            place: Place::AtLeast(super::mem::PAYLOAD_RAM_BASE as u64),
+        },
+        // Existing optional recovery format; never loaded by this path.
+        KindRule {
+            kind: KIND_VENDOR_SPL,
+            place: Place::Recovery {
+                addr: 0x47000,
+                max_size: 0x4a000,
+            },
+        },
+    ];
 
-    /// Decode the media frame without assuming its byte buffer has Table's
-    /// u64 alignment. All fields are plain integers and the length is checked.
+    /// The A7A table contract: magic, version, the firmware gap on the card,
+    /// DRAM, this stage's address width, where each kind loads; main and the
+    /// payload are required.
+    pub const CONTRACT: Contract<'static> = Contract {
+        magic: MAGIC,
+        version: VERSION,
+        image_start: IMAGE_START,
+        image_end: IMAGE_END,
+        block_size: BLOCK_SIZE,
+        dram_base: super::mem::DRAM_BASE as u64,
+        max_address: usize::MAX as u64,
+        kinds: &KINDS,
+        required: &[KIND_MAIN, KIND_PAYLOAD],
+    };
+
+    /// Decode the media frame (any alignment): length, header and the table
+    /// CRC.
     pub fn decode(bytes: &[u8]) -> Result<Table, Error> {
-        if bytes.len() < TABLE_SIZE {
-            return Err(Error::Header);
-        }
-        // SAFETY: complete repr(C) integer-only frame, possibly unaligned.
-        let table: Table = unsafe { core::ptr::read_unaligned(bytes.as_ptr().cast()) };
-        if table.magic != MAGIC || table.version != VERSION || table.count as usize > MAX_ENTRIES {
-            return Err(Error::Header);
-        }
-        let mut checksum_bytes = [0u8; TABLE_SIZE];
-        checksum_bytes.copy_from_slice(&bytes[..TABLE_SIZE]);
-        checksum_bytes[CRC_FIELD_OFFSET..CRC_FIELD_OFFSET + 4].fill(0);
-        if super::crc32(&checksum_bytes) != table.crc32 {
-            return Err(Error::Checksum);
-        }
-        Ok(table)
-    }
-
-    fn padded(e: &Entry) -> Result<u64, Error> {
-        if e.size == 0 {
-            return Err(Error::EmptyImage);
-        }
-        Ok((u64::from(e.size) + BLOCK_SIZE - 1) & !(BLOCK_SIZE - 1))
-    }
-
-    fn media_range(e: &Entry) -> Result<(u64, u64), Error> {
-        let start = u64::from(e.offset);
-        let end = start.checked_add(padded(e)?).ok_or(Error::MediaRange)?;
-        if start < IMAGE_START || start % BLOCK_SIZE != 0 || end > IMAGE_END {
-            return Err(Error::MediaRange);
-        }
-        Ok((start, end))
-    }
-
-    fn memory_range(e: &Entry, dram_end: u64) -> Result<(u64, u64), Error> {
-        use super::mem;
-        let start = e.load_addr;
-        let end = start.checked_add(padded(e)?).ok_or(Error::MemoryRange)?;
-        // Check the full64-bit address before converting to AArch32 usize.
-        if start & 3 != 0 || usize::try_from(start).is_err() || usize::try_from(end).is_err() {
-            return Err(Error::MemoryRange);
-        }
-        match e.kind {
-            KIND_MAIN => {
-                if start != mem::MAIN_BASE as u64 || padded(e)? > mem::MAIN_MAX_SIZE as u64 {
-                    return Err(Error::LinkedAddress);
-                }
-            }
-            KIND_PAYLOAD => {
-                if start != mem::PAYLOAD_BASE as u64 {
-                    return Err(Error::LinkedAddress);
-                }
-            }
-            KIND_DTB => {
-                if start < mem::PAYLOAD_RAM_BASE as u64 {
-                    return Err(Error::MemoryRange);
-                }
-            }
-            KIND_VENDOR_SPL => {
-                // Existing optional recovery format; never loaded by this path.
-                if start != 0x47000 || padded(e)? > 0x4a000 {
-                    return Err(Error::LinkedAddress);
-                }
-                return Ok((start, end));
-            }
-            _ => return Err(Error::UnknownKind),
-        }
-        if start < mem::DRAM_BASE as u64 || end > dram_end {
-            return Err(Error::MemoryRange);
-        }
-        Ok((start, end))
-    }
-
-    fn overlaps(a: (u64, u64), b: (u64, u64)) -> bool {
-        a.0 < b.1 && b.0 < a.1
+        bootlayout::decode(&CONTRACT, bytes)
     }
 
     /// Validate every entry before any image is copied. The table CRC is
     /// checked by the media reader; this checks the image/loader contract.
     pub fn validate(table: &Table, dram_end: u64) -> Result<(), Error> {
-        if table.magic != MAGIC || table.version != VERSION || table.count as usize > MAX_ENTRIES {
-            return Err(Error::Header);
-        }
-        if table._reserved != 0 {
-            return Err(Error::UnsupportedFields);
-        }
-        let entries = &table.entries[..table.count as usize];
-        let mut seen = 0u32;
-        for (i, e) in entries.iter().enumerate() {
-            if e.flags != 0 || e._reserved != 0 {
-                return Err(Error::UnsupportedFields);
-            }
-            if !(KIND_MAIN..=KIND_VENDOR_SPL).contains(&e.kind) {
-                return Err(Error::UnknownKind);
-            }
-            let bit = 1 << e.kind;
-            if seen & bit != 0 {
-                return Err(Error::DuplicateKind);
-            }
-            seen |= bit;
-            let media = media_range(e)?;
-            let memory = memory_range(e, dram_end)?;
-            for prior in &entries[..i] {
-                if overlaps(media, media_range(prior)?)
-                    || (e.kind != KIND_VENDOR_SPL
-                        && prior.kind != KIND_VENDOR_SPL
-                        && overlaps(memory, memory_range(prior, dram_end)?))
-                {
-                    return Err(Error::Overlap);
-                }
-            }
-        }
-        let required = (1 << KIND_MAIN) | (1 << KIND_PAYLOAD);
-        if seen & required != required {
-            return Err(Error::MissingStage);
-        }
-        Ok(())
+        bootlayout::validate(&CONTRACT, table, dram_end)
     }
 
     /// Actual bt0 load orchestration: no callback can run until the entire
@@ -293,22 +206,10 @@ pub mod layout {
     pub fn load_entries(
         table: &Table,
         dram_end: u64,
-        mut load: impl FnMut(&Entry, usize, usize),
+        load: impl FnMut(&Entry, usize, usize),
     ) -> Result<(), Error> {
-        validate(table, dram_end)?;
-        for e in &table.entries[..table.count as usize] {
-            if e.kind != KIND_VENDOR_SPL {
-                // validate proved both conversions and the whole extent.
-                load(e, e.load_addr as usize, padded(e)? as usize);
-            }
-        }
-        Ok(())
+        bootlayout::load_entries(&CONTRACT, table, dram_end, load)
     }
-
-    pub const TABLE_SIZE: usize = core::mem::size_of::<Table>();
-    pub const CRC_FIELD_OFFSET: usize = 16;
-    const _: () = assert!(TABLE_SIZE == 24 + 32 * MAX_ENTRIES);
-    const _: () = assert!(TABLE_SIZE <= 512);
 
     #[cfg(test)]
     mod load_controls {
@@ -324,7 +225,10 @@ pub mod layout {
             let checksum = crate::crc32(frame);
             frame[CRC_FIELD_OFFSET..CRC_FIELD_OFFSET + 4].copy_from_slice(&checksum.to_le_bytes());
             assert_eq!(decode(frame).unwrap().count, 0);
-            assert!(matches!(decode(&frame[..TABLE_SIZE - 1]), Err(Error::Header)));
+            assert!(matches!(
+                decode(&frame[..TABLE_SIZE - 1]),
+                Err(Error::Header)
+            ));
             frame[24] ^= 1;
             assert!(matches!(decode(frame), Err(Error::Checksum)));
         }
@@ -502,7 +406,6 @@ pub mod layout {
             rejected_before_load(&t);
         }
     }
-
 }
 
 /// Boot-attempt tracking, so a broken oreboot/EDK2 build falls back to the
@@ -552,38 +455,8 @@ pub struct Handoff {
 }
 
 /// CRC-32 (IEEE 802.3, reflected, as used by zlib and Python's
-/// `zlib.crc32`).
-pub fn crc32(data: &[u8]) -> u32 {
-    crc32_update(0, data)
-}
-
-pub fn crc32_update(crc: u32, data: &[u8]) -> u32 {
-    let mut c = !crc;
-    for &b in data {
-        c = CRC_TABLE[((c ^ b as u32) & 0xff) as usize] ^ (c >> 8);
-    }
-    !c
-}
-
-const CRC_TABLE: [u32; 256] = {
-    let mut t = [0u32; 256];
-    let mut i = 0;
-    while i < 256 {
-        let mut c = i as u32;
-        let mut k = 0;
-        while k < 8 {
-            c = if c & 1 != 0 {
-                0xedb8_8320 ^ (c >> 1)
-            } else {
-                c >> 1
-            };
-            k += 1;
-        }
-        t[i] = c;
-        i += 1;
-    }
-    t
-};
+/// `zlib.crc32`): the shared `storage::crc`.
+pub use storage::crc::{crc32, update as crc32_update};
 
 #[cfg(test)]
 mod tests {

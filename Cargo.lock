@@ -77,6 +77,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "arch-timer"
+version = "0.1.0"
+
+[[package]]
 name = "arraydeque"
 version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -120,6 +124,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ace50bade8e6234aa140d9a2f552bbee1db4d353f69b8217bc503490fc1a9f26"
 
 [[package]]
+name = "bakery"
+version = "0.1.0"
+
+[[package]]
 name = "bare-metal"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -160,6 +168,17 @@ checksum = "3078c7629b62d3f0439517fa394996acacc5cbc91c5a20d8c658e77abd503a71"
 dependencies = [
  "generic-array",
 ]
+
+[[package]]
+name = "bootlayout"
+version = "0.1.0"
+dependencies = [
+ "storage",
+]
+
+[[package]]
+name = "bootlog"
+version = "0.1.0"
 
 [[package]]
 name = "byteorder"
@@ -354,9 +373,19 @@ dependencies = [
 name = "cubie-a7a-common"
 version = "0.1.0"
 dependencies = [
+ "arch-timer",
+ "bakery",
+ "bootlayout",
+ "bootlog",
  "embedded-hal-nb",
  "log 0.1.0",
+ "memtest",
  "nb 1.1.0",
+ "netid",
+ "regio",
+ "sha256",
+ "storage",
+ "uart-16550",
  "util",
 ]
 
@@ -734,6 +763,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "78ca9ab1a0babb1e7d5695e3530886289c18cf2f87ec19a575a0abdce112e3a3"
 
 [[package]]
+name = "memtest"
+version = "0.1.0"
+dependencies = [
+ "dram-train",
+]
+
+[[package]]
 name = "miniz_oxide"
 version = "0.8.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -756,6 +792,13 @@ name = "nb"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8d5439c4ad607c3c23abf66de8c8bf57ba8adcd1f129e699851a6e43935d339d"
+
+[[package]]
+name = "netid"
+version = "0.1.0"
+dependencies = [
+ "sha256",
+]
 
 [[package]]
 name = "nix"
@@ -825,6 +868,7 @@ dependencies = [
  "cubie-a7a-common",
  "cubie-a7a-dram",
  "log 0.1.0",
+ "sha256",
  "util",
 ]
 
@@ -1315,6 +1359,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "sha256"
+version = "0.1.0"
+
+[[package]]
 name = "spin"
 version = "0.9.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1386,6 +1434,10 @@ name = "static_assertions"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
+
+[[package]]
+name = "storage"
+version = "0.1.0"
 
 [[package]]
 name = "strsim"
@@ -1478,6 +1530,13 @@ name = "typenum"
 version = "1.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "562d481066bde0658276a35467c4af00bdc6ee726305698a55b86e61d7ad82bb"
+
+[[package]]
+name = "uart-16550"
+version = "0.1.0"
+dependencies = [
+ "regio",
+]
 
 [[package]]
 name = "ucd-trie"

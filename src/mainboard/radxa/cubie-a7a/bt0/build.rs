@@ -92,10 +92,6 @@ fn link_dram_library() {
     }
 }
 
-#[path = "../common/src/sha256.rs"]
-#[allow(dead_code)]
-mod sha256;
-
 /// The DRAM PHY's firmware, which runs inside the PHY (Synopsys training
 /// firmware and PIE sequencer images): data the open driver loads. It
 /// comes from the pinned Tina SDK dramlib object (A733_PHY_FW_OBJ,

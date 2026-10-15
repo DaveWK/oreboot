@@ -10,3 +10,14 @@ nb = "1"
 
 log = { path = "../../../../lib/log" }
 util = { path = "../../../../lib/util" }
+# ore-edk2-boot shared crates (linked into src/lib by the board's fetch).
+arch-timer = { path = "../../../../lib/arch-timer" }
+bakery = { path = "../../../../lib/bakery" }
+bootlayout = { path = "../../../../lib/bootlayout" }
+bootlog = { path = "../../../../lib/bootlog" }
+memtest = { path = "../../../../lib/memtest" }
+netid = { path = "../../../../lib/netid" }
+regio = { path = "../../../../lib/regio" }
+sha256 = { path = "../../../../lib/sha256" }
+storage = { path = "../../../../lib/storage" }
+uart-16550 = { path = "../../../../lib/uart-16550" }

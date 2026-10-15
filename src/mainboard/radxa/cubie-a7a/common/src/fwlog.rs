@@ -9,8 +9,10 @@
 //! its contents across a watchdog or warm reset often enough to be useful,
 //! but nothing guarantees it, so that copy is best effort.
 //!
-//! Layout of each area (little endian; EDK2's OrebootLogSerialPortLib and
-//! the Linux reader `a7a-fwlog` mirror it; docs/fwlog.md):
+//! The area format and operations are the shared `bootlog::ring` (format
+//! [`ring::A7A`]); this module keeps the A7A addresses and the sink
+//! selection. Layout of each area (little endian; EDK2's
+//! OrebootLogSerialPortLib and the Linux reader mirror it; docs/fwlog.md):
 //!
 //! | Offset | Size | Field |
 //! |---|---|---|
@@ -23,6 +25,7 @@
 //! | 32 | 32 | reserved, 0 |
 //! | 64 | size | ring data |
 
+use bootlog::{ring, Area};
 use core::ptr::{read_volatile, write_volatile};
 
 pub const MAGIC: [u8; 8] = *b"A7AFWLOG";
@@ -31,8 +34,8 @@ pub const MAGIC: [u8; 8] = *b"A7AFWLOG";
 /// chainload (whose BL31 answers NOT_SUPPORTED) even if DRAM still holds a
 /// valid-looking header from an earlier oreboot boot.
 pub const SIP_FWLOG_BASE: u32 = 0x8200_0002;
-pub const VERSION: u32 = 1;
-pub const HEADER_SIZE: usize = 64;
+pub const VERSION: u32 = ring::VERSION;
+pub const HEADER_SIZE: usize = ring::HEADER_SIZE;
 
 /// This boot's log.
 pub const CUR_BASE: usize = 0x4014_0000;
@@ -46,10 +49,7 @@ pub const DATA_SIZE: usize = AREA_SIZE - HEADER_SIZE;
 pub const EARLY_BASE: usize = 0x000f_0000;
 pub const EARLY_SIZE: usize = 0x4000;
 
-const OFF_VERSION: usize = 8;
-const OFF_SIZE: usize = 12;
-const OFF_WRITTEN: usize = 16;
-const OFF_SEQ: usize = 24;
+const _: () = assert!(MAGIC[0] == ring::A7A.magic[0] && DATA_SIZE == ring::A7A.data_size);
 
 const _: () = assert!(CUR_BASE + AREA_SIZE <= PREV_BASE);
 const _: () = assert!(PREV_BASE + AREA_SIZE <= crate::mem::HANDOFF_ADDR);
@@ -66,52 +66,23 @@ enum Sink {
 
 static mut SINK: Sink = Sink::None;
 
-// All accesses are byte or naturally aligned word accesses: main runs with
-// the MMU off, where unaligned accesses fault.
-fn r32(a: usize) -> u32 {
-    unsafe { read_volatile(a as *const u32) }
-}
-fn w32(a: usize, v: u32) {
-    unsafe { write_volatile(a as *mut u32, v) }
-}
-fn r64(a: usize) -> u64 {
-    r32(a) as u64 | (r32(a + 4) as u64) << 32
-}
-fn w64(a: usize, v: u64) {
-    w32(a, v as u32);
-    w32(a + 4, (v >> 32) as u32);
-}
-fn w8(a: usize, v: u8) {
-    unsafe { write_volatile(a as *mut u8, v) }
-}
-fn r8(a: usize) -> u8 {
-    unsafe { read_volatile(a as *const u8) }
-}
+/// One log area in memory. All accesses are byte or naturally aligned word
+/// accesses: main runs with the MMU off, where unaligned accesses fault.
+struct Mem(usize);
 
-fn header_valid(base: usize) -> bool {
-    (0..8).all(|i| r8(base + i) == MAGIC[i])
-        && r32(base + OFF_VERSION) == VERSION
-        && r32(base + OFF_SIZE) as usize == DATA_SIZE
-}
-
-fn init_header(base: usize, seq: u32) {
-    for i in 0..HEADER_SIZE / 4 {
-        w32(base + 4 * i, 0);
+impl Area for Mem {
+    fn read8(&self, off: usize) -> u8 {
+        unsafe { read_volatile((self.0 + off) as *const u8) }
     }
-    w32(base + OFF_VERSION, VERSION);
-    w32(base + OFF_SIZE, DATA_SIZE as u32);
-    w64(base + OFF_WRITTEN, 0);
-    w32(base + OFF_SEQ, seq);
-    // Magic last, so a reader never sees a valid header over stale fields.
-    for (i, &b) in MAGIC.iter().enumerate() {
-        w8(base + i, b);
+    fn write8(&mut self, off: usize, v: u8) {
+        unsafe { write_volatile((self.0 + off) as *mut u8, v) }
     }
-}
-
-fn ring_putc(base: usize, c: u8) {
-    let n = r64(base + OFF_WRITTEN);
-    w8(base + HEADER_SIZE + (n % DATA_SIZE as u64) as usize, c);
-    w64(base + OFF_WRITTEN, n + 1);
+    fn read32(&self, off: usize) -> u32 {
+        unsafe { read_volatile((self.0 + off) as *const u32) }
+    }
+    fn write32(&mut self, off: usize, v: u32) {
+        unsafe { write_volatile((self.0 + off) as *mut u32, v) }
+    }
 }
 
 /// Append one byte to the current log. Called by the UART writer for every
@@ -120,51 +91,33 @@ pub fn putc(c: u8) {
     // SAFETY: SINK is only changed by the boot CPU during early setup.
     match unsafe { SINK } {
         Sink::None => {}
-        Sink::Early => {
-            let n = r32(EARLY_BASE) as usize;
-            if 4 + n < EARLY_SIZE {
-                w8(EARLY_BASE + 4 + n, c);
-                w32(EARLY_BASE, (n + 1) as u32);
-            }
-        }
-        Sink::Ring => ring_putc(CUR_BASE, c),
+        Sink::Early => ring::early_putc(&mut Mem(EARLY_BASE), EARLY_SIZE, c),
+        Sink::Ring => ring::putc(&mut Mem(CUR_BASE), &ring::A7A, c),
     }
 }
 
 /// bt0, first thing: collect output in SRAM until DRAM works.
 pub fn start_early() {
-    w32(EARLY_BASE, 0);
+    Mem(EARLY_BASE).write32(0, 0);
     unsafe { SINK = Sink::Early };
 }
 
 /// bt0, once DRAM is trained: keep the previous boot's log if it survived,
 /// start this boot's log and move the early output into it.
 pub fn start_dram() {
-    let mut seq = 0;
-    if header_valid(CUR_BASE) {
-        seq = r32(CUR_BASE + OFF_SEQ).wrapping_add(1);
-        for i in (0..AREA_SIZE).step_by(4) {
-            w32(PREV_BASE + i, r32(CUR_BASE + i));
-        }
-    } else {
-        // Nothing usable: make sure no stale copy passes for the last boot.
-        w32(PREV_BASE, 0);
-    }
-    init_header(CUR_BASE, seq);
-    let early = match unsafe { SINK } {
-        Sink::Early => (r32(EARLY_BASE) as usize).min(EARLY_SIZE - 4),
-        _ => 0,
-    };
-    for i in 0..early {
-        ring_putc(CUR_BASE, r8(EARLY_BASE + 4 + i));
+    let mut cur = Mem(CUR_BASE);
+    ring::rotate(&mut cur, &mut Mem(PREV_BASE), &ring::A7A);
+    if let Sink::Early = unsafe { SINK } {
+        ring::drain_early(&Mem(EARLY_BASE), EARLY_SIZE, &mut cur, &ring::A7A);
     }
     unsafe { SINK = Sink::Ring };
 }
 
 /// main: append to the log bt0 started (or start one if bt0 did not).
 pub fn attach() {
-    if !header_valid(CUR_BASE) {
-        init_header(CUR_BASE, 0);
+    let mut cur = Mem(CUR_BASE);
+    if !ring::header_valid(&cur, &ring::A7A) {
+        ring::init_header(&mut cur, &ring::A7A, 0);
     }
     unsafe { SINK = Sink::Ring };
 }

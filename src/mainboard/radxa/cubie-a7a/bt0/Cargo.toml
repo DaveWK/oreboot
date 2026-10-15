@@ -19,3 +19,6 @@ log = { path = "../../../../lib/log" }
 util = { path = "../../../../lib/util" }
 cubie-a7a-common = { path = "../common" }
 cubie-a7a-dram = { path = "../dram" }
+
+[build-dependencies]
+sha256 = { path = "../../../../lib/sha256" }
