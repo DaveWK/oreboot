@@ -81,6 +81,13 @@ name = "arch-timer"
 version = "0.1.0"
 
 [[package]]
+name = "arm-ppu"
+version = "0.1.0"
+dependencies = [
+ "regio",
+]
+
+[[package]]
 name = "arraydeque"
 version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -438,6 +445,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "dwc-pcie"
+version = "0.1.0"
+dependencies = [
+ "regio",
+]
+
+[[package]]
 name = "embedded-hal"
 version = "0.2.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -540,6 +554,17 @@ name = "fdt"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "784a4df722dc6267a04af36895398f59d21d07dce47232adf31ec0ff2fa45e67"
+
+[[package]]
+name = "fdt-checked"
+version = "0.1.0"
+
+[[package]]
+name = "fdt-writer"
+version = "0.1.0"
+dependencies = [
+ "fdt-checked",
+]
 
 [[package]]
 name = "foldhash"
@@ -877,8 +902,14 @@ dependencies = [
 name = "oreboot-cubie-a7a-main"
 version = "0.1.0"
 dependencies = [
+ "arm-ppu",
  "cubie-a7a-common",
+ "dwc-pcie",
+ "fdt-writer",
  "log 0.1.0",
+ "memtest",
+ "psci-el3",
+ "regio",
  "util",
 ]
 
@@ -1036,6 +1067,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f139b0662de085916d1fb67d2b4169d1addddda1919e696f3252b740b629986e"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "psci-el3"
+version = "0.1.0"
+dependencies = [
+ "bakery",
+ "regio",
 ]
 
 [[package]]

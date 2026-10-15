@@ -8,6 +8,13 @@ edition = "2021"
 log = { path = "../../../../lib/log" }
 util = { path = "../../../../lib/util" }
 cubie-a7a-common = { path = "../common" }
+# ore-edk2-boot shared crates (linked into src/lib by the board's fetch).
+arm-ppu = { path = "../../../../lib/arm-ppu" }
+dwc-pcie = { path = "../../../../lib/dwc-pcie" }
+fdt-writer = { path = "../../../../lib/fdt-writer" }
+memtest = { path = "../../../../lib/memtest" }
+psci-el3 = { path = "../../../../lib/psci-el3", features = ["vectors"] }
+regio = { path = "../../../../lib/regio" }
 
 # Peripheral bring-up in main, each one a build option so a first boot on new
 # hardware can leave out what has not run yet (Makefile BRINGUP=...). The

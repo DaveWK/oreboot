@@ -1,282 +1,111 @@
-//! PSCI 1.0 and SMCCC 1.1 services for the non-secure world.
+//! PSCI 1.0 and SMCCC 1.1 services for the non-secure world: the shared
+//! `psci-el3` dispatcher and per-core state table with the A733 as its
+//! [`Platform`].
 //!
 //! Cores are powered on and off through the A733 hotplug/PPU registers
 //! ([`crate::soc::cpu_power_on`]); a powered-on core starts at `start` in
-//! EL3 and is sent to its requested entry point by `secondary_main`.
+//! EL3 and is sent to its requested entry point by `secondary_main`. The
+//! state records are guarded by the EL3 bakery lock ([`psci_lock`]).
 
-use core::ptr::{addr_of, addr_of_mut, read_volatile, write_volatile};
+use core::fmt;
 
-use cubie_a7a_common::{mem, recovery};
+use cubie_a7a_common::{bakery, fwlog, mem, recovery};
+use psci_el3::{aff1_core_index, el3::Context, LockDenied, Platform, PowerOnError, Psci};
 
-use crate::{psci_lock, soc, Context};
+pub use psci_el3::{Cpu, State};
 
-const SMCCC_VERSION: u32 = 0x8000_0000;
-const SMCCC_ARCH_FEATURES: u32 = 0x8000_0001;
-const SMCCC_ARCH_WORKAROUND_1: u32 = 0x8000_8000;
-const SMCCC_ARCH_WORKAROUND_2: u32 = 0x8000_7fff;
-const SMCCC_ARCH_WORKAROUND_3: u32 = 0x8000_3fff;
-const PSCI_VERSION: u32 = 0x8400_0000;
-const CPU_SUSPEND: u32 = 0x8400_0001;
-const CPU_OFF: u32 = 0x8400_0002;
-const CPU_ON: u32 = 0x8400_0003;
-const AFFINITY_INFO: u32 = 0x8400_0004;
-const MIGRATE_INFO_TYPE: u32 = 0x8400_0006;
-const SYSTEM_OFF: u32 = 0x8400_0008;
-const SYSTEM_RESET: u32 = 0x8400_0009;
-const PSCI_FEATURES: u32 = 0x8400_000a;
-/// SMC64 calling convention bit.
-const SMC64: u32 = 0x4000_0000;
-
-const SUCCESS: i64 = 0;
-const NOT_SUPPORTED: i64 = -1;
-const NOT_REQUIRED: i64 = -2;
-/// SMCCC_ARCH_FEATURES for a workaround: implemented, not needed on this PE.
-const WA_UNAFFECTED: i64 = 1;
-const INVALID_PARAMETERS: i64 = -2;
-const DENIED: i64 = -3;
-const ALREADY_ON: i64 = -4;
-const ON_PENDING: i64 = -5;
-const INTERNAL_FAILURE: i64 = -6;
-const INVALID_ADDRESS: i64 = -9;
-
-const AFF_ON: i64 = 0;
-const AFF_OFF: i64 = 1;
-const AFF_ON_PENDING: i64 = 2;
+use crate::{psci_lock, soc};
 
 pub const MAX_CPUS: usize = 8;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-#[repr(u32)]
-pub enum State {
-    Off = 0,
-    On = 1,
-    OnPending = 2,
-}
+static PSCI: Psci<MAX_CPUS> = Psci::new();
 
-#[derive(Clone, Copy)]
-#[repr(C)]
-pub struct Cpu {
-    pub state: State,
-    pub entry: u64,
-    pub context: u64,
-    /// Redistributor frame, once known.
-    pub gicr: usize,
-}
+/// The A733 under the PSCI dispatcher.
+pub struct A733;
 
-const CPU_INIT: Cpu = Cpu {
-    state: State::Off,
-    entry: 0,
-    context: 0,
-    gicr: 0,
-};
-
-// Whole records are read/written only under the bakery guard. The state
-// word additionally has aligned ordered scalar access: AF_INFO can observe
-// exactly one published state without copying a concurrently changing record.
-static mut CPUS: [Cpu; MAX_CPUS] = [CPU_INIT; MAX_CPUS];
-
-fn state(idx: usize) -> State {
-    match unsafe { psci_lock::load32(addr_of!(CPUS[idx].state).cast()) } {
-        0 => State::Off,
-        1 => State::On,
-        2 => State::OnPending,
-        _ => panic!("invalid EL3 CPU state"),
+impl Platform for A733 {
+    type Guard<'a> = bakery::Guard<'static, psci_lock::Uncached>;
+    fn acquire(&self) -> Result<Self::Guard<'_>, LockDenied> {
+        psci_lock::acquire().map_err(|_| LockDenied)
     }
-}
-// Requires a live guard; do not expose an unlocked aggregate access.
-fn read_cpu(idx: usize) -> Cpu {
-    unsafe {
-        Cpu {
-            state: state(idx),
-            entry: read_volatile(addr_of!(CPUS[idx].entry)),
-            context: read_volatile(addr_of!(CPUS[idx].context)),
-            gicr: read_volatile(addr_of!(CPUS[idx].gicr)),
+    unsafe fn load32(&self, p: *const u32) -> u32 {
+        psci_lock::load32(p)
+    }
+    unsafe fn store32(&self, p: *mut u32, v: u32) {
+        psci_lock::store32(p, v)
+    }
+    fn barrier(&self) {
+        psci_lock::barrier()
+    }
+    fn current_core(&self) -> usize {
+        crate::current_core()
+    }
+    /// Aff1 = core number on the A733's single DynamIQ cluster.
+    fn core_index(&self, mpidr: u64) -> Option<usize> {
+        aff1_core_index::<MAX_CPUS>(mpidr)
+    }
+    fn valid_ns_entry(&self, entry: u64) -> bool {
+        // The handoff remains in EL3-owned RAM for the whole uptime.
+        let h = psci_lock::handoff();
+        mem::valid_payload_entry(h.dram_base, h.dram_size, entry)
+    }
+    fn cpu_power_on(&self, idx: usize) -> Result<(), PowerOnError> {
+        soc::cpu_power_on(idx, crate::warm_entry_addr()).map_err(|e| match e {
+            soc::PowerOnError::OffTimeout => PowerOnError::OffTimeout,
+            soc::PowerOnError::OnTimeout => PowerOnError::OnTimeout,
+        })
+    }
+    fn cpu_power_off_prepare(&self, idx: usize) {
+        soc::cpu_power_off_prepare(idx)
+    }
+    fn gic_cpu_off(&self, gicr: usize) {
+        crate::gic::cpu_off(gicr)
+    }
+    fn standby(&self) {
+        psci_lock::standby()
+    }
+    fn cpu_off_finish(&self) -> i64 {
+        crate::cpu_off_finish()
+    }
+    fn system_off(&self) -> i64 {
+        crate::system_off()
+    }
+    fn system_reset(&self) -> i64 {
+        crate::system_reset()
+    }
+    /// CVE-2022-23960: the A76 needs the branch history flushed, which the
+    /// EL3 entry path does on every SMC.
+    fn workaround_3_required(&self) -> bool {
+        crate::is_cortex_a76()
+    }
+    fn sip(&self, fid: u32) -> Option<i64> {
+        match fid {
+            recovery::SIP_BOOT_OK => Some(crate::boot_confirmed()),
+            fwlog::SIP_FWLOG_BASE => Some(fwlog::CUR_BASE as i64),
+            _ => None,
         }
     }
-}
-fn write_cpu(idx: usize, c: Cpu) {
-    unsafe {
-        write_volatile(addr_of_mut!(CPUS[idx].entry), c.entry);
-        write_volatile(addr_of_mut!(CPUS[idx].context), c.context);
-        write_volatile(addr_of_mut!(CPUS[idx].gicr), c.gicr);
-        psci_lock::store32(addr_of_mut!(CPUS[idx].state).cast(), c.state as u32);
+    fn log(&self, args: fmt::Arguments) {
+        print!("{args}");
     }
 }
+
 pub fn cpu(idx: usize) -> Cpu {
-    let _guard = psci_lock::acquire().expect("EL3 CPU-state lock unavailable");
-    read_cpu(idx)
+    PSCI.cpu(&A733, idx)
 }
+
 pub fn set_cpu(idx: usize, c: Cpu) {
-    let _guard = psci_lock::acquire().expect("EL3 CPU-state lock unavailable");
-    write_cpu(idx, c);
+    PSCI.set_cpu(&A733, idx, c)
 }
 
-/// Platform preparation completes before Off is published. CPU_ON then waits
-/// for PPU OFF before issuing a request, matching pinned A733 TF-A. Release
-/// the software guard before the caller's final WFI: no powered-off lock owner.
+/// Platform preparation completes before Off is published (the dispatcher's
+/// CPU_OFF path; also used by the host controls, tests/psci-host.rs.in).
+#[allow(dead_code)]
 pub fn prepare_cpu_off(idx: usize) -> Result<(), i64> {
-    let _guard = psci_lock::acquire().map_err(|_| DENIED)?;
-    let mut c = read_cpu(idx);
-    if c.state != State::On {
-        return Err(DENIED);
-    }
-    if c.gicr != 0 {
-        crate::gic::cpu_off(c.gicr);
-    }
-    soc::cpu_power_off_prepare(idx);
-    psci_lock::barrier();
-    c.state = State::Off;
-    write_cpu(idx, c);
-    Ok(())
-}
-
-/// Core index for an MPIDR affinity value as passed by the OS
-/// (Aff1 = core number on the A733's single DynamIQ cluster).
-pub fn core_index(mpidr: u64) -> Option<usize> {
-    let aff0 = mpidr & 0xff;
-    let aff1 = ((mpidr >> 8) & 0xff) as usize;
-    let aff2 = (mpidr >> 16) & 0xff;
-    let aff3 = (mpidr >> 32) & 0xff;
-    (aff0 == 0 && aff2 == 0 && aff3 == 0 && aff1 < MAX_CPUS).then_some(aff1)
-}
-
-fn valid_ns_entry(addr: u64) -> bool {
-    // The handoff remains in EL3-owned RAM for the whole uptime.
-    let h = psci_lock::handoff();
-    mem::valid_payload_entry(h.dram_base, h.dram_size, addr)
-}
-
-fn cpu_on(target: u64, entry: u64, context: u64) -> i64 {
-    let Some(idx) = core_index(target) else {
-        return INVALID_PARAMETERS;
-    };
-    if !valid_ns_entry(entry) {
-        return INVALID_ADDRESS;
-    }
-    let Ok(_guard) = psci_lock::acquire() else {
-        return DENIED;
-    };
-    let mut c = read_cpu(idx);
-    match c.state {
-        State::On => return ALREADY_ON,
-        State::OnPending => return ON_PENDING,
-        State::Off => {}
-    }
-    c.entry = entry;
-    c.context = context;
-    c.state = State::OnPending;
-    write_cpu(idx, c);
-    match soc::cpu_power_on(idx, crate::warm_entry_addr()) {
-        Ok(()) => SUCCESS,
-        Err(why) => {
-            println!("[main] PSCI CPU_ON cpu{idx}: {why:?}");
-            if why == soc::PowerOnError::OffTimeout {
-                c.state = State::Off;
-                write_cpu(idx, c);
-            }
-            // ON timeout is ambiguous: retain Pending so a late secondary can
-            // complete, and no second caller can reprogram an active core.
-            INTERNAL_FAILURE
-        }
-    }
-}
-
-fn affinity_info(target: u64, lowest_level: u64) -> i64 {
-    if lowest_level != 0 {
-        return INVALID_PARAMETERS;
-    }
-    match core_index(target).map(state) {
-        Some(State::On) => AFF_ON,
-        Some(State::Off) => AFF_OFF,
-        Some(State::OnPending) => AFF_ON_PENDING,
-        None => INVALID_PARAMETERS,
-    }
-}
-
-/// Only original-format, level-zero, state-ID-zero standby is implemented.
-/// Entry/context are ignored for standby. Power-down/cluster idle require a
-/// real save/restore sequence and are rejected instead of reporting success.
-fn cpu_suspend(power_state: u64) -> i64 {
-    if power_state != 0 {
-        return INVALID_PARAMETERS;
-    }
-    psci_lock::standby();
-    SUCCESS
-}
-
-/// SMCCC_ARCH_FEATURES, answered per calling core as TF-A does
-/// (services/arm_arch_svc). Linux asks each CPU separately.
-fn arch_features(fid: u32) -> i64 {
-    match fid {
-        SMCCC_VERSION | SMCCC_ARCH_FEATURES => SUCCESS,
-        // CVE-2017-5715: neither the A55 nor the A76 is affected.
-        SMCCC_ARCH_WORKAROUND_1 => WA_UNAFFECTED,
-        // CVE-2018-3639: A55 unaffected, the A76 has SSBS.
-        SMCCC_ARCH_WORKAROUND_2 => NOT_REQUIRED,
-        // CVE-2022-23960: the A76 needs the branch history flushed, which
-        // the EL3 entry path does on every SMC (`el3_lower_sync`).
-        SMCCC_ARCH_WORKAROUND_3 if crate::is_cortex_a76() => SUCCESS,
-        SMCCC_ARCH_WORKAROUND_3 => WA_UNAFFECTED,
-        _ => NOT_SUPPORTED,
-    }
-}
-
-fn canonical(fid: u32) -> Option<u32> {
-    if fid & SMC64 == 0 {
-        return Some(fid);
-    }
-    let base = fid & !SMC64;
-    matches!(base, CPU_SUSPEND | CPU_ON | AFFINITY_INFO).then_some(base)
-}
-fn features(fid: u32) -> i64 {
-    let Some(base) = canonical(fid) else {
-        return NOT_SUPPORTED;
-    };
-    match base {
-        // bit 1 clear: original power_state format
-        CPU_SUSPEND => 0,
-        PSCI_VERSION | CPU_OFF | CPU_ON | AFFINITY_INFO | MIGRATE_INFO_TYPE | SYSTEM_OFF
-        | SYSTEM_RESET | PSCI_FEATURES => SUCCESS,
-        SMCCC_VERSION => SUCCESS,
-        _ => NOT_SUPPORTED,
-    }
+    PSCI.prepare_cpu_off(&A733, idx)
 }
 
 /// Handle an SMC from the non-secure world; results go to x0..x3.
 pub fn handle_smc(ctx: &mut Context) {
-    let fid = ctx.x[0] as u32;
-    // SMC32 callers only own the low 32 bits of the arguments.
-    let arg = |i: usize| {
-        if fid & SMC64 != 0 {
-            ctx.x[i]
-        } else {
-            ctx.x[i] & 0xffff_ffff
-        }
-    };
-    let Some(base) = canonical(fid) else {
-        ctx.x[0] = NOT_SUPPORTED as u64;
-        return;
-    };
-    let ret: i64 = match base {
-        SMCCC_VERSION => 0x1_0001,
-        SMCCC_ARCH_FEATURES => arch_features(arg(1) as u32),
-        // The BHB flush already ran on entry; nothing else to do.
-        SMCCC_ARCH_WORKAROUND_1 | SMCCC_ARCH_WORKAROUND_3 => SUCCESS,
-        PSCI_VERSION => 0x1_0000,
-        CPU_SUSPEND => cpu_suspend(arg(1) as u32 as u64),
-        CPU_OFF => crate::cpu_off(),
-        CPU_ON => cpu_on(arg(1), arg(2), arg(3)),
-        AFFINITY_INFO => affinity_info(arg(1), arg(2) as u32 as u64),
-        MIGRATE_INFO_TYPE => 2, // no Trusted OS
-        recovery::SIP_BOOT_OK => crate::boot_confirmed(),
-        cubie_a7a_common::fwlog::SIP_FWLOG_BASE => cubie_a7a_common::fwlog::CUR_BASE as i64,
-        SYSTEM_OFF => crate::system_off(),
-        SYSTEM_RESET => crate::system_reset(),
-        PSCI_FEATURES => features(arg(1) as u32),
-        _ => {
-            println!("[main] unknown SMC function 0x{fid:08x}");
-            -1
-        }
-    };
-    ctx.x[0] = ret as u64;
+    PSCI.handle_smc(&A733, &mut ctx.x[..4])
 }

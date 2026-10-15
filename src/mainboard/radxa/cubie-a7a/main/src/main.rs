@@ -11,7 +11,7 @@
 #[macro_use]
 extern crate log;
 
-use core::arch::{asm, global_asm, naked_asm};
+use core::arch::{asm, naked_asm};
 use core::panic::PanicInfo;
 use core::ptr::{addr_of_mut, read_volatile, write_volatile};
 
@@ -20,10 +20,12 @@ use cubie_a7a_common::{
     uart::{init_logger, Uart},
     Handoff, HANDOFF_MAGIC, HANDOFF_VERSION,
 };
+use psci_el3::el3::{self, ArchEl3, Context, El3Regs, Trap};
 
 mod fdt;
 mod gic;
 mod gmac;
+mod io;
 #[cfg(feature = "memtest")]
 mod memtest;
 mod pcie;
@@ -43,28 +45,6 @@ const STACK_SIZE: usize = 16 * 1024;
 const BOOT_COLD: u32 = 0xc01d_b007;
 const BOOT_WARM: u32 = 0x0000_600d;
 static mut BOOT_STATE: u32 = BOOT_COLD;
-
-/// SCR_EL3: NS, RES1[5:4], HCE, SIF, RW (lower ELs are AArch64).
-const SCR_EL3_VAL: u64 = (1 << 0) | (0b11 << 4) | (1 << 8) | (1 << 9) | (1 << 10);
-/// SCTLR_EL2 RES1 bits; MMU and caches off.
-const SCTLR_EL2_VAL: u64 = 0x30c5_0830;
-/// HCR_EL2.RW: EL1 is AArch64.
-const HCR_EL2_VAL: u64 = 1 << 31;
-/// CPTR_EL2 RES1 bits; no FP/SIMD traps.
-const CPTR_EL2_VAL: u64 = 0x33ff;
-/// CNTHCTL_EL2: EL1 access to the physical counter and timer.
-const CNTHCTL_EL2_VAL: u64 = 0x3;
-/// SPSR_EL3 for the payload: EL2h, DAIF masked.
-const SPSR_EL2H: u64 = 0x3c9;
-
-/// Saved lower-EL context on SMC entry, see `el3_vectors`.
-#[repr(C)]
-pub struct Context {
-    pub x: [u64; 31],
-    pub elr: u64,
-    pub spsr: u64,
-    _pad: u64,
-}
 
 /// # Safety
 /// Reset entry (RVBAR) for every core: cold boot and PSCI warm boot.
@@ -126,108 +106,18 @@ pub fn warm_entry_addr() -> usize {
     start as *const () as usize
 }
 
-// EL3 exception vectors. SMCs from EL2/EL1 (AArch64 or AArch32) save the
-// full GPR context on SP_EL3 and go to `el3_sync_lower`; anything else is
-// reported and halts.
-global_asm!(
-    r#"
-    .section .text.vectors, "ax"
-    .balign 0x800
-    .global el3_vectors
-el3_vectors:
-    .irp idx, 0, 1, 2, 3, 4, 5, 6, 7
-    .balign 0x80
-    mov     x0, #\idx
-    b       el3_unhandled_entry
-    .endr
-    .balign 0x80                // 0x400: lower EL, AArch64, synchronous
-    b       el3_lower_sync
-    .balign 0x80
-    mov     x0, #9
-    b       el3_unhandled_entry
-    .balign 0x80
-    mov     x0, #10
-    b       el3_unhandled_entry
-    .balign 0x80
-    mov     x0, #11
-    b       el3_unhandled_entry
-    .balign 0x80                // 0x600: lower EL, AArch32, synchronous
-    b       el3_lower_sync
-    .irp idx, 13, 14, 15
-    .balign 0x80
-    mov     x0, #\idx
-    b       el3_unhandled_entry
-    .endr
-
-el3_lower_sync:
-    sub     sp, sp, #272
-    stp     x0, x1, [sp, #0]
-    // CVE-2022-23960 (Spectre-BHB): overwrite the branch history with 24
-    // taken branches before EL3 code runs (TF-A wa_cve_2022_23960_bhb,
-    // k = 24 for the A76). Harmless on the A55.
-    mov     x0, #24
-1:  b       2f
-2:  subs    x0, x0, #1
-    b.ne    1b
-    dsb     sy
-    isb
-    stp     x2, x3, [sp, #16]
-    stp     x4, x5, [sp, #32]
-    stp     x6, x7, [sp, #48]
-    stp     x8, x9, [sp, #64]
-    stp     x10, x11, [sp, #80]
-    stp     x12, x13, [sp, #96]
-    stp     x14, x15, [sp, #112]
-    stp     x16, x17, [sp, #128]
-    stp     x18, x19, [sp, #144]
-    stp     x20, x21, [sp, #160]
-    stp     x22, x23, [sp, #176]
-    stp     x24, x25, [sp, #192]
-    stp     x26, x27, [sp, #208]
-    stp     x28, x29, [sp, #224]
-    mrs     x0, elr_el3
-    stp     x30, x0, [sp, #240]
-    mrs     x0, spsr_el3
-    str     x0, [sp, #256]
-    mov     x0, sp
-    bl      el3_sync_lower
-    ldr     x0, [sp, #256]
-    msr     spsr_el3, x0
-    ldp     x30, x0, [sp, #240]
-    msr     elr_el3, x0
-    ldp     x0, x1, [sp, #0]
-    ldp     x2, x3, [sp, #16]
-    ldp     x4, x5, [sp, #32]
-    ldp     x6, x7, [sp, #48]
-    ldp     x8, x9, [sp, #64]
-    ldp     x10, x11, [sp, #80]
-    ldp     x12, x13, [sp, #96]
-    ldp     x14, x15, [sp, #112]
-    ldp     x16, x17, [sp, #128]
-    ldp     x18, x19, [sp, #144]
-    ldp     x20, x21, [sp, #160]
-    ldp     x22, x23, [sp, #176]
-    ldp     x24, x25, [sp, #192]
-    ldp     x26, x27, [sp, #208]
-    ldp     x28, x29, [sp, #224]
-    add     sp, sp, #272
-    eret
-
-el3_unhandled_entry:
-    mrs     x1, esr_el3
-    mrs     x2, elr_el3
-    mrs     x3, far_el3
-    bl      el3_unhandled
-    "#
-);
+// EL3 exception vectors: the shared psci-el3 `el3_vectors` (feature
+// `vectors`). SMCs from EL2/EL1 (AArch64 or AArch32) save the full GPR
+// context on SP_EL3 and come to `el3_sync_lower`; anything else goes to
+// `el3_unhandled`, which reports and halts.
 
 #[unsafe(no_mangle)]
 extern "C" fn el3_sync_lower(ctx: &mut Context) {
     let esr: u64;
     unsafe { asm!("mrs {}, esr_el3", out(reg) esr) };
-    match esr >> 26 {
-        0x17 | 0x13 => psci::handle_smc(ctx),
-        ec => {
+    match el3::classify(esr) {
+        Trap::Smc => psci::handle_smc(ctx),
+        Trap::Other(ec) => {
             println!(
                 "[main] unexpected trap from lower EL: EC {ec:#x} ESR {esr:#x} ELR {:#x}",
                 ctx.elr
@@ -239,12 +129,8 @@ extern "C" fn el3_sync_lower(ctx: &mut Context) {
 
 #[unsafe(no_mangle)]
 extern "C" fn el3_unhandled(kind: u64, esr: u64, elr: u64, far: u64) -> ! {
-    const NAMES: [&str; 4] = ["sync", "IRQ", "FIQ", "SError"];
-    let from = ["EL3/SP0", "EL3/SPx", "lower/A64", "lower/A32"][(kind / 4) as usize & 3];
-    println!(
-        "[main] EXCEPTION {} from {from}: ESR {esr:#x} ELR {elr:#x} FAR {far:#x}",
-        NAMES[(kind % 4) as usize]
-    );
+    let (name, from) = el3::unhandled_kind(kind);
+    println!("[main] EXCEPTION {name} from {from}: ESR {esr:#x} ELR {elr:#x} FAR {far:#x}");
     halt()
 }
 
@@ -272,95 +158,21 @@ fn current_core() -> usize {
     ((mpidr >> 8) & 0xff) as usize
 }
 
-const MIDR_PARTNUM_A76: u64 = 0xd0b;
-
-fn midr() -> u64 {
-    let v: u64;
-    unsafe { asm!("mrs {}, midr_el1", out(reg) v) };
-    v
-}
-
 pub fn is_cortex_a76() -> bool {
-    (midr() >> 4) & 0xfff == MIDR_PARTNUM_A76
+    el3::is_cortex_a76(ArchEl3.midr())
 }
 
-/// Cortex-A76 errata that need EL3 at every core reset, per TF-A
-/// (lib/cpus/aarch64/cortex_a76.S). This board's A76s are r4p1. The A55s
-/// are r2p0, which no A55 erratum handled by TF-A covers.
-fn cpu_errata() {
-    let midr = midr();
-    if (midr >> 4) & 0xfff != MIDR_PARTNUM_A76 {
-        return;
-    }
-    let rev = ((midr >> 16) & 0xf0) | (midr & 0xf); // 0xVR, e.g. 0x41
-    if (0x30..=0x41).contains(&rev) {
-        // Erratum 1946160: IMPDEF instruction patching slots 3, 4 and 5.
-        for (slot, a, b) in [
-            (3u64, 0x10_e390_0002u64, 0x10_fff0_0083u64),
-            (4, 0x10_e380_0082, 0x10_fff0_0083),
-            (5, 0x10_e380_0200, 0x10_fff0_03e0),
-        ] {
-            unsafe {
-                asm!(
-                    "msr S3_6_C15_C8_0, {slot}",
-                    "msr S3_6_C15_C8_2, {a}",
-                    "msr S3_6_C15_C8_3, {b}",
-                    "msr S3_6_C15_C8_1, {c}",
-                    slot = in(reg) slot,
-                    a = in(reg) a,
-                    b = in(reg) b,
-                    c = in(reg) 0x2_0010_03ffu64,
-                )
-            };
-        }
-        unsafe { asm!("isb") };
-    }
-}
-
-/// Per-core EL3 register setup, cold and warm boot.
+/// Per-core EL3 register setup, cold and warm boot (shared psci-el3: the
+/// CPU errata as data, SCR/CPTR/MDCR/CNTFRQ).
 fn el3_cpu_init() {
-    cpu_errata();
-    unsafe {
-        asm!(
-            "msr scr_el3, {scr}",
-            "msr cptr_el3, xzr",
-            "msr mdcr_el3, xzr",
-            "msr cntfrq_el0, {freq}",
-            "isb",
-            scr = in(reg) SCR_EL3_VAL,
-            freq = in(reg) soc::TIMER_HZ,
-        )
-    };
+    el3::el3_cpu_init(&mut ArchEl3, soc::TIMER_HZ);
 }
 
 /// Drop to EL2 at `entry` with `x0 = arg0`, `x1..x3 = 0`.
 fn enter_nonsecure(entry: u64, arg0: u64) -> ! {
-    unsafe {
-        asm!(
-            "msr sctlr_el2, {sctlr}",
-            "msr hcr_el2, {hcr}",
-            "msr cptr_el2, {cptr}",
-            "msr cnthctl_el2, {cnthctl}",
-            "msr cntvoff_el2, xzr",
-            "msr spsr_el3, {spsr}",
-            "msr elr_el3, {entry}",
-            "ic iallu",
-            "dsb sy",
-            "isb",
-            "eret",
-            sctlr = in(reg) SCTLR_EL2_VAL,
-            hcr = in(reg) HCR_EL2_VAL,
-            cptr = in(reg) CPTR_EL2_VAL,
-            cnthctl = in(reg) CNTHCTL_EL2_VAL,
-            spsr = in(reg) SPSR_EL2H,
-            entry = in(reg) entry,
-            in("x0") arg0,
-            in("x1") 0u64,
-            in("x2") 0u64,
-            in("x3") 0u64,
-            options(noreturn)
-        )
-    }
+    // SAFETY: entry is the payload or a PSCI CPU_ON entry checked by
+    // valid_ns_entry; EL3 state is abandoned.
+    unsafe { el3::enter_nonsecure(entry, arg0) }
 }
 
 fn build_dtb(h: &Handoff) -> usize {
@@ -476,10 +288,10 @@ extern "C" fn primary_main(mpidr: u64, core: usize) -> ! {
     for other in (0..psci::MAX_CPUS).filter(|&n| n != core) {
         soc::cpu_power_off_prepare(other);
     }
-    let irqs = gic::init_distributor();
+    let irqs = gic::init_distributor().unwrap_or_else(|e| panic!("GIC distributor: {e:?}"));
     let gicr = match gic::init_cpu(mpidr, core) {
         Ok(rd) => rd,
-        Err(()) => panic!("no GIC redistributor for MPIDR {mpidr:#x}"),
+        Err(e) => panic!("GIC redistributor for MPIDR {mpidr:#x}: {e:?}"),
     };
     println!("[main] GICv3: {irqs} interrupt lines, cpu{core} redistributor @ {gicr:#x}");
     psci::set_cpu(
@@ -534,8 +346,8 @@ extern "C" fn secondary_main(mpidr: u64, core: usize) -> ! {
     }
     match gic::init_cpu(mpidr, core) {
         Ok(rd) => c.gicr = rd,
-        Err(()) => {
-            println!("[main] cpu{core}: no GIC redistributor");
+        Err(e) => {
+            println!("[main] cpu{core}: GIC redistributor: {e:?}");
             halt()
         }
     }
@@ -544,14 +356,11 @@ extern "C" fn secondary_main(mpidr: u64, core: usize) -> ! {
     enter_nonsecure(c.entry, c.context)
 }
 
-/// PSCI CPU_OFF on the calling core: quiesce the GIC interface, arm the
-/// hotplug controller and WFI; the PPU then powers the core down. CPU_ON
-/// later restarts it from reset at `start`.
-pub fn cpu_off() -> i64 {
-    let core = current_core();
-    if let Err(code) = psci::prepare_cpu_off(core) {
-        return code;
-    }
+/// PSCI CPU_OFF on the calling core, after the dispatcher quiesced the GIC
+/// interface, armed the hotplug controller and published the core Off: WFI;
+/// the PPU then powers the core down. CPU_ON later restarts it from reset
+/// at `start`.
+pub fn cpu_off_finish() -> i64 {
     loop {
         unsafe { asm!("dsb sy", "wfi") };
     }

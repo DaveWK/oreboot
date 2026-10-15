@@ -18,8 +18,10 @@
 // The full domain list is kept so callers use names, not numbers.
 #![allow(dead_code)]
 
-use cubie_a7a_common::time::udelay;
-use util::mmio::{read32, write32};
+use arm_ppu::{Gate, Pck600};
+use cubie_a7a_common::mmio::Mmio;
+
+pub use arm_ppu::PpuError;
 
 pub const VI: u32 = 0;
 pub const DE_SYS: u32 = 1;
@@ -34,70 +36,36 @@ pub const VO: u32 = 9;
 pub const VO1: u32 = 10;
 pub const COUNT: u32 = 11;
 
-const PCK600_BASE: usize = 0x0706_0000;
-const R_CCU_R_PPU_GATE: usize = 0x0701_0000 + 0x1ac;
-
-const PWPR: usize = 0x000;
-const PWSR: usize = 0x008;
-const DCDR0: usize = 0x170;
-const DCDR1: usize = 0x174;
-const LPS0_DELAY: usize = 0xc00;
-const LPS1_DELAY: usize = 0xc04;
-const OFF2ON_DELAY: usize = 0xc10;
-
-const MODE_MASK: u32 = 0xf;
-const MODE_ON: u32 = 0x8;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PpuError {
-    /// No such domain.
-    BadDomain(u32),
-    /// PWSR did not report ON within 10 ms; holds the last PWSR value.
-    Timeout(u32),
-}
-
-const fn frame(domain: u32) -> usize {
-    PCK600_BASE + ((domain as usize) << 12)
-}
-
-fn open_bus_clock() {
-    let v = read32(R_CCU_R_PPU_GATE);
-    if v & 1 == 0 {
-        write32(R_CCU_R_PPU_GATE, v | 1);
-        udelay(10);
-    }
-}
+/// The A733's PCK-600 (shared `arm-ppu`): 4 KiB frames at 0x07060000,
+/// the transition delays of Linux's sun60i_a733_pck600_desc, the R_PPU bus
+/// clock gate, 1000 status polls 10 us apart (10 ms, as Linux allows).
+const PCK600: Pck600 = Pck600 {
+    base: 0x0706_0000,
+    frame_shift: 12,
+    count: COUNT,
+    setup: &[
+        (0x170, 0x001f_1f1f),
+        (0x174, 0x0000_1f1f),
+        (0xc00, 0x0808_0808),
+        (0xc04, 0x0000_0808),
+        (0xc10, 0x0000_0008),
+    ],
+    gate: Some(Gate {
+        addr: 0x0701_0000 + 0x1ac,
+        bit: 0,
+        settle_us: 10,
+    }),
+    polls: 1000,
+    poll_us: 10,
+};
 
 /// True if the domain's PPU reports ON.
 pub fn is_on(domain: u32) -> bool {
-    if domain >= COUNT {
-        return false;
-    }
-    open_bus_clock();
-    read32(frame(domain) + PWSR) & MODE_MASK == MODE_ON
+    PCK600.is_on(&mut Mmio, domain)
 }
 
 /// Power a domain on and wait (at most 10 ms, as Linux allows) for the PPU
 /// status to follow. Does nothing if it is already on.
 pub fn power_on(domain: u32) -> Result<(), PpuError> {
-    if domain >= COUNT {
-        return Err(PpuError::BadDomain(domain));
-    }
-    if is_on(domain) {
-        return Ok(());
-    }
-    let f = frame(domain);
-    write32(f + DCDR0, 0x001f_1f1f);
-    write32(f + DCDR1, 0x0000_1f1f);
-    write32(f + LPS0_DELAY, 0x0808_0808);
-    write32(f + LPS1_DELAY, 0x0000_0808);
-    write32(f + OFF2ON_DELAY, 0x0000_0008);
-    write32(f + PWPR, (read32(f + PWPR) & !MODE_MASK) | MODE_ON);
-    for _ in 0..1000 {
-        if read32(f + PWSR) & MODE_MASK == MODE_ON {
-            return Ok(());
-        }
-        udelay(10);
-    }
-    Err(PpuError::Timeout(read32(f + PWSR)))
+    PCK600.power_on(&mut Mmio, domain)
 }

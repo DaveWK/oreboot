@@ -26,6 +26,12 @@
 //! and clocks are up hangs the bus with no output. Nothing below touches
 //! 0x06xxxxxx before `clocks_on()` and every poll is bounded.
 //!
+//! The DesignWare RC part (express capability, RC set-up, LTSSM training,
+//! the directed speed change with its Gen1 fall-back, iATU, the endpoint
+//! probe) is the shared `dwc-pcie` crate; this file is the A733 around it
+//! ([`A733`]: pins, power domain, clocks, combo PHY, vendor glue) and the
+//! DT node.
+//!
 //! On success the link is trained, iATU region 1 maps MEM32 and region 2
 //! maps I/O; region 0 is left for the payload to retarget per config
 //! access (see `fdt_node`). On failure the controller is put back into
@@ -33,9 +39,11 @@
 //! on without PCIe.
 
 use cubie_a7a_common::time::{ticks, udelay, TIMER_HZ};
+use dwc_pcie::{Link, Platform, Window};
 use util::mmio::{read16, read32, write16, write32};
 
 use crate::fdt::Fdt;
+use crate::io::Io;
 use crate::ppu;
 
 // --- CCU (vendor ccu-sun60iw2.c) -------------------------------------------
@@ -84,12 +92,6 @@ const LTSSM_EN: u32 = 1 << 0;
 const APP_LINK_STAT: usize = APP + 0xe0c;
 const LINK_UP: u32 = 0b11; // SMLH | RDLH
 
-const PORT_LINK_CTRL: usize = DBI + 0x710;
-const PL_DEBUG0: usize = DBI + 0x728; // [5:0] LTSSM state
-const GEN2_CTRL: usize = DBI + 0x80c; // [16:8] width, bit 17 speed change
-const SPEED_CHANGE: u32 = 1 << 17;
-const MISC_CONTROL_1: usize = DBI + 0x8bc; // bit 0 DBI_RO_WR_EN
-
 // --- Windows (vendor DT `ranges`), CPU address == PCI address except I/O --------
 pub const CFG_BASE: u64 = 0x2000_0000;
 /// The part of the 16 MiB config window iATU region 0 decodes.
@@ -100,11 +102,6 @@ pub const IO_SIZE: u64 = 0x1_0000;
 pub const MEM_BASE: u64 = 0x2200_0000;
 pub const MEM_SIZE: u64 = 0x0600_0000;
 
-const ATU_TYPE_MEM: u32 = 0;
-const ATU_TYPE_IO: u32 = 2;
-const ATU_TYPE_CFG0: u32 = 4;
-const ATU_ENABLE: u32 = 1 << 31;
-
 /// Target speed after the Gen1 link is up (the vendor DT's max-link-speed).
 const MAX_GEN: u32 = 3;
 
@@ -113,30 +110,14 @@ const MAX_GEN: u32 = 3;
 /// adapter here turns out to need the same.
 const PERST_HOLD_US: u64 = 100_000;
 
+/// The A733's own failures (the DesignWare ones are `dwc_pcie::Error`).
 // The fields are only read through `{:?}` in the log.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
-enum Error {
+pub enum BoardError {
     PowerDomain(ppu::PpuError),
     /// Combo PHY PMA never reported ready (top + 0x900).
     PmaTimeout(u32),
-    /// No PCIe express capability in the RC's config space.
-    NoExpressCap,
-    /// The LTSSM never left Detect: nothing in the slot.
-    Empty,
-    /// LINK_STAT and the last LTSSM state.
-    LinkTimeout(u32, u32),
-    /// The endpoint never answered config reads (last value).
-    NoEndpoint(u32),
-}
-
-#[derive(Clone, Copy)]
-struct Link {
-    gen: u32,
-    width: u32,
-    /// Endpoint vendor ID | device ID << 16.
-    id: u32,
-    class: u32,
 }
 
 static mut LINK: Option<Link> = None;
@@ -269,7 +250,7 @@ fn clocks_on() {
     );
 }
 
-fn phy_init() -> Result<(), Error> {
+fn phy_init() -> Result<(), BoardError> {
     for op in PHY_TABLE {
         match *op {
             Top32(off, v) => write32(C1_TOP + off as usize, v),
@@ -283,7 +264,7 @@ fn phy_init() -> Result<(), Error> {
     set32(C1_TOP, 1);
     set32(C1_TOP + 0x100, 1);
     if !wait(100_000, 100, || read32(C1_TOP + 0x900) & 1 != 0) {
-        return Err(Error::PmaTimeout(read32(C1_TOP + 0x900)));
+        return Err(BoardError::PmaTimeout(read32(C1_TOP + 0x900)));
     }
     write16(C1_PHY + 0xa0, 0x270);
     write16(C1_PHY + 0x98, read16(C1_PHY + 0x98) | (1 << 4));
@@ -292,204 +273,94 @@ fn phy_init() -> Result<(), Error> {
     Ok(())
 }
 
-fn find_express_cap() -> Option<usize> {
-    let mut ptr = (read16(DBI + 0x34) & 0xff) as usize;
-    for _ in 0..48 {
-        if ptr == 0 || ptr > 0xfc {
-            return None;
-        }
-        let hdr = read16(DBI + ptr);
-        if hdr & 0xff == 0x10 {
-            return Some(ptr);
-        }
-        ptr = (hdr >> 8) as usize;
-    }
-    None
-}
-
-/// sunxi_pcie_host_setup_rc(), training first at Gen1. RC BARs are
-/// disabled through their DBI2 masks (the vendor EP driver's BAR_ENABLE
-/// register) so the payload sees a plain bridge.
-fn setup_rc() -> Result<usize, Error> {
-    set32(MISC_CONTROL_1, 1);
-    let Some(cap) = find_express_cap() else {
-        clr32(MISC_CONTROL_1, 1);
-        return Err(Error::NoExpressCap);
-    };
-    rmw32(DBI + cap + 0x0c, 0xf, MAX_GEN); // LNKCAP: max link speed
-    rmw32(DBI + cap + 0x30, 0xf, 1); // LNKCTL2: target Gen1 for training
-    rmw32(PORT_LINK_CTRL, 0x3f << 16, 1 << 16); // x1
-    rmw32(GEN2_CTRL, 0x1ff << 8, 1 << 8);
-    write32(DBI2 + 0x10, 0);
-    write32(DBI2 + 0x14, 0);
-    write32(DBI + 0x10, 0);
-    write32(DBI + 0x14, 0);
-    rmw32(DBI + 0x3c, 0xff00, 0x0100); // interrupt pin INTA
-    rmw32(DBI + 0x18, 0x00ff_ffff, 0x00ff_0100); // buses 0 / 1 / 0xff
-    rmw32(DBI + 0x04, 0xffff, (1 << 0) | (1 << 1) | (1 << 2) | (1 << 8));
-    write16(DBI + 0x0a, 0x0604); // class: PCI-to-PCI bridge
-    clr32(MISC_CONTROL_1, 1);
-    Ok(cap)
-}
-
-fn ltssm() -> u32 {
-    read32(PL_DEBUG0) & 0x3f
-}
-
 fn link_up() -> bool {
     read32(APP_LINK_STAT) & LINK_UP == LINK_UP
 }
 
-/// LTSSM on, then wait for SMLH + RDLH. A slot whose LTSSM stays in
-/// Detect (states 0/1) for 100 ms is empty; a link that started training
-/// gets 1 s, as the vendor's 20 x 100 ms.
-fn train() -> Result<(), Error> {
-    set32(APP_LTSSM_CTRL, LTSSM_EN);
-    let t = ticks();
-    let mut seen = false;
-    loop {
-        if link_up() {
-            return Ok(());
+/// The A733 around the DesignWare core (vendor BSP order).
+pub struct A733;
+
+impl Platform<Io> for A733 {
+    type Error = BoardError;
+    fn perst(&mut self, _: &mut Io, asserted: bool) {
+        pe_out(PIN_PERST, !asserted);
+    }
+    fn slot_power(&mut self, _: &mut Io, on: bool) {
+        pe_out(PIN_POWER, on);
+        if on {
+            pe_out(PIN_WAKE, true); // the vendor driver drives WAKE# high too
         }
-        let s = ltssm();
-        seen |= s > 1;
-        let us = us_since(t);
-        if !seen && us >= 100_000 {
-            return Err(Error::Empty);
+    }
+    fn power_domain_on(&mut self, _: &mut Io) -> Result<(), BoardError> {
+        ppu::power_on(ppu::PCIE).map_err(BoardError::PowerDomain)
+    }
+    fn clocks_on(&mut self, _: &mut Io) {
+        clocks_on();
+    }
+    fn phy_init(&mut self, _: &mut Io) -> Result<(), BoardError> {
+        phy_init()
+    }
+    fn after_phy(&mut self, _: &mut Io) {
+        println!(
+            "[main] PCIe: PHY ready; LTSSM_CTRL {:#x}, PHY_CFG {:#010x}",
+            read32(APP_LTSSM_CTRL),
+            read32(APP_PHY_CFG)
+        );
+    }
+    fn ltssm_enable(&mut self, _: &mut Io, on: bool) {
+        if on {
+            set32(APP_LTSSM_CTRL, LTSSM_EN);
+        } else {
+            clr32(APP_LTSSM_CTRL, LTSSM_EN);
         }
-        if us >= 1_000_000 {
-            return Err(Error::LinkTimeout(read32(APP_LINK_STAT), s));
-        }
-        udelay(100);
     }
-}
-
-fn link_status(cap: usize) -> (u32, u32) {
-    let sta = read16(DBI + cap + 0x12) as u32;
-    (sta & 0xf, (sta >> 4) & 0x3f)
-}
-
-/// sunxi_pcie_host_speed_change(): raise the target speed and request a
-/// directed speed change. If the link does not come back within 100 ms,
-/// retrain at Gen1 rather than lose it.
-fn speed_up(cap: usize) -> Result<(), Error> {
-    if MAX_GEN <= 1 {
-        return Ok(());
+    fn link_up(&mut self, _: &mut Io) -> bool {
+        link_up()
     }
-    set32(MISC_CONTROL_1, 1);
-    rmw32(DBI + cap + 0x30, 0xf, MAX_GEN);
-    clr32(GEN2_CTRL, SPEED_CHANGE);
-    set32(GEN2_CTRL, SPEED_CHANGE);
-    clr32(MISC_CONTROL_1, 1);
-    let done = wait(20_000, 100, || read32(GEN2_CTRL) & SPEED_CHANGE == 0);
-    let back = wait(100_000, 100, || {
-        link_up() && read16(DBI + cap + 0x12) & (1 << 11) == 0 // not training
-    });
-    if back {
-        if !done {
-            println!("[main] PCIe: speed change bit did not clear");
-        }
-        return Ok(());
+    fn link_status(&mut self, _: &mut Io) -> u32 {
+        read32(APP_LINK_STAT)
     }
-    println!("[main] PCIe: link lost after the Gen{MAX_GEN} change; retraining at Gen1");
-    rmw32(DBI + cap + 0x30, 0xf, 1);
-    set32(DBI + cap + 0x10, 1 << 5); // LNKCTL: retrain link
-    if wait(100_000, 100, link_up) {
-        Ok(())
-    } else {
-        Err(Error::LinkTimeout(read32(APP_LINK_STAT), ltssm()))
-    }
-}
-
-fn atu_outbound(region: usize, kind: u32, cpu: u64, pci: u64, size: u64) {
-    let r = ATU + region * 0x200;
-    write32(r + 0x08, cpu as u32);
-    write32(r + 0x0c, (cpu >> 32) as u32);
-    write32(r + 0x10, (cpu + size - 1) as u32);
-    write32(r + 0x14, pci as u32);
-    write32(r + 0x18, (pci >> 32) as u32);
-    write32(r + 0x00, kind);
-    write32(r + 0x04, ATU_ENABLE);
-    if !wait(20_000, 1000, || read32(r + 0x04) & ATU_ENABLE != 0) {
-        println!("[main] PCIe: iATU region {region} did not enable");
-    }
-}
-
-/// Read bus 1 device 0 through iATU region 0. After training, devices may
-/// answer Configuration Request Retry (seen as vendor 0x0001 or all ones)
-/// for up to 1 s.
-fn endpoint_id() -> Result<(u32, u32), Error> {
-    atu_outbound(0, ATU_TYPE_CFG0, CFG_BASE, 1 << 24, CFG_WINDOW);
-    let cfg = CFG_BASE as usize;
-    let mut id = 0;
-    let ok = wait(1_000_000, 10_000, || {
-        id = read32(cfg);
-        id != 0xffff_ffff && id != 0 && id & 0xffff != 0x0001
-    });
-    if !ok {
-        return Err(Error::NoEndpoint(id));
-    }
-    Ok((id, read32(cfg + 0x08) >> 8))
-}
-
-fn bring_up(clocked: &mut bool) -> Result<Link, Error> {
-    pe_out(PIN_PERST, false);
-    pe_out(PIN_POWER, true);
-    pe_out(PIN_WAKE, true); // the vendor driver drives WAKE# high too
-    let t_power = ticks();
-
-    ppu::power_on(ppu::PCIE).map_err(Error::PowerDomain)?;
-    clocks_on();
-    *clocked = true;
-    phy_init()?;
-    println!(
-        "[main] PCIe: PHY ready; LTSSM_CTRL {:#x}, PHY_CFG {:#010x}",
-        read32(APP_LTSSM_CTRL),
-        read32(APP_PHY_CFG)
-    );
-    clr32(APP_LTSSM_CTRL, LTSSM_EN);
-
-    let held = us_since(t_power);
-    if held < PERST_HOLD_US {
-        udelay(PERST_HOLD_US - held);
-    }
-    pe_out(PIN_PERST, true);
-
-    let cap = setup_rc()?;
-    train()?;
-    speed_up(cap)?;
-    // PCIe base spec 6.6.1: 100 ms after training before the first config
-    // request (above 5 GT/s; also covers PERST# release at lower speeds).
-    udelay(100_000);
-    let (gen, width) = link_status(cap);
-    let (id, class) = endpoint_id()?;
-    atu_outbound(1, ATU_TYPE_MEM, MEM_BASE, MEM_BASE, MEM_SIZE);
-    atu_outbound(2, ATU_TYPE_IO, IO_CPU, 0, IO_SIZE);
-    Ok(Link { gen, width, id, class })
-}
-
-/// Back to the state a cold boot leaves: training off, endpoint in reset,
-/// controller in reset with its clocks gated, slot rail off. The serdes
-/// subsystem and the shared AHB/MBUS serdes gates stay on (USB uses them).
-fn shut_down(clocked: bool) {
-    if clocked {
-        clr32(APP_LTSSM_CTRL, LTSSM_EN);
-    }
-    pe_out(PIN_PERST, false);
-    if clocked {
+    /// Controller back into reset with its clocks gated. The serdes
+    /// subsystem and the shared AHB/MBUS serdes gates stay on (USB uses
+    /// them).
+    fn clocks_off(&mut self, _: &mut Io) {
         clr32(ITS_BGR, (1 << 16) | (1 << 1));
         clr32(PCIE_AXI_SLV_CLK, GATE);
         clr32(PCIE_AUX_CLK, GATE);
         clr32(PCIE_BGR, (1 << 17) | (1 << 16));
     }
-    pe_out(PIN_POWER, false);
 }
+
+/// The A733's RC: DBI, DBI2 and iATU bases, Gen3 x1, the windows of the
+/// vendor DT.
+const CONFIG: dwc_pcie::Config = dwc_pcie::Config {
+    dbi: DBI,
+    dbi2: DBI2,
+    atu: ATU,
+    max_gen: MAX_GEN,
+    lanes: 1,
+    perst_hold_us: PERST_HOLD_US,
+    config: Window {
+        cpu: CFG_BASE,
+        pci: 0,
+        size: CFG_WINDOW,
+    },
+    mem: Window {
+        cpu: MEM_BASE,
+        pci: MEM_BASE,
+        size: MEM_SIZE,
+    },
+    io: Window {
+        cpu: IO_CPU,
+        pci: 0,
+        size: IO_SIZE,
+    },
+};
 
 /// Bring the root complex and the link up. Never fails the boot.
 pub fn init() {
     let t = ticks();
-    let mut clocked = false;
-    match bring_up(&mut clocked) {
+    match dwc_pcie::init(&mut Io, &mut A733, &CONFIG) {
         Ok(l) => {
             println!(
                 "[main] PCIe: link up Gen{} x{}, endpoint {:04x}:{:04x} class {:06x} ({} ms)",
@@ -504,9 +375,9 @@ pub fn init() {
             unsafe { LINK = Some(l) };
         }
         Err(e) => {
-            shut_down(clocked);
+            // dwc_pcie::init has shut the controller and the slot down.
             match e {
-                Error::Empty => {
+                dwc_pcie::Error::Empty => {
                     println!("[main] PCIe: slot empty ({} ms)", us_since(t) / 1000);
                 }
                 e => {
