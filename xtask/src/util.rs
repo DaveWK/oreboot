@@ -209,14 +209,15 @@ fn find_binutils_prefix(arch: &str) -> Option<String> {
     trace!("find binutils prefix");
     for prefix in [
         "rust-".to_string(),
+        "llvm-".to_string(),
         format!("{arch}-unknown-elf-"),
         format!("{arch}-linux-gnu-"),
     ] {
         let mut cmd = Command::new(format!("{prefix}objcopy"));
         cmd.arg("--version");
         cmd.stdout(Stdio::null());
-        let status = cmd.status().unwrap();
-        if status.success() {
+        // A prefix whose objcopy is not installed is simply not a match.
+        if cmd.status().is_ok_and(|s| s.success()) {
             trace!("found binutils with prefix '{prefix}'");
             return Some(prefix);
         }
