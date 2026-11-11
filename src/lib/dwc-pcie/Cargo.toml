@@ -1,0 +1,13 @@
+[package]
+name = "dwc-pcie"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "GPL-2.0-only"
+description = "DesignWare PCIe root complex bring-up over regio: RC setup, LTSSM training, speed change, iATU, endpoint probe; SoC glue behind a trait (no_std)"
+
+[dependencies]
+regio = { path = "../regio" }
+
+[dev-dependencies]
+regio = { path = "../regio", features = ["mock"] }

@@ -1,0 +1,10 @@
+[package]
+name = "netid"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "GPL-2.0-only"
+description = "Stable locally administered Ethernet MAC addresses from a SoC chip ID"
+
+[dependencies]
+sha256 = { path = "../sha256" }

@@ -1,0 +1,9 @@
+[package]
+name = "arch-timer"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "GPL-2.0-only"
+description = "Arm generic timer counter (AArch32 CNTPCT, AArch64 CNTPCT_EL0) and counter-based delays, frequency as a parameter"
+
+[dependencies]

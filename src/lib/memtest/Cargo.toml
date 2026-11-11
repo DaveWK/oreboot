@@ -1,0 +1,10 @@
+[package]
+name = "memtest"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "GPL-2.0-only"
+description = "Destructive DRAM test planning, patterns, passes, quick check and guarded soak (no_std)"
+
+[dependencies]
+dram-train = { path = "../dram-train" }

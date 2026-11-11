@@ -1,0 +1,19 @@
+[package]
+name = "psci-el3"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "GPL-2.0-only"
+description = "EL3 PSCI 1.0 / SMCCC 1.1 dispatcher and per-core state for the non-secure world; SoC power hooks behind a trait (no_std)"
+
+[dependencies]
+regio = { path = "../regio" }
+
+[features]
+# The EL3 exception vector table (AArch64): calls the board's el3_sync_lower
+# and el3_unhandled.
+vectors = []
+
+[dev-dependencies]
+bakery = { path = "../bakery" }
+regio = { path = "../regio", features = ["mock"] }
