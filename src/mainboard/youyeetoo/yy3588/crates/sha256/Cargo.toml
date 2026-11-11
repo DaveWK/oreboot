@@ -1,0 +1,9 @@
+[package]
+name = "sha256"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "GPL-2.0-only"
+description = "SHA-256 for firmware stages (no_std, no allocation)"
+
+[dependencies]

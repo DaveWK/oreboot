@@ -1,0 +1,19 @@
+[package]
+name = "rk3588-fastboot"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "GPL-2.0-only"
+description = "RK3588 (YY3588) fastboot gadget for bt0: USB3OTG0 GRF/PHY bring-up for dwc3-udc, the fastboot device (eMMC targets behind a hook, boot of a downloaded FIT through the BL31 handoff), memory layout (no_std)"
+
+[dependencies]
+regio = { path = "../regio" }
+rk3588 = { path = "../rk3588" }
+fastboot = { path = "../fastboot" }
+sparse = { path = "../sparse" }
+dwc3-udc = { path = "../dwc3-udc", features = ["fastboot"] }
+
+[dev-dependencies]
+regio = { path = "../regio", features = ["mock"] }
+fdt-writer = { path = "../fdt-writer" }
+sha256 = { path = "../sha256" }

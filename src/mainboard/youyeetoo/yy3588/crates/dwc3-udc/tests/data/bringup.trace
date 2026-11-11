@@ -1,0 +1,114 @@
+# Udc::init on the RK3588 USB3OTG0 (base 0xfc000000, TRM P2 p.2187) while
+# the BootROM's MaskROM device is still running. Reviewed line by line
+# against mainline U-Boot drivers/usb/dwc3 (core.c dwc3_core_init,
+# dwc3_phy_setup, dwc3_core_soft_reset; gadget.c dwc3_gadget_start,
+# __dwc3_gadget_ep_enable, dwc3_gadget_run_stop; ep0.c
+# dwc3_ep0_out_start) and the TRM register pages. The platform's GRF/PHY
+# writes happen before this (Dwc3Platform::bring_up, not traced here).
+#
+# GSNPSID (TRM p.2200): 'U3' + revision (core.c dwc3_core_is_valid);
+# 3.00a as read on the RK3588 (first hardware run). 3.30a gives the same
+# program (bringup_trace.rs); only <= 1.94a would skip GUSB3PIPECTL.SUSPHY.
+R32 fc00c120 5533300a
+P [usb] dwc3 GSNPSID 0x5533300a (DWC_usb3 3.00a)\n
+# Stop the BootROM session: DCTL Run/Stop off (TRM p.2219), acknowledge its
+# pending event (GEVNTCOUNT, p.2215) until DSTS.DevCtrlHlt (p.2224).
+R32 fc00c704 80f00000
+W32 fc00c704 00f00000
+R32 fc00c40c 00000004
+W32 fc00c40c 00000004
+R32 fc00c70c 00520000
+# Device soft reset: DCTL = CSFTRST, poll until clear (core.c dwc3_core_init).
+W32 fc00c704 40000000
+R32 fc00c704 00000000
+# dwc3_phy_setup: GUSB3PIPECTL (p.2210) SUSPHY set, DEPOCHANGE clear
+# (snps,dis-del-phy-power-chg-quirk).
+R32 fc00c2c0 00000000
+W32 fc00c2c0 00020000
+# GUSB2PHYCFG (p.2207): PHYIf = 16-bit, USBTrdTim = 5 (phy_type utmi_wide,
+# core.c dwc3_hsphy_mode_setup), then 100 ms.
+R32 fc00c200 40102400
+W32 fc00c200 40101408
+D 100000
+# U2_FREECLK_EXISTS and ENBLSLPM clear (snps,dis-u2-freeclk-exists-quirk,
+# snps,dis_enblslpm_quirk); SUSPHY stays 0 (deliberate, see lib.rs); 100 ms.
+R32 fc00c200 40101408
+W32 fc00c200 00101408
+D 100000
+# dwc3_core_soft_reset: CSFTRST again with Run/Stop clear, poll, 100 ms.
+R32 fc00c704 00000000
+W32 fc00c704 40000000
+R32 fc00c704 00000000
+D 100000
+# GCTL (pp.2193-2195): scale-down off, scrambling on, no hibernation,
+# PrtCapDir = device (2; already the reset value).
+R32 fc00c110 13512000
+W32 fc00c110 13512000
+# Event buffer 0 (core.c dwc3_event_buffers_setup; pp.2214-2215): address
+# (host address, masked by the test), 1024 bytes, count 0.
+W32 fc00c400 a8001000
+W32 fc00c404 00007f95
+W32 fc00c408 00000400
+W32 fc00c40c 00000000
+# DCFG (p.2219): High-Speed, device address 0 (the BootROM's address 3
+# survives the soft reset), LPMCap clear (gadget.c dwc3_gadget_start).
+R32 fc00c700 00080018
+W32 fc00c700 00080000
+# ep0: DEPSTARTCFG XferRscIdx 0 on physical ep0 (gadget.c
+# dwc3_gadget_start_config; DEPnCMD p.2227: PAR2, PAR1, PAR0, then the
+# command with CmdAct, polled until CmdAct clears).
+W32 fc00c800 00000000
+W32 fc00c804 00000000
+W32 fc00c808 00000000
+W32 fc00c80c 00000409
+R32 fc00c80c 00000009
+R32 fc00c80c 00000009
+# DEPCFG ep0 OUT: control, 512 bytes until ConnectDone; XferComplete +
+# XferNotReady, number 0 (gadget.c dwc3_gadget_set_ep_config).
+W32 fc00c800 00000000
+W32 fc00c804 00000500
+W32 fc00c808 00001000
+W32 fc00c80c 00000401
+R32 fc00c80c 00000001
+R32 fc00c80c 00000001
+# DEPXFERCFG ep0 OUT: one transfer resource; DALEPENA (p.2226) bit 0.
+W32 fc00c800 00000000
+W32 fc00c804 00000000
+W32 fc00c808 00000001
+W32 fc00c80c 00000402
+R32 fc00c80c 00000002
+R32 fc00c80c 00000002
+R32 fc00c720 00000000
+W32 fc00c720 00000001
+# ep0 IN (physical 1): the same, number 1, TX FIFO 0; DALEPENA bit 1.
+W32 fc00c810 00000000
+W32 fc00c814 02000500
+W32 fc00c818 00001000
+W32 fc00c81c 00000401
+R32 fc00c81c 00000001
+R32 fc00c81c 00000001
+W32 fc00c810 00000000
+W32 fc00c814 00000000
+W32 fc00c818 00000001
+W32 fc00c81c 00000402
+R32 fc00c81c 00000002
+R32 fc00c81c 00000002
+R32 fc00c720 00000001
+W32 fc00c720 00000003
+# First SETUP: STARTTRANSFER on physical ep0 with the SETUP TRB's address
+# (PAR0 high, PAR1 low; host address, masked); XferRscIdx comes back in
+# DEPCMD[22:16] (ep0.c dwc3_ep0_start_trans / dwc3_ep0_out_start).
+W32 fc00c800 00000000
+W32 fc00c804 a8001400
+W32 fc00c808 00007f95
+W32 fc00c80c 00000406
+R32 fc00c80c 00010006
+R32 fc00c80c 00010006
+# DEVTEN (p.2223): U-Boot gadget.c dwc3_gadget_enable_irq's set.
+W32 fc00c708 00001e1f
+# Connect: Run/Stop on, KeepConnect clear; wait for DevCtrlHlt to clear
+# (gadget.c dwc3_gadget_run_stop).
+R32 fc00c704 00000000
+W32 fc00c704 80000000
+R32 fc00c70c 00120000
+P [usb] device controller running, waiting for the host\n

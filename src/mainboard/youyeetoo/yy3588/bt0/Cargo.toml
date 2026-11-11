@@ -1,0 +1,44 @@
+[package]
+name = "yy3588-bt0"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "GPL-2.0-only"
+description = "youyeetoo YY3588 (RK3588) first stage: console, DRAM (rkbin handoff now, own init later), FIT from eMMC, TF-A BL31 + EDK2 handoff"
+
+[features]
+default = []
+# Full PMIC/rail dump, SPI2 diagnostics and the dram-info report.
+diag = ["dram-info"]
+# Linked at DRAM 0x0 and run after DRAM is up: the idblock "boot" image of
+# the stepping-stone image (rkbin DDR init as "init") and the 472 part of
+# the MaskROM USB loader. Without it bt0 links at SYSTEM_SRAM 0xff001000.
+stepping-stone = []
+# Print the dram-info report and write its record at 0x1F0000.
+dram-info = []
+# The 472 part of the MaskROM USB loader (rkdeveloptool db): after
+# dram-info, serve fastboot on the USB-C OTG port (src/usb.rs, FASTBOOT.md).
+usb-loader = ["stepping-stone"]
+# Call rk3588::ddr::init when no OS_REG handoff is found (WIP, untested).
+own-ddr = []
+
+[dependencies]
+regio = { path = "../crates/regio" }
+rk3588 = { path = "../crates/rk3588" }
+sdhci = { path = "../crates/sdhci" }
+dwc3-udc = { path = "../crates/dwc3-udc", features = ["fastboot"] }
+fastboot = { path = "../crates/fastboot" }
+# usb.rs is compiled in every build (main.rs calls it under cfg!), and
+# only linked into the usb-loader one.
+rk3588-fastboot = { path = "../crates/rk3588-fastboot" }
+
+[profile.release]
+opt-level = "s"
+lto = true
+panic = "abort"
+debug = true
+
+[profile.dev]
+panic = "abort"
+
+[workspace]

@@ -1,0 +1,9 @@
+[package]
+name = "sparse"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "GPL-2.0-only"
+description = "Android sparse image validation and execution over a block writer (no_std, no allocation)"
+
+[dependencies]

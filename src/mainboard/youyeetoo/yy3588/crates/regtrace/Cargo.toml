@@ -1,0 +1,10 @@
+[package]
+name = "regtrace"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "GPL-2.0-only"
+description = "Host-only register-access traces: record regio accesses, read and render traces, compare a generated register program with a reference per register and field"
+
+[dependencies]
+regio = { path = "../regio" }

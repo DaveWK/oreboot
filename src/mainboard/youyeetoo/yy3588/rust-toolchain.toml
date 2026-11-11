@@ -1,0 +1,7 @@
+# bt0 and the host tools build on this exact stable release (not oreboot's
+# nightly); the workspace Makefile calls `cargo +1.99.0` explicitly.
+[toolchain]
+channel = "1.99.0"
+profile = "minimal"
+components = ["rustfmt", "clippy"]
+targets = ["aarch64-unknown-none-softfloat"]

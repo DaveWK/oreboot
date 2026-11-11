@@ -1,0 +1,20 @@
+[package]
+name = "dwc3-udc"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "GPL-2.0-only"
+description = "Polled USB 2.0 device on a Synopsys DesignWare USB3 (DWC3) controller in device mode: event buffer, ep0 control transfers, one bulk IN/OUT pair, SoC bring-up behind a platform trait (no_std)"
+
+[features]
+# fastboot::Transport for Udc.
+fastboot = ["dep:fastboot"]
+
+[dependencies]
+regio = { path = "../regio" }
+usb-device = { path = "../usb-device" }
+fastboot = { path = "../fastboot", optional = true }
+
+[dev-dependencies]
+regtrace = { path = "../regtrace" }
+fastboot = { path = "../fastboot" }

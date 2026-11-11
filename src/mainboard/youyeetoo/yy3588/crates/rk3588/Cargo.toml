@@ -1,0 +1,20 @@
+[package]
+name = "rk3588"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "GPL-2.0-only"
+description = "Rockchip RK3588 first-stage support for the youyeetoo YY3588 bt0: DDR (DDRCTL x4 + DDRPHY x4) init and training, OS_REG handoff, DDRSCH, RK806 over SPI2, FIT walking and the TF-A BL31 handoff (no_std)"
+
+[dependencies]
+regio = { path = "../regio" }
+jedec-lpddr = { path = "../jedec-lpddr" }
+fdt-checked = { path = "../fdt-checked" }
+sha256 = { path = "../sha256" }
+fdt-writer = { path = "../fdt-writer" }
+dwc-ddrctl = { path = "../dwc-ddrctl" }
+dram-train = { path = "../dram-train" }
+memtest = { path = "../memtest" }
+
+[dev-dependencies]
+regtrace = { path = "../regtrace" }

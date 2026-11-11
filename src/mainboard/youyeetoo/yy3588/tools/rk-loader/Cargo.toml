@@ -1,0 +1,10 @@
+[package]
+name = "rk-loader"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-2.0-only"
+description = "Rockchip MaskROM USB loader (.bin for rkdeveloptool db) from documented/GPL sources: rkbin DDR init as 471, our bt0 as 472"
+publish = false
+
+[dependencies]
+rk-idblock = { path = "../rk-idblock" }

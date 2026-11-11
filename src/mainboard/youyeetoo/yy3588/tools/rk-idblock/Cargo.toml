@@ -1,0 +1,10 @@
+[package]
+name = "rk-idblock"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-2.0-only"
+description = "Rockchip RK35xx BootROM idblock (header v2, SHA-256) from our own first stage, replacing rkbin's boot_merger"
+publish = false
+
+[dependencies]
+sha256 = { path = "../../crates/sha256" }

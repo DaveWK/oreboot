@@ -8,6 +8,8 @@ members = [
   "src/soc",
   "xtask",
 ]
+# youyeetoo/yy3588 is its own cargo workspace (bt0, crates, tools; stable toolchain).
+exclude = ["src/mainboard/youyeetoo"]
 default-members = ["xtask"]
 resolver = "2"
 
