@@ -1,0 +1,179 @@
+// SPDX-License-Identifier: GPL-2.0-only
+//! LPDDR5 DRAM initialisation for the Allwinner A733 on the Radxa Cubie
+//! A7A (DesignWare DDRCTL controllers and LPDDR5 PHY, JEDEC LPDDR5/5X).
+//! It links no vendor code; the PHY's
+//! training firmware is loaded as data (see [`phy`]).
+#![no_std]
+
+pub mod blobless;
+pub mod ccu;
+pub mod ctrl;
+pub mod dump;
+pub mod handover;
+pub mod hw;
+pub mod mr;
+pub mod para;
+pub mod phy;
+pub mod post;
+pub mod power;
+pub mod rd;
+pub mod rdtrain;
+pub mod sets;
+pub mod size;
+pub mod timing;
+pub mod vendor_cmp;
+pub mod wl;
+
+pub use hw::{Error, Hw, Rail, RegIo};
+pub use para::Para;
+pub use phy::PhyFirmware;
+
+use ctrl::{ddrc, DDRC_184, DDRC_B84, PWRCTL};
+
+/// Distinguish ordinary initialization failures from result-save recovery
+/// failures without discarding either the primary or any per-rank error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InitError {
+    Operation(Error),
+    ResultSave(post::SaveFailure),
+}
+impl From<Error> for InitError {
+    fn from(error: Error) -> Self {
+        Self::Operation(error)
+    }
+}
+impl From<post::SaveFailure> for InitError {
+    fn from(error: post::SaveFailure) -> Self {
+        Self::ResultSave(error)
+    }
+}
+
+/// DRAM clocks/resets and the controller set-up that precede the PHY
+/// (the first half of [`core_init`], shared with the firmware-free probes
+/// in [`blobless`]). The caller validates `p` first.
+pub fn controller_pre_phy<H: Hw>(hw: &mut H, p: &mut Para) -> Result<(), Error> {
+    ccu::sys_init(hw, p.clk())?;
+    ctrl::com_pre_init(hw, p);
+    for ch in 0..p.channels() {
+        ctrl::bus_config(hw, ch);
+        hw.set32(ddrc(ch, DDRC_B84), 1);
+        hw.write32(ddrc(ch, DDRC_184), 2);
+        ctrl::com_init(hw, p, ch)?;
+    }
+    ctrl::com_post_init(hw, p);
+    Ok(())
+}
+
+/// Controllers and PHY of every channel: clocks, controller set-up, PHY
+/// training, DFI handshake. Returns after the controllers run normally.
+pub fn core_init<H: Hw>(hw: &mut H, p: &mut Para, fw: &PhyFirmware) -> Result<(), Error> {
+    core_init_opts(hw, p, fw, &phy::init::Opts::DEFAULT)
+}
+
+/// [`core_init`] with the measurement variants of `o` (FEL lab builds).
+pub fn core_init_opts<H: Hw>(
+    hw: &mut H,
+    p: &mut Para,
+    fw: &PhyFirmware,
+    o: &phy::init::Opts,
+) -> Result<(), Error> {
+    ccu::validate_pll_ddr_rate(p.clk())?;
+    phy::init::validate(p)?;
+    ctrl::validate_geometry(p)?;
+    controller_pre_phy(hw, p)?;
+    let channels = p.channels();
+    let rl = if p.tpr10() & (1 << 31) != 0 { 14 } else { 13 };
+    phy::init::init_opts(hw, p, fw, rl, o)?;
+    if o.stop_before_dfi {
+        if o.mission_level != 0 {
+            phy::devinit::mission_bringup(hw, o.mission_level);
+        }
+        return Ok(());
+    }
+    for ch in 0..channels {
+        post::timing_after_phy(hw, ch)?;
+    }
+    if let Some(ps) = o.only_pstate {
+        // The controller's active frequency set follows the trained pstate
+        // (MSTR2 [4:0]); the vendor order ends on pstate 0 = set 0.
+        post::select_freq_set(hw, channels, ps)?;
+    }
+    if o.mission_level != 0 {
+        phy::devinit::mission_bringup(hw, o.mission_level);
+    }
+    if o.cpu_dfi_answer {
+        post::dfi_init_cpu(hw, channels)?;
+    } else {
+        post::dfi_init(hw, channels)?;
+    }
+    post::controller_after_phy(hw, p)?;
+    if p.tpr13() & (1 << 24) != 0 {
+        for ch in 0..channels {
+            hw.set32(ddrc(ch, PWRCTL), 0x11);
+        }
+    }
+    if p.tpr13() & 4 != 0 {
+        post::dfs_table(hw, p);
+    }
+    Ok(())
+}
+
+/// Bring up LPDDR5 with parameter set `p`. Returns the size in MiB; `p`
+/// then also holds the size (para2) and the training results.
+// no_std without an allocator: InitError carries the SaveFailure record by
+// value (see post::save_training_results).
+#[allow(clippy::result_large_err)]
+pub fn init<H: Hw>(hw: &mut H, p: &mut Para, fw: &PhyFirmware) -> Result<u32, InitError> {
+    init_opts(hw, p, fw, &phy::init::Opts::DEFAULT)
+}
+
+/// [`init`] with the measurement variants of `o` (FEL lab builds).
+#[allow(clippy::result_large_err)]
+pub fn init_opts<H: Hw>(
+    hw: &mut H,
+    p: &mut Para,
+    fw: &PhyFirmware,
+    o: &phy::init::Opts,
+) -> Result<u32, InitError> {
+    hw.log(format_args!(
+        "[dram] open LPDDR5 init: {} MHz, type {}\n",
+        p.clk(),
+        p.ty()
+    ));
+    if !p.is_lpddr5() {
+        return Err(Error::Config("only LPDDR5 (dram_type 9) is supported").into());
+    }
+    if p.tpr13() & 1 == 0 {
+        return Err(Error::Config("geometry scan (tpr13[0] clear) is not supported").into());
+    }
+    ccu::validate_pll_ddr_rate(p.clk())?;
+    phy::init::validate(p)?;
+    ctrl::validate_geometry(p)?;
+    let mib = size::boot_size_mib(p)?;
+    ccu::pad_calibration(hw);
+    let vddq = power::set_rails(hw, p)?;
+    hw.log(format_args!("[dram] VDDQ {vddq} mV\n"));
+    core_init_opts(hw, p, fw, o)?;
+    if o.stop_before_dfi {
+        return Ok(mib);
+    }
+    if (p.tpr1() as i32) >= 0 && p.tpr10() & (1 << 29) != 0 {
+        post::save_training_results(hw, p)?;
+        if p.tpr10() & (1 << 30) == 0 {
+            p.set_tpr10(p.tpr10() & !(1 << 29));
+        }
+    }
+    if p.para2() & (1 << 31) == 0 {
+        p.set_para2((p.para2() & 0xffff) | (mib << 16));
+    }
+    hw.log(format_args!(
+        "[dram] {mib} MiB, para1 {:#x}, para2 {:#x}, tpr13 {:#x}\n",
+        p.para1(),
+        p.para2(),
+        p.tpr13()
+    ));
+    if !o.no_quick_test {
+        size::quick_test(hw, mib.min(4096), 4096)?;
+    }
+    Ok(mib)
+}
