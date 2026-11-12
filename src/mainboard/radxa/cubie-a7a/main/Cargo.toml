@@ -1,0 +1,40 @@
+[package]
+name = "oreboot-cubie-a7a-main"
+version = "0.1.0"
+authors = ["oreboot authors"]
+edition = "2021"
+
+[dependencies]
+log = { path = "../../../../lib/log" }
+util = { path = "../../../../lib/util" }
+cubie-a7a-common = { path = "../common" }
+# Shared firmware crates in src/lib.
+arm-ppu = { path = "../../../../lib/arm-ppu" }
+dwc-pcie = { path = "../../../../lib/dwc-pcie" }
+fdt-writer = { path = "../../../../lib/fdt-writer" }
+memtest = { path = "../../../../lib/memtest" }
+psci-el3 = { path = "../../../../lib/psci-el3", features = ["vectors"] }
+regio = { path = "../../../../lib/regio" }
+
+# Peripheral bring-up in main, each one a build option so a first boot on new
+# hardware can leave out what has not run yet (Makefile BRINGUP=...). The
+# modules are always compiled; a disabled one never touches its hardware and
+# reports nothing in the DTB.
+[features]
+default = ["gmac", "pcie", "usb"]
+gmac = []
+pcie = []
+usb = []
+memtest = []
+# SMCCC TRNG (DEN0098) on the CE TRNG. Off until the A733 sequence has been
+# checked on the board (see src/trng.rs); without it every TRNG call answers
+# NOT_SUPPORTED. trng-byte-addr: no effect since the CE v5 hash/RBG task
+# (byte addresses only); kept so existing build lines still work.
+trng = []
+trng-byte-addr = []
+# combo0 (the blue port's SuperSpeed pair) stays off: the xHCI runs on its
+# high-speed fallback and a USB 3 device in the blue port connects at high
+# speed to EHCI1, which EDK2 (EhciDxe) and Linux's initramfs (ehci-platform)
+# both drive. For a USB root disk while Linux's SERDES PHY and PCK-600
+# modules (needed by its dwc3/xHCI) are not loaded in the initramfs.
+usb-hs-only = ["usb"]

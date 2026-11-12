@@ -377,6 +377,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "cubie-a7a-common"
+version = "0.1.0"
+dependencies = [
+ "arch-timer",
+ "bakery",
+ "bootlayout",
+ "bootlog",
+ "embedded-hal-nb",
+ "log 0.1.0",
+ "memtest",
+ "nb 1.1.0",
+ "netid",
+ "regio",
+ "sha256",
+ "storage",
+ "uart-16550",
+ "util",
+]
+
+[[package]]
+name = "cubie-a7a-dram"
+version = "0.1.0"
+dependencies = [
+ "dram-ctrl",
+ "dram-train",
+ "dwc-ddrctl",
+ "jedec-lpddr",
+ "memtest",
+]
+
+[[package]]
 name = "d1-pac"
 version = "0.0.31"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -874,6 +905,33 @@ version = "0.1.0"
 dependencies = [
  "oreboot-arch",
  "raw-cpuid",
+]
+
+[[package]]
+name = "oreboot-cubie-a7a-bt0"
+version = "0.1.0"
+dependencies = [
+ "bootlog",
+ "cubie-a7a-common",
+ "cubie-a7a-dram",
+ "log 0.1.0",
+ "sha256",
+ "util",
+]
+
+[[package]]
+name = "oreboot-cubie-a7a-main"
+version = "0.1.0"
+dependencies = [
+ "arm-ppu",
+ "cubie-a7a-common",
+ "dwc-pcie",
+ "fdt-writer",
+ "log 0.1.0",
+ "memtest",
+ "psci-el3",
+ "regio",
+ "util",
 ]
 
 [[package]]

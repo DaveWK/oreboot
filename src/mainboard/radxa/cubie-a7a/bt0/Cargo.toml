@@ -1,0 +1,80 @@
+[package]
+name = "oreboot-cubie-a7a-bt0"
+version = "0.1.0"
+authors = ["oreboot authors"]
+edition = "2021"
+
+[features]
+# DRAM init through Allwinner's closed library (A733_DRAM_LIB) instead of
+# the open driver. The library is not part of this tree; see the board README.
+dramlib = []
+# DRAM without any PHY firmware (no PMU training firmware, no PIE images).
+# Development stage: probes the PHY and halts (src/dram/blobless.rs).
+blobless = []
+# One held-reset alias observation; bypass all ACSM/DevInit/CBT probes.
+wck-alias-probe = ["blobless"]
+# Measurement build: the vendor library trains, bt0 prints the trained
+# per-DBYTE/lane PHY delays (read-only, named CSRs) and halts into the vendor
+# recovery. Comparison data only; never shipped.
+av3-dump = ["dramlib"]
+# As av3-dump (the library's normal run), then the PHY's mission state by
+# address range (crate `dump`) instead of the per-CSR dump, for the
+# host-side diff against the hand-over image's dump.
+av3h = ["av3-dump"]
+# As av3-dump, with the vendor library training one pstate at
+# 1200 MHz (our blobless probe's pstate 1 frequency): dram_clk 1200 and
+# tpr13[2] (multi-pstate) cleared. The dump then reads that pstate.
+av3c = ["av3-dump"]
+# As av3c, plus our data-mode compare in the vendor library's trained state
+# (positive control), the PHY taking the DFI after a controller quiesce;
+# then the halt into the vendor recovery. This is the eye image.
+av3g = ["av3c"]
+# The gate image of av3g: the gate window and the four-pattern data check
+# instead of the per-lane eye.
+av3g-gate = ["av3g"]
+# Arm the PMIC's die over-temperature power-off at 115 C and print the
+# read-back. Off by default.
+otp = []
+# The per-call-site udelay trace of the vendor DRAM library on the console
+# (~27 lines at 115200 baud, ~150-230 ms of a boot). Off by default; the
+# last site still goes to the RTC registers for the post-reset report.
+dram-trace = []
+# The read path measurement searches (rd::measure_block) instead of the
+# read training (rdtrain).
+rd-measure = ["blobless"]
+# The read training as a measurement image: it runs, checks and puts
+# everything back (the initial state repeated), with the vendor's trained
+# values as references. Without it the training is applied.
+rd-train-only = ["blobless"]
+# The hand-over to the DDR controller without a PIE after the applied read
+# training (crate module handover; measurement image).
+handover = ["blobless"]
+# After the applied read training, the lean hand-over
+# (cubie_a7a_dram::blobless::mission_handover: mission CSRs, read-data
+# enable, CPU-answered DFI init, ports), then the halt (back to FEL in a
+# FEL build) for the host's checks.
+bl-mission = ["blobless"]
+# Hybrid: the open backend with the PHY training firmware for the pstate,
+# then our own stages (WCK2CK leveling, read training) and the lean
+# hand-over (bt0/src/dram/blobless.rs hybrid_after_pmu). Build with
+# A7A_OPEN_OPTS bit 7 (stop before the DFI init).
+hybrid = []
+# USB FEL boot (src/fel.rs; scripts/fel-boot.sh in radxa-a7a-workspace):
+# bt0 linked at 0x90000, started by the mask ROM's FEL (xfel exec) instead
+# of from the SD card. Entry 1 brings up PMIC, clocks and DRAM and returns
+# to FEL; the host then writes main, the payload and the layout table;
+# entry 2 checks them and hands over to main as the SD path does. Combine
+# with a DRAM backend (e.g. dramlib).
+fel = ["cubie-a7a-dram/vendor-vdd2l"]
+# The blobless probe at pstate 3 (the lowest) instead of 1, the
+# timing-independence test of the data-mode compare.
+probe-ps3 = ["blobless"]
+[dependencies]
+bootlog = { path = "../../../../lib/bootlog" }
+log = { path = "../../../../lib/log" }
+util = { path = "../../../../lib/util" }
+cubie-a7a-common = { path = "../common" }
+cubie-a7a-dram = { path = "../dram" }
+
+[build-dependencies]
+sha256 = { path = "../../../../lib/sha256" }
