@@ -22,7 +22,7 @@
 //! maintenance through [`Memory`], plan slices for several harts, a bounded
 //! [`ErrorLog`], and the recommended [`PROFILE_FAST`].
 // Region/Plan/pass code is kept as the A7A board had it (equivalence-tested
-// against tests/legacy/); this newer-clippy style lint is allowed.
+// against the board's copy outside this tree); this newer-clippy style lint is allowed.
 #![allow(unknown_lints)] // the lint below is newer than the runners' clippy (Rust 1.98)
 #![allow(clippy::manual_is_multiple_of)]
 #![no_std]

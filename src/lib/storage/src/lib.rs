@@ -7,7 +7,7 @@
 //! `sd_capacity.rs`). The only change: the GPT fallback partition
 //! type is a parameter ([`gpt::find_typed`]); [`gpt::find`] keeps the K1 one.
 // The code is kept as the board had it (equivalence-tested against the
-// verbatim copy in tests/legacy/); these newer-clippy style lints are allowed.
+// board's copy outside this tree); these newer-clippy style lints are allowed.
 #![allow(unknown_lints)] // the lint below is newer than the runners' clippy (Rust 1.98)
 #![allow(clippy::manual_is_multiple_of, clippy::manual_range_contains)]
 #![no_std]

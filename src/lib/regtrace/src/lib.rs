@@ -9,7 +9,7 @@
 //! documentation and JEDEC rules writes what a recorded reference wrote,
 //! and to explain every difference (masks, skipped ranges).
 //!
-//! From the Cubie A7A DRAM emulator harness's `trace.rs`
+//! From the Cubie A7A DRAM host tools' `trace.rs`
 //! (Ev, fnv1a, render, render_annotated, CompareOpts, compare), with
 //! 64-bit addresses, no SoC address ranges in the defaults (the A733's PHY
 //! DMEM and PState SRAM are the board's options), per-address field masks,

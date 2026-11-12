@@ -7,7 +7,7 @@
 //! From the SpacemiT K1 board code (`bt0/src/fdt_checked.rs`)
 //! (unchanged code).
 // The code is kept as the board had it (equivalence-tested against the
-// verbatim copy in tests/legacy/); these newer-clippy style lints are allowed.
+// board's copy outside this tree); these newer-clippy style lints are allowed.
 #![allow(unknown_lints)] // some lints below are newer than the runners' clippy
 #![allow(
     clippy::manual_is_multiple_of,

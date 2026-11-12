@@ -9,7 +9,7 @@
 //! `L L L H L L OP7 | OP0-6`, MRR `L L L H H L L | MA0-6`. The MRW values are
 //! the ones the Radxa Cubie A7A bt0 drives (the Cubie A7A board code
 //! `phy/acsm.rs` `MrWritePayload`, `phy/coldinit.rs` `mrw`/`mrw_ddr`), which
-//! this module replaces; equivalence tests compare them.
+//! this module replaces (compared by equivalence tests kept outside this tree).
 //!
 //! Only the CA values: how a controller or PHY sequencer packs them (chip
 //! selects, record halfwords, delays) is the board's.

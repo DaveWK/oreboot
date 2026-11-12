@@ -7,7 +7,7 @@
 //! The K1 and A7A boards each had a copy of the same algorithm (K1
 //! `bt0/src/sha256.rs`, A7A `common/src/sha256.rs`); this is the K1 code.
 // The code is kept as the board had it (equivalence-tested against the
-// verbatim copy in tests/legacy/); these newer-clippy style lints are allowed.
+// board's copy outside this tree); these newer-clippy style lints are allowed.
 #![allow(unknown_lints)] // the lint below is newer than the runners' clippy (Rust 1.98)
 #![allow(clippy::chunks_exact_to_as_chunks)]
 #![no_std]
