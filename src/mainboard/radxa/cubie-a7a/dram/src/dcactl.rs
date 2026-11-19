@@ -35,7 +35,7 @@
 use crate::ctrl::{ddrc, MSTR4};
 use crate::dca::{
     dcm_bit, decide, final_mr30, mr16_write_operating, mr30_both, step_of, ByteDecision, ByteSweep,
-    DcaPolicy, MR26_START, MR26_START_FLIP, MR26_STOP, STEPS,
+    DcaPolicy, Outcome, MR26_START, MR26_START_FLIP, MR26_STOP, STEPS,
 };
 use crate::hw::{Error, Hw};
 
@@ -97,11 +97,14 @@ pub enum Stop {
     WckOff,
     /// MR5 did not read as wanted: nothing was written.
     Mr5 { got: u32 },
-    /// MR16 did not read as the configuration says, or cannot be moved to
-    /// the operating set: nothing was written.
+    /// MR16 did not read as configured, or could not enter the operating set.
     Mr16 { got: u32 },
-    /// A controller command failed; what could be put back was.
+    /// MR26 indicated that the monitor was already running.
+    MonitorActive,
+    /// A controller command failed; check the outcome for recovery status.
     Command(Error),
+    /// A written register could not be verified.
+    Verify,
 }
 
 /// One block's (channel, rank) run.
@@ -119,8 +122,7 @@ pub struct Block {
     /// Per sweep step, the last MR26 read.
     pub mr26: [Option<u8>; STEPS],
     pub mr30_final: Option<u8>,
-    /// MR30 and MR16 read back as left (measure: as found).
-    pub restored: bool,
+    pub outcome: Outcome,
     pub mrws: u16,
     pub mrrs: u16,
     pub elapsed_us: u32,
@@ -138,18 +140,10 @@ impl Block {
             decision: [None; 2],
             mr26: [None; STEPS],
             mr30_final: None,
-            restored: false,
+            outcome: Outcome::Unchanged,
             mrws: 0,
             mrrs: 0,
             elapsed_us: 0,
-        }
-    }
-
-    /// An applied change: MR30 left other than found.
-    pub const fn changed(&self) -> bool {
-        match (self.mr30_found, self.mr30_final) {
-            (Some(a), Some(z)) => a != z,
-            _ => false,
         }
     }
 }
@@ -192,17 +186,40 @@ pub fn run_block<H: Hw>(hw: &mut H, ch: usize, rank: u32, cfg: &Config) -> Block
         mrrs: 0,
     };
     if let Err(e) = body(&mut p, &mut out, cfg) {
-        // Put back what is known, whatever failed in between.
-        if let Some(found) = out.mr30_found {
-            let _ = p.mrw(30, found);
-            out.mr30_final = Some(found);
-        }
-        let _ = p.mrw(16, cfg.mr16_found);
         out.stop = Some(Stop::Command(e));
+    }
+    if out.outcome == Outcome::Unknown {
+        out.stop.get_or_insert(Stop::Verify);
+        out.mr30_final = None;
+        if restore(&mut p, &out, cfg) {
+            out.mr30_final = out.mr30_found;
+            out.outcome = Outcome::Unchanged;
+        }
     }
     (out.mrws, out.mrrs) = (p.mrws, p.mrrs);
     out.elapsed_us = p.hw.now_us().wrapping_sub(t0) as u32;
     out
+}
+
+fn restore<H: Hw>(p: &mut Port<'_, H>, out: &Block, cfg: &Config) -> bool {
+    // Only a block that reached the sweep can have changed MR30 or MR26.
+    // Re-open and verify the operating FSP before writing either register.
+    let mut verified = true;
+    if let Some(found) = out
+        .mr30_found
+        .filter(|_| out.mr26_found.is_some_and(|v| v & 3 == MR26_STOP))
+    {
+        let op = mr16_write_operating(cfg.mr16_found).expect("validated before sweep");
+        let _ = p.mrw(16, op);
+        verified = p.mrr(16) == Ok(op);
+        if verified {
+            let _ = p.mrw(26, MR26_STOP);
+            let _ = p.mrw(30, found);
+            verified = p.mrr(26).is_ok_and(|v| v & 3 == MR26_STOP) && p.mrr(30) == Ok(found);
+        }
+    }
+    let _ = p.mrw(16, cfg.mr16_found);
+    (p.mrr(16) == Ok(cfg.mr16_found)) && verified
 }
 
 fn body<H: Hw>(p: &mut Port<'_, H>, out: &mut Block, cfg: &Config) -> Result<(), Error> {
@@ -217,11 +234,23 @@ fn body<H: Hw>(p: &mut Port<'_, H>, out: &mut Block, cfg: &Config) -> Result<(),
         out.stop = Some(Stop::Mr16 { got: mr16 as u32 });
         return Ok(());
     };
-    // From here every MR30 write lies between this switch and the one back.
+    // A timed-out MRW might have reached DRAM; nothing from here is
+    // presumed safe until the mode-register readbacks confirm it.
+    out.outcome = Outcome::Unknown;
     p.mrw(16, mr16_op)?;
+    let got = p.mrr(16)?;
+    if got != mr16_op {
+        out.stop = Some(Stop::Mr16 { got: got as u32 });
+        return Ok(());
+    }
     let found = p.mrr(30)?;
     out.mr30_found = Some(found);
-    out.mr26_found = Some(p.mrr(26)?);
+    let monitor = p.mrr(26)?;
+    out.mr26_found = Some(monitor);
+    if monitor & 3 != MR26_STOP {
+        out.stop = Some(Stop::MonitorActive);
+        return Ok(());
+    }
     for _ in 0..cfg.iterations.max(1) {
         for i in 0..STEPS {
             p.hw.kick_watchdog();
@@ -251,10 +280,17 @@ fn body<H: Hw>(p: &mut Port<'_, H>, out: &mut Block, cfg: &Config) -> Result<(),
         Mode::Measure => found,
     };
     p.mrw(30, last)?;
-    out.mr30_final = Some(last);
     let back = p.mrr(30)?;
+    let monitor = p.mrr(26)?;
     p.mrw(16, cfg.mr16_found)?;
-    out.restored = back == last && p.mrr(16)? == cfg.mr16_found;
+    if p.mrr(16)? == cfg.mr16_found && back == last && monitor & 3 == MR26_STOP {
+        out.mr30_final = Some(last);
+        out.outcome = if last == found {
+            Outcome::Unchanged
+        } else {
+            Outcome::Applied(1)
+        };
+    }
     Ok(())
 }
 
@@ -263,8 +299,8 @@ pub fn log_block<H: Hw>(hw: &mut H, b: &Block) {
     let ch = ["A", "B"][b.ch & 1];
     hw.kick_watchdog();
     hw.log(format_args!(
-        "[dram] DCC {ch}{}: stop {:?} restored {}; MR30 found {:02x?} final {:02x?} changed {}; MR26 before {:02x?}; {} MRW, {} MRR, {} us\n",
-        b.rank, b.stop, b.restored, b.mr30_found, b.mr30_final, b.changed(), b.mr26_found, b.mrws, b.mrrs, b.elapsed_us
+        "[dram] DCC {ch}{}: stop {:?} outcome {:?}; MR30 found {:02x?} final {:02x?}; MR26 before {:02x?}; {} MRW, {} MRR, {} us\n",
+        b.rank, b.stop, b.outcome, b.mr30_found, b.mr30_final, b.mr26_found, b.mrws, b.mrrs, b.elapsed_us
     ));
     if b.mr26.iter().any(|x| x.is_some()) {
         hw.log(format_args!(
@@ -283,20 +319,23 @@ pub fn log_block<H: Hw>(hw: &mut H, b: &Block) {
 }
 
 /// The stage on every channel and rank of `channels` x `ranks`, logged.
-/// Returns how many blocks left another MR30 than they found.
-pub fn run<H: Hw>(hw: &mut H, channels: usize, ranks: u32, cfg: &Config) -> u32 {
+/// Stops immediately when any block's final state is unknown.
+pub fn run<H: Hw>(hw: &mut H, channels: usize, ranks: u32, cfg: &Config) -> Outcome {
     hw.log(format_args!(
         "[dram] DCC: WCK duty-cycle monitor through the controller, mission mode: {cfg:x?}\n"
     ));
-    let mut changed = 0;
+    let mut outcome = Outcome::Unchanged;
     for rank in 0..ranks {
         for ch in 0..channels {
             let b = run_block(hw, ch, rank, cfg);
             log_block(hw, &b);
-            changed += b.changed() as u32;
+            outcome = outcome.merge(b.outcome);
+            if outcome == Outcome::Unknown {
+                return outcome;
+            }
         }
     }
-    changed
+    outcome
 }
 
 #[cfg(test)]
@@ -336,6 +375,8 @@ mod tests {
         short_waits: u32,
         /// Fail the n-th MRW from now with a timeout (the busy bit stays).
         fail_at: Option<u32>,
+        /// A blocked MR16 restore can look like a completed controller command.
+        drop_mr16_restore: bool,
         mrws: Vec<(usize, u32, u32, u8)>,
         clock: u64,
         log: String,
@@ -362,6 +403,7 @@ mod tests {
                 since_start: 0,
                 short_waits: 0,
                 fail_at: None,
+                drop_mr16_restore: false,
                 mrws: Vec::new(),
                 clock: 0,
                 log: String::new(),
@@ -380,7 +422,7 @@ mod tests {
             let d = &mut self.dram[ch][rank as usize];
             let m = Mr16::decode(d.mr16);
             match ma {
-                16 => d.mr16 = op,
+                16 if !(self.drop_mr16_restore && op == 0x04) => d.mr16 = op,
                 30 => d.mr30[m.fsp_wr as usize] = op,
                 26 => {
                     d.mr26 = (d.mr26 & !3) | (op & 3);
@@ -477,7 +519,7 @@ mod tests {
     #[test]
     fn measure_reports_the_decision_and_changes_nothing() {
         let mut m = Model::new(ERR, 0x9a);
-        assert_eq!(run(&mut m, 2, 2, &Config::DEFAULT), 0);
+        assert_eq!(run(&mut m, 2, 2, &Config::DEFAULT), Outcome::Unchanged);
         for ch in 0..2 {
             for rank in 0..2 {
                 let d = &m.dram[ch][rank];
@@ -488,9 +530,7 @@ mod tests {
         assert_eq!(m.short_waits, 0);
         let t = &m.log;
         assert!(
-            t.contains(
-                "DCC A0: stop None restored true; MR30 found Some(9a) final Some(9a) changed false"
-            ),
+            t.contains("DCC A0: stop None outcome Unchanged; MR30 found Some(9a) final Some(9a)"),
             "{t}"
         );
         assert!(t.contains("DCC B1 lower: flip0 ones"));
@@ -499,13 +539,13 @@ mod tests {
         let b = run_block(&mut m, 0, 0, &Config::DEFAULT);
         assert_eq!(b.decision[0].unwrap().step, Ok(-2));
         assert_eq!(b.decision[1].unwrap().step, Ok(1));
-        assert_eq!((b.mrws, b.mrrs), (2 + 15 * 5 + 1, 5 + 15 + 1));
+        assert_eq!((b.mrws, b.mrrs), (2 + 15 * 5 + 1, 8 + 15));
     }
 
     #[test]
     fn apply_trains_the_operating_set_inside_the_mr16_window() {
         let mut m = Model::new(ERR, 0x00);
-        assert_eq!(run(&mut m, 2, 2, &APPLY), 4);
+        assert_eq!(run(&mut m, 2, 2, &APPLY), Outcome::Applied(4));
         for ch in 0..2 {
             for rank in 0..2 {
                 let d = &m.dram[ch][rank];
@@ -569,7 +609,7 @@ mod tests {
         for d in b.decision {
             assert_eq!(d.unwrap().step, Err(NoDecision::Flat));
         }
-        assert!(!b.changed() && b.restored);
+        assert_eq!(b.outcome, Outcome::Unchanged);
         assert_eq!(m.dram[0][0].mr30, [0, 0x21, 0]);
     }
 
@@ -586,10 +626,22 @@ mod tests {
         );
         // The later commands go through: the found MR30 and MR16 are back
         // in the DRAM, and the block reports that it did not finish.
-        assert!(!b.restored);
+        assert_eq!(b.outcome, Outcome::Unchanged);
         assert_eq!(b.mr30_final, Some(0x21));
-        assert!(!b.changed());
         assert_eq!((m.dram[1][1].mr30, m.dram[1][1].mr16), ([0, 0x21, 0], 0x04));
+    }
+
+    #[test]
+    fn unverified_restore_stops_before_the_next_block() {
+        let mut m = Model::new(ERR, 0x21);
+        m.drop_mr16_restore = true;
+        let outcome = run(&mut m, 2, 2, &APPLY);
+        assert!(
+            !m.log.contains("DCC B0"),
+            "swept another block after failed restore"
+        );
+        assert_eq!(outcome, Outcome::Unknown);
+        assert_eq!(m.dram[0][0].mr16, 0x05);
     }
 
     #[test]

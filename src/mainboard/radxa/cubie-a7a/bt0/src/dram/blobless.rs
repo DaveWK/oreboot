@@ -1653,6 +1653,12 @@ pub fn hybrid_after_pmu(p: &mut Para) -> ! {
         acsm_field_probe(v);
     }
     if DCA_MODE.is_some() {
+        #[cfg(feature = "full-speed")]
+        if dca_stage() == cubie_a7a_dram::dca::Outcome::Unknown {
+            println!("[dram] DCA: unverified state; refusing hand-over");
+            crate::halt();
+        }
+        #[cfg(not(feature = "full-speed"))]
         dca_stage();
     }
     if k.hybrid_no_wl {
@@ -1837,26 +1843,28 @@ static mut DCA_BLOCK: cubie_a7a_dram::dca::DcaBlock = cubie_a7a_dram::dca::DcaBl
     cubie_a7a_dram::phy::wcklevel::Rank::R0,
 );
 
-/// The DCA stage on the four blocks, printed (`DCA ...` lines). Returns
-/// how many blocks left another MR30 than they found.
+/// The DCA stage on the four blocks, stopping at any unverified state.
 #[cfg(all(feature = "full-speed", any(feature = "hybrid", dram_mission)))]
 #[inline(never)]
-fn dca_stage() -> u32 {
-    use cubie_a7a_dram::dca;
+fn dca_stage() -> cubie_a7a_dram::dca::Outcome {
+    use cubie_a7a_dram::dca::{self, Outcome};
     let cfg = DCA_CONFIG;
     println!("[dram] DCA: {cfg:x?}");
     // SAFETY: bt0 is single-threaded and nothing else refers to it.
     let b = unsafe { &mut *core::ptr::addr_of_mut!(DCA_BLOCK) };
-    let mut changed = 0;
+    let mut outcome = Outcome::Unchanged;
     for &(ch, rank) in dca::BLOCKS.iter() {
         crate::recovery::kick();
         b.channel = ch;
         b.rank = rank;
         dca::run_block(&mut Bt0Hw, b, &cfg);
         dca::log_block(&mut Bt0Hw, b);
-        changed += dca::changed(b) as u32;
+        outcome = outcome.merge(b.outcome());
+        if outcome == Outcome::Unknown {
+            return outcome;
+        }
     }
-    changed
+    outcome
 }
 
 /// The read training, then, in the blob-free flow with `A7A_DCA`, the WCK
@@ -1895,12 +1903,19 @@ fn read_training_staged(bases: [Option<cubie_a7a_dram::phy::wcklevel::Mr18Base>;
 ))]
 #[inline(never)]
 fn dca_after_read_training(bases: [Option<cubie_a7a_dram::phy::wcklevel::Mr18Base>; 4]) -> bool {
+    use cubie_a7a_dram::dca::Outcome;
     println!("[dram] DCA: WCK duty-cycle stage after the read training, PHY training mode");
-    let changed = dca_stage();
-    if changed == 0 {
-        println!("[dram] DCA: MR30 as found on every block; leveling and read training stand");
-        return true;
-    }
+    let changed = match dca_stage() {
+        Outcome::Unchanged => {
+            println!("[dram] DCA: MR30 as found on every block; leveling and read training stand");
+            return true;
+        }
+        Outcome::Applied(n) => n,
+        Outcome::Unknown => {
+            println!("[dram] DCA: unverified state; refusing hand-over");
+            crate::halt();
+        }
+    };
     println!(
         "[dram] DCA: MR30 changed on {changed} block(s): WCK2CK leveling and the read training again"
     );
@@ -1908,6 +1923,9 @@ fn dca_after_read_training(bases: [Option<cubie_a7a_dram::phy::wcklevel::Mr18Bas
     if let Some((_, after)) = window {
         let f = blobless::mr16_all(&mut Bt0Hw, after);
         println!("[dram] DCA: MR16 {after:02x} to all ranks before the leveling: failure {f:?}");
+        if f.is_some() {
+            crate::halt();
+        }
     }
     let leveled = relevel(bases);
     if let Some((before, _)) = window {
@@ -1915,6 +1933,9 @@ fn dca_after_read_training(bases: [Option<cubie_a7a_dram::phy::wcklevel::Mr18Bas
         println!(
             "[dram] DCA: MR16 {before:02x} to all ranks before the read training: failure {f:?}"
         );
+        if f.is_some() {
+            crate::halt();
+        }
     }
     if !leveled {
         println!("[dram] DCA: leveling after the change failed; no read training");
@@ -2034,8 +2055,8 @@ const _: () = assert!(
 ))]
 #[inline(always)]
 fn mission_stages() -> bool {
-    if let Some(cfg) = DCA_CTL {
-        dca_ctl_stage(&cfg);
+    if DCA_CTL.is_some_and(|cfg| !dca_ctl_stage(&cfg)) {
+        return false;
     }
     super::wrstage::run()
 }
@@ -2047,8 +2068,9 @@ fn mission_stages() -> bool {
     not(feature = "rd-measure")
 ))]
 #[inline(never)]
-fn dca_ctl_stage(cfg: &cubie_a7a_dram::dcactl::Config) {
+fn dca_ctl_stage(cfg: &cubie_a7a_dram::dcactl::Config) -> bool {
     use cubie_a7a_dram::ctrl::{ddrc, MSTR0};
+    use cubie_a7a_dram::dca::Outcome;
     use cubie_a7a_dram::RegIo;
     let channels = cubie_a7a_dram::wrtrain::DBYTES / 2;
     // MSTR0.active_ranks: 1 one rank, 3 two.
@@ -2057,13 +2079,19 @@ fn dca_ctl_stage(cfg: &cubie_a7a_dram::dcactl::Config) {
     } else {
         1
     };
-    let changed = cubie_a7a_dram::dcactl::run(&mut Bt0Hw, channels, ranks, cfg);
-    println!(
-        "[dram] DCC: done; MR30 changed on {changed} block(s){}",
-        if changed != 0 {
-            "; WCK2CK leveling was not repeated (it cannot run in mission mode)"
-        } else {
-            ""
+    match cubie_a7a_dram::dcactl::run(&mut Bt0Hw, channels, ranks, cfg) {
+        Outcome::Unchanged => {
+            println!("[dram] DCC: done; MR30 unchanged");
         }
-    );
+        Outcome::Applied(n) => {
+            println!(
+                "[dram] DCC: MR30 changed on {n} block(s); WCK2CK leveling cannot run in mission mode"
+            );
+        }
+        Outcome::Unknown => {
+            println!("[dram] DCC: unverified state; refusing hand-over");
+            return false;
+        }
+    }
+    true
 }

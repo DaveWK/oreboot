@@ -743,6 +743,26 @@ pub enum DcaStop {
     Mr16Read { got: Option<u8> },
 }
 
+/// Whether duty changed and whether the stage left a verified state.
+#[cfg(any(test, feature = "full-speed"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Outcome {
+    Unchanged,
+    Applied(u32),
+    Unknown,
+}
+
+#[cfg(any(test, feature = "full-speed"))]
+impl Outcome {
+    pub const fn merge(self, next: Self) -> Self {
+        match (self, next) {
+            (Self::Unknown, _) | (_, Self::Unknown) => Self::Unknown,
+            (Self::Unchanged, other) | (other, Self::Unchanged) => other,
+            (Self::Applied(a), Self::Applied(b)) => Self::Applied(a + b),
+        }
+    }
+}
+
 /// MRRs of [`Mode::Mrr`] at the found FSP-WR, and with FSP-WR at the
 /// operating set.
 pub const MRR_FOUND: [u8; 6] = [5, 8, 16, 24, 26, 30];
@@ -776,6 +796,8 @@ pub struct DcaBlock {
     pub mr30_final: Option<u8>,
     pub stop: Option<DcaStop>,
     pub restored: bool,
+    #[cfg(any(test, feature = "full-speed"))]
+    mr_state_verified: bool,
     pub launches: u16,
     pub writes: u16,
     pub failure: Option<WlFailure>,
@@ -802,10 +824,23 @@ impl DcaBlock {
             mr30_final: None,
             stop: None,
             restored: false,
+            #[cfg(any(test, feature = "full-speed"))]
+            mr_state_verified: true,
             launches: 0,
             writes: 0,
             failure: None,
             elapsed_us: 0,
+        }
+    }
+
+    #[cfg(any(test, feature = "full-speed"))]
+    pub const fn outcome(&self) -> Outcome {
+        if !self.restored || !self.mr_state_verified || self.failure.is_some() {
+            Outcome::Unknown
+        } else if changed(self) {
+            Outcome::Applied(1)
+        } else {
+            Outcome::Unchanged
         }
     }
 }
@@ -1152,25 +1187,35 @@ fn body<H: Hw>(ex: &mut WlExec<'_, H>, out: &mut DcaBlock, dbs: [u32; 2], cfg: &
         });
         return;
     };
-    if ro == Readout::Located {
-        // A second known answer at the same place, before any write.
-        let got = out.found[2].get(mdb);
-        if got != Some(cfg.mr16_found) {
-            out.stop = Some(DcaStop::Mr16Read { got });
-            return;
-        }
+    // A second known answer at the same place, before any write.
+    let got = out.found[2].get(mdb);
+    if got != Some(cfg.mr16_found) {
+        out.stop = Some(DcaStop::Mr16Read { got });
+        return;
     }
+    if ex.failure.is_some() {
+        return;
+    }
+    out.mr_state_verified = false;
     launch(ex, &mrw_launch(rank, 16, mr16_op));
+    if read(ex, 16).get(mdb) != Some(mr16_op) || ex.failure.is_some() {
+        launch(ex, &mrw_launch(rank, 16, cfg.mr16_found));
+        // The operating window was never confirmed; no MR30/MR26 write.
+        out.mr_state_verified = read(ex, 16).get(mdb) == Some(cfg.mr16_found);
+        return;
+    }
     for (k, &ma) in MRR_OPERATING.iter().enumerate() {
         out.operating[k] = read(ex, ma);
     }
     out.mr30_found = out.operating[0].get(mdb);
+    let mut verified = true;
     match cfg.mode {
         Mode::Mrr => {}
         Mode::Dcm => {
             let (rows, n) = cfg.dcm(rank);
             launch(ex, &rows[..n]);
             out.dcm_once = read(ex, 26).get(mdb);
+            verified = out.dcm_once.is_some_and(|v| v & 3 == MR26_STOP);
         }
         Mode::Measure | Mode::Apply => match out.mr30_found {
             None => out.stop = Some(DcaStop::Mr30Unread),
@@ -1187,12 +1232,27 @@ fn body<H: Hw>(ex: &mut WlExec<'_, H>, out: &mut DcaBlock, dbs: [u32; 2], cfg: &
                     found
                 };
                 launch(ex, &mrw_launch(rank, 30, last));
-                out.mr30_final = Some(last);
+                let actual = read(ex, 30).get(mdb);
+                if actual == Some(last) {
+                    out.mr30_final = actual;
+                } else {
+                    // Still inside the verified operating FSP window. If
+                    // the apply cannot be verified, try to restore MR30.
+                    launch(ex, &mrw_launch(rank, 30, found));
+                    let back = read(ex, 30).get(mdb);
+                    if back == Some(found) {
+                        out.mr30_final = back;
+                    } else {
+                        verified = false;
+                    }
+                }
+                verified &= read(ex, 26).get(mdb).is_some_and(|v| v & 3 == MR26_STOP);
             }
         },
     }
     // MR16 back: FSP-WR to the non-operating set as found.
     launch(ex, &mrw_launch(rank, 16, cfg.mr16_found));
+    out.mr_state_verified = read(ex, 16).get(mdb) == Some(cfg.mr16_found) && verified;
 }
 
 #[cfg(any(test, feature = "full-speed"))]
@@ -1666,6 +1726,7 @@ mod sim {
         dram: [[Dram; 2]; 2],
         off: f32,
         mr5: u8,
+        drop_mr16_restore: bool,
         mrws: Vec<(usize, usize, u8, u8)>,
         /// The RX FIFO's debug port: the port form that addresses the
         /// contents, and the pointers at which the last MRR's eight UI
@@ -1713,6 +1774,7 @@ mod sim {
                 dram: [[d(err[0][0]), d(err[0][1])], [d(err[1][0]), d(err[1][1])]],
                 off: 1.3,
                 mr5: 0x13,
+                drop_mr16_restore: false,
                 mrws: Vec::new(),
                 port: Port::Dfe0,
                 at: 8,
@@ -1760,7 +1822,7 @@ mod sim {
             let d = &mut self.dram[ch][rk];
             let m = Mr16::decode(d.mr16);
             match ma {
-                16 => d.mr16 = op,
+                16 if !(self.drop_mr16_restore && op == 0x04) => d.mr16 = op,
                 30 => d.mr30[m.fsp_wr as usize] = op,
                 26 if op & 1 != 0 => {
                     let flip = (op >> 1 & 1) as usize;
@@ -1908,6 +1970,7 @@ mod sim {
             assert_eq!(o.stop, None);
             assert_eq!(o.failure, None);
             assert!(o.restored);
+            assert_eq!(o.outcome(), Outcome::Applied(1));
             assert_eq!(o.mrr_db, Some(1));
             assert_eq!(o.mr30_found, Some(0));
             let ch_i = (ch == Channel::B) as usize;
@@ -1948,6 +2011,7 @@ mod sim {
         for o in &out {
             assert_eq!(o.mr30_found, Some(0x9a));
             assert_eq!(o.mr30_final, Some(0x9a));
+            assert_eq!(o.outcome(), Outcome::Unchanged);
             assert!(o.decision.iter().all(|d| d.is_some()));
         }
         for ch in &sim.dram {
@@ -1956,6 +2020,21 @@ mod sim {
                 assert_eq!(d.mr16, 0x04);
             }
         }
+    }
+
+    #[test]
+    fn unverified_mr16_restore_is_not_an_applied_result() {
+        let mut sim = Sim::new(ERR, 0);
+        sim.drop_mr16_restore = true;
+        let cfg = Config {
+            mode: Mode::Apply,
+            ..Config::DEFAULT
+        };
+        let mut out = DcaBlock::empty(Channel::A, Rank::R0);
+        run_block(&mut sim, &mut out, &cfg);
+        assert_ne!(out.mr30_found, out.mr30_final);
+        assert!(out.restored, "PHY CSR restore alone is not enough");
+        assert_eq!(out.outcome(), Outcome::Unknown);
     }
 
     #[test]
