@@ -843,7 +843,7 @@ fn read_training(bases: [Option<cubie_a7a_dram::phy::wcklevel::Mr18Base>; 4]) ->
         }
     };
     println!(
-        "[dram] RDT: read training ({}, pstate {}): order {:?}; config {:x?}; latch events (CSR, read at, bits) {:05x?} held {} us; receive clock effective delay 64 x coarse + fine (fine < 0x40 written); VrefDAC {}; check patterns (MR33, MR34) {:x?} then the first inverted (negative control); MRR {:?} with RxFifoVisibility {:x?}; no PState flip, no refresh; ps = taps x UI / 64; MRL = ceil((RxEnDly/64 UI + {} UI + {} ps) / {} UI) + {}, search {}, sweep {}..={}",
+        "[dram] RDT: read training ({}, pstate {}): order {:?}; config {:x?}; latch events (CSR, read at, bits) {:05x?} held {} us; receive clock effective delay 64 x coarse + fine (fine < 0x40 written); VrefDAC {}; check patterns (MR33, MR34) {:x?} then the first inverted (negative control); MRR {:?} at the FIFO location of MR5; no PState flip, no refresh; ps = taps x UI / 64; MRL = ceil((RxEnDly/64 UI + {} UI + {} ps) / {} UI) + {}, search {}, sweep {}..={}",
         if TRAIN_ONLY { "measurement image" } else { "applied" },
         ps,
         runs,
@@ -853,7 +853,6 @@ fn read_training(bases: [Option<cubie_a7a_dram::phy::wcklevel::Mr18Base>; 4]) ->
         if TRAIN_ONLY { "from the vendor (av3c)" } else { "as initialised (ours)" },
         CHECK_PATTERNS,
         MRR_MAS,
-        rdtrain::VIS_MRR,
         base_cfg.fifo_ui,
         base_cfg.fifo_ps,
         base_cfg.dficlk_ui,

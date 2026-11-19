@@ -49,8 +49,8 @@
 //!    pattern with the inverted expected word as a negative control (every
 //!    lane must fail).
 //! 6. **MRR** of [`MRR_MAS`] through the synchronous path read from the RX
-//!    FIFO with ObsSel 1 as the reference reads it (RxFifoVisibility 0x300,
-//!    then 0x3fc per lane), decoded through Dq0..7LnSel when every lane
+//!    FIFO at the per-DBYTE location found by scanning for MR5,
+//!    decoded through Dq0..7LnSel when every lane
 //!    reads 0x00 or 0xff. Reported, not judged.
 //! 7. **MRL:** the diagnostic sweep from [`TrainConfig::search_mrl`] up to
 //!    `mrl_max`, then down to `mrl_min`, each value followed by a probe at
@@ -180,7 +180,7 @@ pub fn EXIT_MRS() -> ModeMrs {
     }
 }
 
-/// RxFifoVisibility for the MRR read-out: ObsSel 1, then ObsSel 1 with
+/// Legacy fixed RxFifoVisibility for the handover probe: ObsSel 1, then ObsSel 1 with
 /// RdEnDfe0/1 and pointer 0x3c (the reference's value). FEL lab knob
 /// `A7A_RD_VIS` (hex) replaces the second value: the reference
 /// writes 0xfffc there (stage 0x06's read-out),
@@ -1597,14 +1597,13 @@ pub(crate) fn data_check<H: Hw>(
     );
 }
 
-/// Step 7: MRR known answers read from the FIFO with ObsSel 1.
+/// MRR known answers read from the FIFO.
 fn mrr<H: Hw>(ex: &mut WlExec<'_, H>, out: &mut RdTrain, dbs: [u32; 2]) {
     let rank = out.rank;
     mrr_read(ex, dbs, rank, &mut out.mrr);
 }
 
-/// [`MRR_MAS`] through the synchronous path, read from the FIFO with
-/// ObsSel 1 (module documentation, step 6).
+/// Locate MR5 per DBYTE, then read each MR at that same location.
 #[inline(never)]
 pub(crate) fn mrr_read<H: Hw>(
     ex: &mut WlExec<'_, H>,
@@ -1613,6 +1612,7 @@ pub(crate) fn mrr_read<H: Hw>(
     out: &mut [MrrRead; MRR_MAS.len()],
 ) {
     let standby = ex.read(0x1000a + 0x1000 * dbs[0]);
+    let mut loc = [None; 2];
     let mut lane_sel = [[0u16; 8]; 2];
     for (i, &db) in dbs.iter().enumerate() {
         for (dq, v) in lane_sel[i].iter_mut().enumerate() {
@@ -1632,14 +1632,18 @@ pub(crate) fn mrr_read<H: Hw>(
         ex.write(RX_STANDBY, standby);
         let r = &mut out[k];
         for (i, &db) in dbs.iter().enumerate() {
-            ex.write(fifo_vis(db), VIS_MRR[0]);
-            for lane in 0..8u32 {
-                ex.read(fifo_info(db, lane));
+            if ma == 5 {
+                let mut scan = [[None; crate::dca::FIFO_UI]; 2];
+                crate::dca::scan_fifo(ex, db, &lane_sel[i], &mut scan);
+                loc[i] = crate::dca::locate(&scan, crate::dca::Config::DEFAULT.mr5_want);
             }
-            for lane in 0..8u32 {
-                ex.write(fifo_vis(db), VIS_MRR[1]);
-                r.raw[i][lane as usize] = ex.read(0x10073 + 0x1000 * db + 0x100 * lane) as u8;
-            }
+            let Some(at) = loc[i] else {
+                r.raw[i] = [0; 8];
+                r.value[i] = None;
+                ex.write(fifo_vis(db), VIS_DFE0);
+                continue;
+            };
+            r.raw[i] = crate::dca::fifo_burst(ex, db, at).map(|v| v as u8);
             ex.write(fifo_vis(db), VIS_DFE0);
             let mut v = 0u8;
             let mut ok = true;

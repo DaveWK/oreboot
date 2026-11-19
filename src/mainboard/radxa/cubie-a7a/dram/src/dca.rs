@@ -501,18 +501,15 @@ pub const TRACE_MRL: [u16; 4] = [0x82, 3, 5, 8];
 
 /// RxFifoVisibility values of the MRR read-out: ObsSel 1 (FIFO pointers),
 /// then the per-lane contents value. The reference writes 0xfffc;
-/// `rdtrain::VIS_MRR` uses 0x3fc (its blobless MRRs read 0 on the board).
+/// a fixed pointer need not address the MRR burst.
 pub const VIS_INFO: u16 = 0x300;
 pub const VIS_TRACE: u16 = 0xfffc;
-#[cfg(any(test, feature = "full-speed"))]
 /// RxFifoVisibility with the DFE0 FIFO's pointers selected (ObsSelOvrd,
 /// ObsSel 0), as the read training reads them.
 pub const VIS_INFO_DFE0: u16 = 0x200;
-#[cfg(any(test, feature = "full-speed"))]
 /// Entries of the RX FIFO per lane (RdLoc 0..47).
 pub const FIFO_UI: usize = 48;
 
-#[cfg(any(test, feature = "full-speed"))]
 /// An address form of the RX FIFO's debug read port.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Port {
@@ -524,7 +521,6 @@ pub enum Port {
     Both,
 }
 
-#[cfg(any(test, feature = "full-speed"))]
 /// Where an MRR's eight UI sit in the FIFO: the port form and its pointer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Loc {
@@ -532,12 +528,10 @@ pub struct Loc {
     pub ptr: u8,
 }
 
-#[cfg(any(test, feature = "full-speed"))]
 /// The decoded value at every pointer, per [`Port`] (0 [`Port::Dfe0`], 1
 /// [`Port::Both`]); None: a lane read neither clearly 0 nor clearly 1.
 pub type Scan = [[Option<u8>; FIFO_UI]; 2];
 
-#[cfg(any(test, feature = "full-speed"))]
 /// The place of the value `want` in a scan: the port form with the
 /// longest circular run of pointers that decode to it (ties: DFE0), and
 /// the middle of that run. None: no pointer of either form reads it.
@@ -910,7 +904,6 @@ pub(crate) fn mrr_rows<H: Hw>(
     m
 }
 
-#[cfg(any(test, feature = "full-speed"))]
 /// One lane's FIFO contents at `loc`.
 fn contents<H: Hw>(ex: &mut WlExec<'_, H>, db: u32, lane: u32, loc: Loc) -> u16 {
     let p = loc.ptr as u16 & 0x3f;
@@ -928,6 +921,24 @@ fn contents<H: Hw>(ex: &mut WlExec<'_, H>, db: u32, lane: u32, loc: Loc) -> u16 
         Port::Both => ex.write(fifo_vis(db), VIS_INFO | 0xc0 | p),
     }
     ex.read(0x10073 + 0x1000 * db + 0x100 * lane)
+}
+
+pub(crate) fn fifo_burst<H: Hw>(ex: &mut WlExec<'_, H>, db: u32, at: Loc) -> [u16; 8] {
+    core::array::from_fn(|lane| contents(ex, db, lane as u32, at))
+}
+
+/// Sample both read-port forms over the complete FIFO for one DBYTE.
+pub(crate) fn scan_fifo<H: Hw>(ex: &mut WlExec<'_, H>, db: u32, sel: &[u16; 8], scan: &mut Scan) {
+    for (row, port) in scan.iter_mut().zip([Port::Dfe0, Port::Both]) {
+        for (ptr, value) in row.iter_mut().enumerate() {
+            let at = Loc {
+                port,
+                ptr: ptr as u8,
+            };
+            *value = decode(&fifo_burst(ex, db, at), sel);
+        }
+        ex.hw.kick_watchdog();
+    }
 }
 
 #[cfg(any(test, feature = "full-speed"))]
@@ -966,18 +977,7 @@ fn mrr_at<H: Hw>(
             m.info[i][lane as usize] = ex.read(fifo_info(db, lane));
         }
         if let Some(sc) = scan.as_deref_mut() {
-            for (k, port) in [Port::Dfe0, Port::Both].into_iter().enumerate() {
-                for (ptr, value) in sc[i][k].iter_mut().enumerate() {
-                    let at = Loc {
-                        port,
-                        ptr: ptr as u8,
-                    };
-                    let raw: [u16; 8] =
-                        core::array::from_fn(|lane| contents(ex, db, lane as u32, at));
-                    *value = decode(&raw, &sel);
-                }
-                ex.hw.kick_watchdog();
-            }
+            scan_fifo(ex, db, &sel, &mut sc[i]);
         }
         match (*ro, loc[i]) {
             (Readout::Fixed(vis), _) => {
@@ -988,9 +988,7 @@ fn mrr_at<H: Hw>(
                 m.value[i] = decode(&m.raw[i], &sel);
             }
             (Readout::Located, Some(at)) => {
-                for lane in 0..8u32 {
-                    m.raw[i][lane as usize] = contents(ex, db, lane, at);
-                }
+                m.raw[i] = fifo_burst(ex, db, at);
                 m.value[i] = decode(&m.raw[i], &sel);
             }
             (Readout::Located, None) => {}
@@ -1846,6 +1844,7 @@ mod sim {
             let d = &self.dram[ch][rk];
             let v = match ma {
                 5 => self.mr5,
+                8 => 0x10,
                 16 => d.mr16,
                 26 => d.mr26_res,
                 30 => d.mr30[Mr16::decode(d.mr16).fsp_wr as usize],
@@ -2094,6 +2093,38 @@ mod sim {
         assert_eq!(a0.decision[0].unwrap().step, Err(NoDecision::Flat));
         assert_eq!(a0.decision[1].unwrap().step, Ok(0));
         assert_eq!(a0.mr30_final, Some(0x00));
+    }
+
+    #[test]
+    fn rdtrain_mrr_reads_at_the_located_pointer() {
+        use crate::rdtrain::{mrr_read, MrrRead, MRR_MAS};
+
+        for port in [Port::Dfe0, Port::Both] {
+            let mut sim = Sim::new(ERR, 0);
+            sim.port = port;
+            sim.at = FIFO_UI - 1;
+            let mut ex = WlExec::new(&mut sim);
+            select(&mut ex, Channel::A, &Config::DEFAULT);
+            let mut out = [MrrRead::EMPTY; MRR_MAS.len()];
+            mrr_read(&mut ex, [0, 1], Rank::R0, &mut out);
+            assert_eq!(
+                out.map(|mr| mr.value),
+                [0x13, 0x10, 0x04, 0].map(|v| [None, Some(v)])
+            );
+        }
+    }
+
+    #[test]
+    fn rdtrain_mrr_without_a_pointer_reports_none() {
+        use crate::rdtrain::{mrr_read, MrrRead, MRR_MAS};
+
+        let mut sim = Sim::new(ERR, 0);
+        sim.span = 0;
+        let mut ex = WlExec::new(&mut sim);
+        select(&mut ex, Channel::B, &Config::DEFAULT);
+        let mut out = [MrrRead::EMPTY; MRR_MAS.len()];
+        mrr_read(&mut ex, [2, 3], Rank::R1, &mut out);
+        assert_eq!(out.map(|mr| mr.value), [[None; 2]; MRR_MAS.len()]);
     }
 
     #[test]
