@@ -186,7 +186,7 @@ const ADDRMAP1_CS_UNUSED: u32 = 0x3f;
 /// Validate the live channel-0 `ADDRMAP1` readback against `dram_size` and the
 /// supported A7A board maps (`cubie-a7a-dram/src/ctrl.rs` `RankMap` and
 /// `dwc-ddrctl/src/addrmap.rs`). The writer sets the unused upper field to
-/// `0x3f`, but task-000095 read `0x0017` on the 4 GiB board after `0x3f17`
+/// `0x3f`, but a read on the 4 GiB board returned `0x0017` after `0x3f17`
 /// was written. Admit either readback, not an arbitrary second CS mapping.
 pub fn validate_live_rank_map(addrmap1: u32, dram_size: u64) -> Result<LiveRankMap, &'static str> {
     const GIB: u64 = 1u64 << 30;

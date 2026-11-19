@@ -84,11 +84,10 @@ cd ../main
 cargo build --release --no-default-features --features "gmac usb trng trng-byte-addr"
 ```
 
-Then `rust-objcopy -O binary` each ELF. Packing the eGON header, the boot
-layout table and the payload (EDK2) into a card image, and the USB FEL boot
-script, are in the workspace that builds the whole chain:
-<https://github.com/DaveWK/radxa-a7a-workspace> (`make firmware`,
-`make fel-boot`).
+Then `rust-objcopy -O binary` each ELF. For a card image, pack the eGON
+header, boot layout table and payload (EDK2) with the stage binaries.
+For USB FEL boot, load the stages with a host FEL tool as described in
+`bt0/src/fel.rs`.
 
 ## Boot failures
 

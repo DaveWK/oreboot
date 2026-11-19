@@ -1,7 +1,7 @@
 //! USB FEL boot (feature `fel`): bt0 started by the mask ROM's FEL mode
 //! over USB (xfel), for a board that cannot boot from its SD card.
 //!
-//! The host (scripts/fel-boot.sh in radxa-a7a-workspace) writes this build to
+//! The host FEL tool writes this build to
 //! [`LINK_BASE`] and calls two entries with `xfel exec`:
 //!
 //! | Address           | Entry                                                |

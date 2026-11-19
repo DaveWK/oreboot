@@ -89,7 +89,7 @@ bl-mission = ["blobless"]
 # hand-over (bt0/src/dram/blobless.rs hybrid_after_pmu). Build with
 # A7A_OPEN_OPTS bit 7 (stop before the DFI init).
 hybrid = []
-# USB FEL boot (src/fel.rs; scripts/fel-boot.sh in radxa-a7a-workspace):
+# USB FEL boot (src/fel.rs):
 # bt0 linked at 0x90000, started by the mask ROM's FEL (xfel exec) instead
 # of from the SD card. Entry 1 brings up PMIC, clocks and DRAM and returns
 # to FEL; the host then writes main, the payload and the layout table;
@@ -108,8 +108,8 @@ spinor = ["cubie-a7a-dram/vendor-vdd2l"]
 # FEL boot's VDD2L for the backends that do not set it themselves (the
 # blob-free boot's profile does).
 emmc = ["cubie-a7a-dram/vendor-vdd2l"]
-# fastboot over FEL (src/fastboot.rs, src/musb.rs; scripts/fastboot-boot.sh
-# in radxa-a7a-workspace): FEL entry 4 at 0x9004c brings DRAM up (unless
+# fastboot over FEL (src/fastboot.rs, src/musb.rs):
+# FEL entry 4 at 0x9004c brings DRAM up (unless
 # entry 1 did), takes USB0 over from the mask ROM and serves the stock
 # fastboot tool (18d1:4ee0): getvar, download, boot/continue of a layout
 # bundle (the FEL entry 2 hand-over), reboot, reboot-bootloader (back to

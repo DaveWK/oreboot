@@ -1570,7 +1570,7 @@ mod tests {
         assert!(firmware_check(&t).is_err());
     }
 
-    /// The built image (scripts/mk-emmc-fw.py in radxa-a7a-workspace), when
+    /// The packed eMMC firmware image, when
     /// given:
     /// `EMMC_FW_IMAGE=.../emmc-fw.bin cargo test`.
     #[test]

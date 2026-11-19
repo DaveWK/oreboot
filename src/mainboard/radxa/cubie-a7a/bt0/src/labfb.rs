@@ -291,8 +291,8 @@ fn leave(back: u32) -> ! {
 const FEL_FLAG_REG: usize = soc::RTC_BASE + 0x108;
 const FEL_FLAG: u32 = 0x5aa5_a55a;
 
-/// WDT0 whole-system reset with exactly the writes the host's felreset
-/// script (scripts/felreset.sh in radxa-a7a-workspace) makes from FEL
+/// WDT0 whole-system reset with the same register writes as a host reset
+/// issued over FEL
 /// (CFG = key | 1 whole system, MODE = key | 1 enable 0.5 s, CTRL
 /// restart), which has brought the board back into FEL after every
 /// blob-free run. `soc::watchdog_reset` also writes WDT0 +0x08 (key | 1)

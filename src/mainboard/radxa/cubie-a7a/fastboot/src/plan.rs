@@ -239,8 +239,8 @@ mod tests {
         );
     }
 
-    /// A real boot bundle (`scripts/fastboot-boot.sh bundle` in
-    /// radxa-a7a-workspace), when A7A_BUNDLE names it.
+    /// A boot bundle containing the layout table and stage images, when
+    /// A7A_BUNDLE names it.
     #[test]
     fn real_bundle_if_given() {
         let Ok(path) = std::env::var("A7A_BUNDLE") else {
