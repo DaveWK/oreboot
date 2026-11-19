@@ -850,6 +850,45 @@ impl<H: Hw> Executor<'_, H> {
     }
 }
 
+/// FEL lab `A7A_CBT_CA_ADD` (hex): added to every CA lane's trained delay.
+pub const CBT_CA_ADD: u16 = hex_knob(option_env!("A7A_CBT_CA_ADD"));
+
+/// The ACTxDly values CBT applies: its centres plus [`CBT_CA_ADD`], wrapped
+/// into the 8-bit register (ACTxDly [7:6] coarse UI 0-3, [5:0] fine UI/64,
+/// EIC7700X TRM Part 2). The sweep runs 0..511 and the delay passes once per
+/// 256 units, so a centre found in the second period (288 on this board)
+/// was written past the register's width and truncated by the hardware.
+pub fn ca_applied(delay: &[u16; 7]) -> [u16; 7] {
+    delay.map(|d| d.wrapping_add(CBT_CA_ADD) & 0xff)
+}
+
+/// FEL lab `A7A_WL_TXWCK_ADD` (hex): added to every DBYTE's TxWckDlyTg0/1
+/// right after WCK2CK leveling, with a held ForceInternalUpdate (the DFI is
+/// still offline). Blobless leveling lands exactly one WCK cycle (0x80)
+/// before the PMU's TxWckDly; with this the read training runs on the PMU's
+/// WCK cycle.
+pub const WL_TXWCK_ADD: u16 = hex_knob(option_env!("A7A_WL_TXWCK_ADD"));
+
+/// Apply [`WL_TXWCK_ADD`]; returns the TxWckDlyTg0 of each DBYTE after.
+pub fn wl_txwck_add<H: Hw>(hw: &mut H) -> [u16; 4] {
+    let mut out = [0u16; 4];
+    csr_access(hw, true);
+    for (db, o) in out.iter_mut().enumerate() {
+        for tg in 0..2u32 {
+            let c = csr(0x1002a + 0x1000 * db as u32 + tg);
+            let v = hw.read16(c);
+            hw.write16(c, v.wrapping_add(WL_TXWCK_ADD));
+        }
+        *o = hw.read16(csr(0x1002a + 0x1000 * db as u32));
+    }
+    hw.write16(csr(0x200a3), 1);
+    hw.udelay(5);
+    hw.write16(csr(0x200a3), 0);
+    hw.udelay(5);
+    csr_access(hw, false);
+    out
+}
+
 /// Points of the common CA delay sweep (0..511 in steps of 4).
 pub const CA_SWEEP_POINTS: u32 = 128;
 pub const CA_SWEEP_STEP: u16 = 4;
@@ -1020,7 +1059,7 @@ pub fn cold_init_ca_train<H: Hw>(
             .iter()
             .zip(out.channels.iter())
         {
-            coldinit::set_block_delays(c.ac, &ca.delay, &mut |s| ex.step(s));
+            coldinit::set_block_delays(c.ac, &ca_applied(&ca.delay), &mut |s| ex.step(s));
         }
     }
     out.exec = ex.r;

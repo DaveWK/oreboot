@@ -265,6 +265,13 @@ fn wck_level(p: &mut Para) {
     }
     let bad = wl::end(&mut Bt0Hw, &saved);
     println!("[dram] WL: lane maps restored, mismatch mask {bad:x}");
+    if blobless::WL_TXWCK_ADD != 0 {
+        let after = blobless::wl_txwck_add(&mut Bt0Hw);
+        println!(
+            "[dram] WL: TxWckDly +{:x} (held update): Tg0 per DBYTE {after:03x?}",
+            blobless::WL_TXWCK_ADD
+        );
+    }
     #[cfg(feature = "hybrid")]
     if option_env!("A7A_HYBRID_SKIP_RD").is_some() {
         let r = blobless::mission_handover(&mut Bt0Hw, p, PROBE_PSTATE);
@@ -1141,10 +1148,11 @@ pub fn init_one(para: &[u32; 32]) -> Option<u32> {
                 for (ch, c) in t.channels.iter().enumerate() {
                     let ls = blobless::LANE_SWEEP_STEP as u32;
                     println!(
-                    "[dram] blobless: CA ch {}: lane map agrees {}, delays {:?}, windows {}..+{} {}..+{} {}..+{} {}..+{} {}..+{} {}..+{} {}..+{}",
+                    "[dram] blobless: CA ch {}: lane map agrees {}, delays {:?} (ACTxDly applied {:02x?}), windows {}..+{} {}..+{} {}..+{} {}..+{} {}..+{} {}..+{} {}..+{}",
                     ["A", "B"][ch],
                     c.lane_map_agrees,
                     c.delay,
+                    blobless::ca_applied(&c.delay),
                     c.runs[0].0 * ls, c.runs[0].1 * ls,
                     c.runs[1].0 * ls, c.runs[1].1 * ls,
                     c.runs[2].0 * ls, c.runs[2].1 * ls,
