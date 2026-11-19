@@ -1929,8 +1929,8 @@ mod tests {
         ));
     }
 
-    fn plan(active: u32, am1: u32) -> Result<probe::Plan, probe::Refusal> {
-        probe::Plan::from_live(0x4000_0000, [active << 24; 2], [am1; 2])
+    fn plan(active: u32, am1: u32, mib: u32) -> Result<probe::Plan, probe::Refusal> {
+        probe::Plan::from_live(0x4000_0000, mib, [active << 24; 2], [am1; 2])
     }
     fn probe_discover(s: &mut Sim, start: &BlindStart, before: &Snapshot) -> BlindRun<()> {
         discover_or_restore(s, &mut 1, start, 0xff, before)
@@ -1940,23 +1940,26 @@ mod tests {
     }
     #[test]
     fn probe119_four_gb() {
-        let p = plan(3, 0x3f17).unwrap();
-        assert_eq!(p.blocks[8], 0xc010_0000);
-        assert_eq!(p.blocks[15], 0xc010_2000);
+        let p = plan(3, 0x3f17, 4096).unwrap();
+        assert_eq!(p.blocks()[8], 0xc010_0000);
+        assert_eq!(p.blocks()[15], 0xc010_2000);
     }
     #[test]
     fn probe119_six_gb() {
-        let p = plan(3, 0x3f16).unwrap();
-        assert_eq!(p.blocks[8], 0x8010_0000);
-        assert_eq!(p.blocks[15], 0x8010_2000);
+        let p = plan(3, 0x3f16, 6144).unwrap();
+        assert_eq!(p.blocks()[8], 0x8010_0000);
+        assert_eq!(p.blocks()[15], 0x8010_2000);
     }
     #[test]
     fn probe119_single_rank_from_geometry_only() {
         // One enabled rank and no CS field is not proof of a single-rank
         // board: no plan, so TG1 is never exempt.
-        assert_eq!(plan(1, 0x3f3f).err(), Some(probe::Refusal::SingleRank));
+        assert_eq!(
+            plan(1, 0x3f3f, 4096).err(),
+            Some(probe::Refusal::SingleRank)
+        );
         // Same absent CS field, but both ranks enabled: no usable plan.
-        assert_eq!(plan(3, 0x3f3f).err(), Some(probe::Refusal::Geometry));
+        assert_eq!(plan(3, 0x3f3f, 4096).err(), Some(probe::Refusal::Geometry));
     }
     #[test]
     fn probe119_no_tg1_refuses_clean_blind_start() {

@@ -34,7 +34,7 @@ use cubie_a7a_dram::wrtrain::{
     self, BlindRun, BlindStart, Delays, Folds, LaneFit, Ledger, MrPort, Snapshot, WritePort,
     DBYTES, LANES,
 };
-use cubie_a7a_dram::{Error, RegIo};
+use cubie_a7a_dram::{Error, Para, RegIo};
 
 use super::bt0hw::Bt0Hw;
 
@@ -89,9 +89,9 @@ fn finish(p: &mut Port<'_>, before: &Snapshot, seed: &mut u32, m: &wrtrain::Map)
     match wrtrain::final_check(m, seed, |seed| p.compare(seed)) {
         Ok(report) => {
             let bad = report.bad;
-            log_coverage("final", p.2.required, report.covered);
+            log_coverage("final", p.2.required(), report.covered);
             println!("[dram] WR: final probe check: failing blocks {bad:04x}");
-            report.passes(p.2.required) || undo(p, before)
+            report.passes(p.2.required()) || undo(p, before)
         }
         Err(e) => {
             println!("[dram] WR: final probe check failed: {e:?}; stopping");
@@ -145,7 +145,7 @@ impl Port<'_> {
                 .apply(&mut || cubie_a7a_dram::blobless::apply_delays(hw, DBYTES / 2))?;
         }
         // DRAM in mission mode; bt0 runs from SRAM and nothing else uses
-        // the plan's blocks.
+        // the plan's blocks (`probe` module docs).
         let r = self.2.compare(&mut self.0, seed);
         crate::recovery::kick();
         Ok(r)
@@ -188,18 +188,28 @@ fn print_delays(tag: &str, tg: usize, d: &Delays) {
 
 /// The stage (see the module docs); nothing when `A7A_WR_STAGE` is unset.
 /// Returns whether the probe blocks write cleanly at the end (true when
-/// the stage is off).
-pub fn run() -> bool {
+/// the stage is off). `para` is the parameter set the bring-up ran with:
+/// its usable size bounds the probe blocks.
+///
+/// Call it only before anything is loaded into DRAM (`probe` module docs).
+pub fn run(para: &Para) -> bool {
     if BITS() == 0 {
         return true;
     }
-    let (mstr, am1) = probe::read_live(&mut Bt0Hw);
+    let mib = match cubie_a7a_dram::size::boot_size_mib(para) {
+        Ok(mib) => mib,
+        Err(e) => {
+            println!("[dram] WR: no usable size: {e:?}; stopping");
+            return false;
+        }
+    };
     // Reads only: nothing is stored to DRAM before the plan is accepted.
-    let plan = match Plan::from_live(crate::mem::DRAM_BASE as u32, mstr, am1) {
+    let (mstr, am1) = probe::read_live(&mut Bt0Hw);
+    let plan = match Plan::from_live(crate::mem::DRAM_BASE as u32, mib, mstr, am1) {
         Ok(plan) => plan,
         Err(refusal) => {
             println!(
-                "[dram] WR: {}: MSTR0 {mstr:08x?} ADDRMAP1 {am1:08x?}; stopping",
+                "[dram] WR: {}: MSTR0 {mstr:08x?} ADDRMAP1 {am1:08x?}, {mib} MiB; stopping",
                 refusal.reason()
             );
             return false;
@@ -211,7 +221,7 @@ pub fn run() -> bool {
     println!(
         "[dram] WR: stage bits {:x}, probe blocks {:08x?} x {BLOCK_BYTES} B",
         BITS(),
-        plan.blocks
+        plan.blocks()
     );
     let before = match wrtrain::snapshot(&mut p) {
         Ok(b) => b,
@@ -267,18 +277,18 @@ pub fn run() -> bool {
     let blind_clean = blind_start.as_ref().is_some_and(BlindStart::clean);
     let m = match blind_start.as_ref() {
         Some(start) => {
-            match wrtrain::discover_or_restore(&mut p, &mut seed, start, plan.required, &before) {
+            match wrtrain::discover_or_restore(&mut p, &mut seed, start, plan.required(), &before) {
                 BlindRun::Map(m) => m,
                 BlindRun::KeepBlind(m, e) => {
                     println!(
                         "[dram] WR: discovery failed: {e:?}; the blind start is clean, keeping it"
                     );
-                    log_coverage("discovery", plan.required, m.coverage(u32::MAX));
+                    log_coverage("discovery", plan.required(), m.coverage(u32::MAX));
                     return finish(&mut p, &before, &mut seed, &m);
                 }
                 BlindRun::Failed(e) => {
                     if let wrtrain::WrError::Coverage(missing) = &e {
-                        log_coverage("discovery", plan.required, plan.required & !missing);
+                        log_coverage("discovery", plan.required(), plan.required() & !missing);
                     }
                     p.apply_restore();
                     println!("[dram] WR: discovery failed: {e:?}; stopping");
@@ -295,8 +305,8 @@ pub fn run() -> bool {
         },
     };
     let observed = m.coverage(u32::MAX);
-    log_coverage("discovery", plan.required, observed);
-    if observed & plan.required != plan.required {
+    log_coverage("discovery", plan.required(), observed);
+    if observed & plan.required() != plan.required() {
         return undo(&mut p, &before);
     }
     println!(

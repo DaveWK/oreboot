@@ -77,7 +77,8 @@ fn RD_GAPS() -> Option<u32> {
 
 /// Sled bases: away from main (0x40000000), the EL3 area and fwlog
 /// (0x40000000-0x401fffff), the EDK2 FD (0x41000000, 4 MiB), the write
-/// stage's probe blocks (0x40100000.., 0xbf000000..), the warm-reset
+/// stage's probe blocks (0x40100000.., and rank 1's 0xc0100000.. or
+/// 0x80100000..), the warm-reset
 /// stub's FILL region (0x48000000, 1 MiB) and inside the range bt0 tests
 /// (below 0xc0000000). A base at +0x80 in its 128-byte block: the other
 /// channel (measured: the write stage's blocks 1 and 9). Each sled length

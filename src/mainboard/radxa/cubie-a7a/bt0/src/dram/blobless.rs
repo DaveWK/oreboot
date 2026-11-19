@@ -373,7 +373,7 @@ fn wck_level(p: &mut Para) {
         let r = blobless::mission_handover(&mut Bt0Hw, p, stage_pstate());
         println!("[dram] MISSION (hybrid, no read training): {r:?}");
         if r.is_ok() {
-            let _ = super::wrstage::run();
+            let _ = super::wrstage::run(p);
         }
         return;
     }
@@ -416,7 +416,7 @@ fn wck_level(p: &mut Para) {
                 );
                 stages = stages.handover_result(r.is_ok());
                 if r.is_ok() {
-                    let clean = mission_stages();
+                    let clean = mission_stages(p);
                     #[cfg(dram_mission)]
                     {
                         stages = stages.write_stage_result(clean);
@@ -1666,7 +1666,7 @@ pub fn hybrid_after_pmu(p: &mut Para) -> ! {
         let r = blobless::mission_handover(&mut Bt0Hw, p, hybrid_pstate());
         println!("[dram] MISSION (hybrid, no leveling, no read training): {r:?}");
         if r.is_ok() {
-            let _ = super::wrstage::run();
+            let _ = super::wrstage::run(p);
         }
     } else if k.hybrid_skip_wl {
         let bases = blobless::wl_mr18_bases(p, stage_pstate());
@@ -2055,11 +2055,11 @@ const _: () = assert!(
     not(feature = "rd-measure")
 ))]
 #[inline(always)]
-fn mission_stages() -> bool {
+fn mission_stages(p: &Para) -> bool {
     if DCA_CTL.is_some_and(|cfg| !dca_ctl_stage(&cfg)) {
         return false;
     }
-    super::wrstage::run()
+    super::wrstage::run(p)
 }
 
 #[cfg(all(
