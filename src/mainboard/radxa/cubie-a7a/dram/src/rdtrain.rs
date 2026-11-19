@@ -318,8 +318,8 @@ impl TrainConfig {
         ..TrainConfig::PSTATE1
     };
 
-    /// The configuration of `pstate` (0 or 1; None for the others), with
-    /// [`MRL_SEARCH`] applied.
+    /// The configuration of `pstate` 0 or 1 (None for the others; they have
+    /// [`below_pstate1`]), with [`MRL_SEARCH`] applied.
     pub const fn for_pstate(pstate: u32) -> Option<TrainConfig> {
         let mut c = match pstate {
             0 => TrainConfig::PSTATE0,
@@ -1532,6 +1532,50 @@ pub fn live_summary<H: Hw>(hw: &mut H, lane: u16) -> [[u16; 3]; 4] {
     v
 }
 
+/// pstate 2 (WCK 800 MHz, 1600 MT/s, UI 625 ps): as pstate 1 (the
+/// reference's read enable and read centring launches are the pstate-1
+/// rows, REFERENCE-DERIVED), with the training firmware's mission read
+/// latency at this pstate during the searches and as the fallback (DFIMRL 4
+/// and RxEnDly 0x307 of DBYTE 0 in the PHY's saved pstate-2 copy on the
+/// board, MEASURED). Not run on a board.
+pub const PSTATE2: TrainConfig = TrainConfig {
+    mrl_search: 4,
+    ui_ps: 625,
+    mrl_check: (0x307, 4),
+    mrl_fallback: 4,
+    ..TrainConfig::PSTATE1
+};
+
+/// pstate 3 (WCK 400 MHz, 800 MT/s, UI 1250 ps): as [`PSTATE2`] with the
+/// saved pstate-3 copy's values (DFIMRL 3, RxEnDly 0x2a5, MEASURED). Not run
+/// on a board.
+pub const PSTATE3: TrainConfig = TrainConfig {
+    mrl_search: 3,
+    ui_ps: 1250,
+    mrl_check: (0x2a5, 3),
+    mrl_fallback: 3,
+    ..TrainConfig::PSTATE1
+};
+
+/// The configuration of a pstate [`TrainConfig::for_pstate`] has none for:
+/// [`PSTATE2`] or [`PSTATE3`] with [`MRL_SEARCH`] applied; for any other,
+/// pstate 1's.
+pub const fn below_pstate1(pstate: u32) -> TrainConfig {
+    let mut c = match pstate {
+        2 => PSTATE2,
+        3 => PSTATE3,
+        _ => return TrainConfig::PSTATE1,
+    };
+    if let Some(m) = MRL_SEARCH {
+        c.mrl_search = m;
+    }
+    c
+}
+
+/// [`below_pstate1`] of the build's pstate ([`crate::pstate::ACTIVE`]): what
+/// a caller takes where [`TrainConfig::for_pstate`] has none.
+pub const BUILD_BELOW_PSTATE1: TrainConfig = below_pstate1(crate::pstate::ACTIVE);
+
 #[cfg(test)]
 mod lane_mask_tests {
     use super::{lane_mask, FULL, PASS_LANES};
@@ -1594,5 +1638,49 @@ mod pstate_config_tests {
             assert_eq!(TrainConfig::for_pstate(0), Some(c0));
         }
         assert_eq!(TrainConfig::for_pstate(2), None);
+        assert_eq!(below_pstate1(1), c1);
+        assert_eq!(below_pstate1(4), c1);
+        if crate::pstate::ACTIVE < 2 {
+            assert_eq!(BUILD_BELOW_PSTATE1, c1);
+        }
+    }
+
+    #[test]
+    fn pstate2_and_pstate3_configs() {
+        let c1 = TrainConfig::PSTATE1;
+        for (ps, c, rx_en, mrl) in [
+            (2, PSTATE2, 0x307, 4),
+            (3, PSTATE3, 0x2a5, 3),
+        ] {
+            // Only the latency inputs and the UI differ from pstate 1.
+            assert_eq!(
+                TrainConfig {
+                    mrl_search: c1.mrl_search,
+                    ui_ps: c1.ui_ps,
+                    mrl_check: c1.mrl_check,
+                    mrl_fallback: c1.mrl_fallback,
+                    ..c
+                },
+                c1
+            );
+            assert_eq!(c.ui_ps as u32, crate::pstate::Point::board(ps).ui_ps());
+            assert_eq!(
+                (c.mrl_check, c.mrl_search, c.mrl_fallback),
+                ((rx_en, mrl), mrl, mrl)
+            );
+            // Inside the diagnostic sweep's range and the search grid.
+            assert!(c.mrl_min <= mrl && mrl <= c.mrl_max);
+            assert!(c.gate_step * (c.gate_n - 1) > rx_en + c.en_margin);
+            // The formula misses these points too (one below), so the
+            // training firmware's mission latency is what is applied.
+            assert_eq!(derive_mrl(rx_en, &c), mrl - 1);
+            assert_eq!(
+                choose_mrl(rx_en, &c),
+                (mrl, MrlSource::FallbackFormulaWrong)
+            );
+            if MRL_SEARCH.is_none() {
+                assert_eq!(below_pstate1(ps), c);
+            }
+        }
     }
 }

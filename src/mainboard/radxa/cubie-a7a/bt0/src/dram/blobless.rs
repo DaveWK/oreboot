@@ -822,7 +822,7 @@ fn read_training(bases: [Option<cubie_a7a_dram::phy::wcklevel::Mr18Base>; 4]) ->
         exit: cubie_a7a_dram::rdtrain::EXIT_MRS(),
         ..match TrainConfig::for_pstate(ps) {
             Some(c) => c,
-            None => TrainConfig::PSTATE1,
+            None => cubie_a7a_dram::rdtrain::BUILD_BELOW_PSTATE1,
         }
     };
     println!(
