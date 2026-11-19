@@ -541,7 +541,18 @@ impl Ehci {
             }
         }
         let chars = Self::chars(DEV_ADDR, ep, maxp as u16, false);
-        let rem = self.run(qh, chars, 0, segs - 1, true, true, BULK_TIMEOUT_US)?;
+        // The CPU's cache and the controller's DMA (cache.rs; no-ops with
+        // the cache off or for the non-cacheable schedule MiB).
+        if in_ep {
+            crate::cache::clean_inv(buf, len);
+        } else {
+            crate::cache::clean(buf, len);
+        }
+        let r = self.run(qh, chars, 0, segs - 1, true, true, BULK_TIMEOUT_US);
+        if in_ep {
+            crate::cache::inv(buf, len);
+        }
+        let rem = r?;
         Ok(len - rem as usize)
     }
 

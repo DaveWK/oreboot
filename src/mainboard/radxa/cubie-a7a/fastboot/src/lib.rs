@@ -36,6 +36,7 @@ pub mod emmc;
 pub mod emmcarm;
 pub mod fetch;
 pub mod gpt;
+pub mod mmu;
 pub mod msc;
 pub mod nor;
 pub mod plan;
@@ -43,6 +44,7 @@ pub mod proto;
 pub mod sd;
 pub mod usb;
 pub mod usbhost;
+pub mod xfer;
 
 /// CRC-32 (IEEE 802.3, as zlib's `crc32`), bitwise and table-free (bt0's
 /// SRAM is tight): the NOR arm token, over at most one partition.

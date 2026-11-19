@@ -519,6 +519,8 @@ impl Device for A7a<'_> {
         // The arm first: no SPI controller access unless this exact
         // flash is armed (and the arm is used up whatever happens next).
         let p = self.guard.take(part, Some(image), now_ms())?;
+        // The NOR write code is in the DRAM extension (build.rs).
+        crate::extcheck::ready()?;
         let f = self.nor()?;
         nor::program_partition(
             f,
@@ -548,6 +550,7 @@ impl Device for A7a<'_> {
             return self.emmc_erase(part, info);
         }
         let p = self.guard.take(part, None, now_ms())?;
+        crate::extcheck::ready()?;
         let f = self.nor()?;
         nor::erase_partition(f, p, scratch(), info).map_err(|e| {
             println!("[fastboot] erase {part}: {e:?}");

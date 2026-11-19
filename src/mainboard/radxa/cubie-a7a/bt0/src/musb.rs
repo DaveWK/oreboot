@@ -31,6 +31,7 @@ use core::ptr::addr_of_mut;
 
 use cubie_a7a_fastboot::proto::{Transport, PACKET};
 use cubie_a7a_fastboot::usb::{self, Descriptors, Request, Setup, EP0_MAX};
+use cubie_a7a_fastboot::xfer;
 use util::mmio::{read16, read32, read8, write16, write32, write8};
 
 use crate::{recovery, soc};
@@ -138,9 +139,12 @@ const RES_DCAP_USB: u32 = 1 << 3;
 
 /// FIFO RAM: EP0 owns 0..64; EP1 TX then RX, 512 bytes each.
 const EP1_TX_FIFO: u16 = 64;
-const EP1_RX_FIFO: u16 = 64 + 512;
+const EP1_RX_FIFO: u16 = 64 + 2 * 512;
 /// FIFOSZ code: 2^(code + 3) bytes.
 const FIFOSZ_512: u8 = 6;
+/// FIFOSZ double packet buffering: two 512-byte buffers per direction, so
+/// the host fills (or drains) one while the CPU copies the other.
+const FIFOSZ_DPB: u8 = 0x10;
 
 /// How long the host sees nothing on the bus before we connect again.
 const DISCONNECT_MS: u64 = 200;
@@ -335,17 +339,20 @@ fn flush_ep0() {
 /// flushed.
 fn configure_ep1(maxp: u16) {
     write8(INDEX, usb::EP1);
-    write8(TXFIFOSZ, FIFOSZ_512);
+    write8(TXFIFOSZ, FIFOSZ_512 | FIFOSZ_DPB);
     write16(TXFIFOADD, EP1_TX_FIFO / 8);
-    write8(RXFIFOSZ, FIFOSZ_512);
+    write8(RXFIFOSZ, FIFOSZ_512 | FIFOSZ_DPB);
     write16(RXFIFOADD, EP1_RX_FIFO / 8);
     write16(TXMAXP, maxp);
     write16(RXMAXP, maxp);
-    let mut tx = TXCSR_MODE | TXCSR_CLRDATATOG;
-    if read16(TXCSR) & TXCSR_FIFONOTEMPTY != 0 {
-        tx |= TXCSR_FLUSHFIFO;
+    // Double buffered: up to two packets to flush.
+    for _ in 0..2 {
+        let mut tx = TXCSR_MODE | TXCSR_CLRDATATOG;
+        if read16(TXCSR) & TXCSR_FIFONOTEMPTY != 0 {
+            tx |= TXCSR_FLUSHFIFO;
+        }
+        write16(TXCSR, tx);
     }
-    write16(TXCSR, tx);
     write16(RXCSR, RXCSR_CLRDATATOG | RXCSR_FLUSHFIFO);
     write16(RXCSR, RXCSR_CLRDATATOG | RXCSR_FLUSHFIFO);
 }
@@ -596,7 +603,9 @@ impl<'a> Musb<'a> {
                 return Err(Error::Reset);
             }
             write8(INDEX, usb::EP1);
-            if read16(TXCSR) & (TXCSR_TXPKTRDY | TXCSR_FIFONOTEMPTY) == 0 {
+            // Double buffered: a buffer is free once TXPKTRDY clears (the
+            // other may still hold a packet for the host).
+            if read16(TXCSR) & TXCSR_TXPKTRDY == 0 {
                 break;
             }
             if now() - t0 > PACKET_TIMEOUT_US {
@@ -629,19 +638,12 @@ impl Transport for Musb<'_> {
         self.read_packet(out, None)
     }
 
+    /// A download: cubie_a7a_fastboot::xfer over EP1 OUT (double
+    /// buffered; the full poll only every xfer::SERVICE_EVERY packets).
     fn recv_exact(&mut self, out: &mut [u8]) -> Result<(), Error> {
-        let mut got = 0;
-        while got < out.len() {
-            let want = (out.len() - got).min(self.maxp());
-            // A packet larger than what is left is an overrun.
-            let n = self.read_packet(&mut out[got..got + want], Some(PACKET_TIMEOUT_US))?;
-            got += n;
-            if n < want && got < out.len() {
-                // A short packet ends the transfer early.
-                return Err(Error::Timeout("short download"));
-            }
-        }
-        Ok(())
+        let maxp = self.maxp();
+        write8(INDEX, usb::EP1);
+        xfer::recv_exact(&mut Bulk(self, 0), out, maxp, PACKET_TIMEOUT_US).map_err(stop_error)
     }
 
     /// A reply line (at most 64 bytes), as one short packet. At full
@@ -658,10 +660,8 @@ impl Transport for Musb<'_> {
     /// packet (the host reads exactly the announced size).
     fn send_data(&mut self, data: &[u8]) -> Result<(), Error> {
         let maxp = self.maxp();
-        for chunk in data.chunks(maxp) {
-            self.write_packet(chunk)?;
-        }
-        Ok(())
+        write8(INDEX, usb::EP1);
+        xfer::send(&mut Bulk(self, 0), data, maxp, PACKET_TIMEOUT_US).map_err(stop_error)
     }
 
     fn disconnect(&mut self) -> Result<(), Error> {
@@ -715,6 +715,9 @@ pub fn restore_rom() {
     for (i, e) in rom.ep.iter().enumerate() {
         write8(INDEX, i as u8);
         if i > 0 {
+            if read16(TXCSR) & TXCSR_FIFONOTEMPTY != 0 {
+                write16(TXCSR, TXCSR_FLUSHFIFO);
+            }
             let flush = if read16(TXCSR) & TXCSR_FIFONOTEMPTY != 0 {
                 TXCSR_FLUSHFIFO
             } else {
@@ -740,4 +743,72 @@ pub fn restore_rom() {
     write16(INTRRXE, rom.intrrxe);
     write8(INDEX, rom.index);
     write8(POWER, rom.power & !(POWER_RESET | POWER_RESUME));
+}
+
+/// EP1 for the data phases, INDEX kept at 1 between packets (`service`
+/// puts it back after the full poll); the second field is the RXCSR value
+/// `ready` read, for `take`.
+struct Bulk<'m, 'a>(&'m mut Musb<'a>, u16);
+
+fn stop_error(s: xfer::Stop<Error>) -> Error {
+    match s {
+        xfer::Stop::Service(e) => e,
+        xfer::Stop::Timeout => Error::Timeout("bulk transfer"),
+        xfer::Stop::Overrun => Error::Overrun,
+        xfer::Stop::Short => Error::Timeout("short download"),
+    }
+}
+
+impl xfer::OutEp for Bulk<'_, '_> {
+    type Error = Error;
+    fn ready(&mut self) -> Option<usize> {
+        let csr = read16(RXCSR);
+        if csr & RXCSR_RXPKTRDY == 0 {
+            return None;
+        }
+        self.1 = csr;
+        Some(read16(RXCOUNT) as usize)
+    }
+    fn take(&mut self, out: &mut [u8]) {
+        read_fifo(usb::EP1 as usize, out);
+        write16(RXCSR, (self.1 | RXCSR_WZC) & !RXCSR_RXPKTRDY);
+    }
+    fn discard(&mut self) {
+        let n = read16(RXCOUNT) as usize;
+        for _ in 0..n {
+            let _ = util::mmio::read8(fifo(usb::EP1 as usize));
+        }
+        write16(RXCSR, (self.1 | RXCSR_WZC) & !RXCSR_RXPKTRDY);
+    }
+    fn service(&mut self) -> Result<(), Error> {
+        let r = self.0.poll();
+        write8(INDEX, usb::EP1);
+        r?;
+        if self.0.configured {
+            Ok(())
+        } else {
+            Err(Error::Reset)
+        }
+    }
+    fn now_us(&mut self) -> u64 {
+        now()
+    }
+}
+
+impl xfer::InEp for Bulk<'_, '_> {
+    type Error = Error;
+    fn free(&mut self) -> bool {
+        read16(TXCSR) & TXCSR_TXPKTRDY == 0
+    }
+    fn put(&mut self, data: &[u8]) {
+        write_fifo(usb::EP1 as usize, data);
+        let csr = read16(TXCSR) & !(TXCSR_FLUSHFIFO | TXCSR_CLRDATATOG);
+        write16(TXCSR, csr | TXCSR_WZC | TXCSR_TXPKTRDY);
+    }
+    fn service(&mut self) -> Result<(), Error> {
+        <Self as xfer::OutEp>::service(self)
+    }
+    fn now_us(&mut self) -> u64 {
+        now()
+    }
 }

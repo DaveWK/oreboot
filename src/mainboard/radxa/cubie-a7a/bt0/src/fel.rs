@@ -306,6 +306,9 @@ pub fn halt_to_fel() -> ! {
 /// What every return to FEL puts back: the ROM's USB0 set-up if fastboot
 /// took it over, the ROM's AHB clock; the watchdog stops.
 fn give_back_to_rom() {
+    // SRAM and DRAM as written, MMU off, before the ROM runs again.
+    #[cfg(feature = "fastboot")]
+    crate::cache::off();
     #[cfg(feature = "fastboot")]
     crate::musb::restore_rom();
     recovery::stop_watchdog();
@@ -426,6 +429,9 @@ extern "C" fn fel_boot() {
 /// The hand-over to main once the images are in place and checked (entry
 /// 2, and fastboot's `boot`).
 pub fn hand_over(b: &Bringup, handoff: cubie_a7a_common::Handoff, main_entry: u32) -> ! {
+    // Images and handoff in DRAM as written, MMU off, as main expects.
+    #[cfg(feature = "fastboot")]
+    crate::cache::off();
     // The ROM's interrupts off, or the warm reset never happens (rmr_switch).
     quiesce_rom_interrupts();
     // As the SD boot from here: bt0's bus clock, the attempt marker and the
@@ -469,6 +475,9 @@ extern "C" fn fel_fastboot() {
             println!("[bt0] FEL: {e}; usb0 and sd dumps off");
         }
     }
+    // MMU and D-cache on while fastboot serves (cache.rs); every way out
+    // turns them off first.
+    crate::cache::on_fastboot();
     let back = crate::fastboot::run(&b);
     Uart::attach(UART0_BASE).drain();
     give_back_to_rom();

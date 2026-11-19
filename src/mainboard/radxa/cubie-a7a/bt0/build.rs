@@ -21,7 +21,10 @@ const LINKERSCRIPT_FILENAME: &str = "link-cubie-a7a-bt0.ld";
 const MEMORY_SD: &str = "SRAM : ORIGIN = 0x00047000, LENGTH = 0x49000";
 const MEMORY_FEL: &str = "SRAM : ORIGIN = 0x00090000, LENGTH = 0x4f000";
 
-// Feature `fastboot` (src/ext.rs): the block-device dump code (bt0's ext,
+// Feature `fastboot` (src/ext.rs): the NOR erase/program code of
+// `fastboot-nor-write` (spinor::write and the nor writer's SpiNor
+// instances; flash/erase check the extension first), and the block-device
+// dump code (bt0's ext,
 // ehci and smhc modules (smhc only serves `fetch:sd` in FEL builds), and the msc, gpt, usbhost and sd modules of
 // cubie-a7a-fastboot, matched by their v0-mangled paths) is linked into
 // `.dram` at 0x59000000, which the host loads after DRAM is up. These rules
@@ -41,6 +44,8 @@ const DRAM_EXT: &str = "
         *(.text.*18cubie_a7a_fastboot2sd*)
         *(.text.*18cubie_a7a_fastboot4emmc*)
         *(.text.*18cubie_a7a_fastboot7emmcarm*)
+        *(.text.*21oreboot_cubie_a7a_bt06spinor5write*)
+        *(.text.*18cubie_a7a_fastboot3nor*6spinor6SpiNor*)
         . = ALIGN(4);
         _dram_end = .;
     } > DRAMX
@@ -54,6 +59,8 @@ const DRAM_EXT: &str = "
         *(.ARM.exidx.text.*18cubie_a7a_fastboot2sd*)
         *(.ARM.exidx.text.*18cubie_a7a_fastboot4emmc*)
         *(.ARM.exidx.text.*18cubie_a7a_fastboot7emmcarm*)
+        *(.ARM.exidx.text.*21oreboot_cubie_a7a_bt06spinor5write*)
+        *(.ARM.exidx.text.*18cubie_a7a_fastboot3nor*6spinor6SpiNor*)
     }
 ";
 

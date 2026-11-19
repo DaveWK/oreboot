@@ -48,6 +48,8 @@ use cubie_a7a_common::{
 use util::mmio::{read32, write32};
 
 mod axp;
+#[cfg(feature = "fastboot")]
+mod cache;
 mod ccu;
 mod dram;
 mod dvfs;

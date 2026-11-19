@@ -327,14 +327,20 @@ const PROTOCOL_VARS: [&str; 4] = [
     "is-userspace",
 ];
 
+/// `fetch:download`: the last download, sent back from the buffer as it
+/// is (a lossless round trip for throughput tests; `getvar
+/// partition-size:download` is its length).
+pub const DOWNLOAD_TARGET: &str = "download";
+
 /// The largest `fetch` chunk: one read into the download buffer, then one
 /// data phase. Small enough that the slowest medium (the SPI NOR at
 /// ~0.7 MB/s) answers within a couple of seconds; the stock tool loops
 /// over the partition in chunks of this size.
 pub const MAX_FETCH: usize = 0x10_0000;
 
-fn protocol_var(name: &str, max: usize, out: &mut Line) -> bool {
+fn protocol_var(name: &str, max: usize, staged: usize, out: &mut Line) -> bool {
     match name {
+        "partition-size:download" if staged > 0 => write!(out, "0x{staged:x}").is_ok(),
         "version" => write!(out, "{PROTOCOL_VERSION}").is_ok(),
         "max-download-size" => write!(out, "0x{max:08x}").is_ok(),
         "max-fetch-size" => write!(out, "0x{:08x}", MAX_FETCH.min(max)).is_ok(),
@@ -346,19 +352,19 @@ fn protocol_var(name: &str, max: usize, out: &mut Line) -> bool {
     }
 }
 
-fn getvar<T: Transport, D: Device>(t: &mut T, d: &mut D, max: usize, name: &str) {
+fn getvar<T: Transport, D: Device>(t: &mut T, d: &mut D, max: usize, staged: usize, name: &str) {
     if name == "all" {
         for n in PROTOCOL_VARS.iter().chain(d.getvar_names()) {
             let mut l = Line::new("INFO");
             let _ = write!(l, "{n}:");
-            if protocol_var(n, max, &mut l) || d.getvar(n, &mut l) {
+            if protocol_var(n, max, staged, &mut l) || d.getvar(n, &mut l) {
                 let _ = t.send(l.as_bytes());
             }
         }
         return reply(t, "OKAY", format_args!(""));
     }
     let mut l = Line::new("OKAY");
-    if protocol_var(name, max, &mut l) || d.getvar(name, &mut l) {
+    if protocol_var(name, max, staged, &mut l) || d.getvar(name, &mut l) {
         t.log(">", l.as_bytes());
         let _ = t.send(l.as_bytes());
     } else {
@@ -400,7 +406,7 @@ pub fn serve<T: Transport, D: Device>(
         };
         d.command(&cmd);
         match cmd {
-            Command::Getvar(name) => getvar(t, d, max, name),
+            Command::Getvar(name) => getvar(t, d, max, downloaded, name),
             Command::Download(size) => {
                 downloaded = 0;
                 match size {
@@ -468,8 +474,12 @@ pub fn serve<T: Transport, D: Device>(
                 }
             }
             Command::Fetch { part, offset, size } => {
-                // The read lands in the download buffer.
-                downloaded = 0;
+                let staged = downloaded;
+                // The read lands in the download buffer (except the
+                // download itself, sent back as it is).
+                if part != DOWNLOAD_TARGET {
+                    downloaded = 0;
+                }
                 let (Some(offset), Some(size)) = (
                     offset.unwrap_or(Some(0)),
                     size.map_or(Some(None), |s| s.map(Some)),
@@ -486,7 +496,13 @@ pub fn serve<T: Transport, D: Device>(
                     );
                     continue;
                 }
-                match d.fetch(part, offset, size, buf, &mut Sink(t)) {
+                let r = if part == DOWNLOAD_TARGET {
+                    crate::fetch::resolve(staged as u64, None, offset, size, room as u64)
+                        .map(|(s, l)| s as usize..(s + l) as usize)
+                } else {
+                    d.fetch(part, offset, size, buf, &mut Sink(t))
+                };
+                match r {
                     Ok(r) if r.is_empty() || r.len() > room || r.end > buf.len() => reply(
                         t,
                         "FAIL",
@@ -1050,6 +1066,43 @@ mod tests {
         // The model's continue boots "nothing" (0) when no image is staged.
         assert_eq!(run(&mut h, &mut b), Ok(Exit::Boot(0)));
         assert_eq!(b.booted_len, None);
+    }
+
+    #[test]
+    fn download_round_trip() {
+        let mut h = Host::new(&[
+            "download:00000c00",
+            "getvar:partition-size:download",
+            "fetch:download:0x00000000:0x00000800",
+            "fetch:download:0x00000800:0x00000400",
+            "fetch:download:0x00000800:0x00000401",
+            "boot",
+        ]);
+        let mut b = Board::default();
+        // The staged image is still there for boot after the fetches.
+        assert_eq!(run(&mut h, &mut b), Ok(Exit::Boot(0xc00)));
+        assert_eq!(h.replies[2], "OKAY0xc00");
+        assert_eq!(
+            &h.replies[3..8],
+            [
+                "DATA00000800",
+                "OKAY",
+                "DATA00000400",
+                "OKAY",
+                "FAILfetch past the end"
+            ]
+        );
+        assert_eq!(h.uploaded.len(), 0xc00);
+        assert!(h.uploaded.iter().enumerate().all(|(i, &v)| v == i as u8));
+        // Nothing downloaded: no such target.
+        let mut h = Host::new(&[
+            "fetch:download:0x0:0x10",
+            "getvar:partition-size:download",
+            "reboot-bootloader",
+        ]);
+        assert_eq!(run(&mut h, &mut Board::default()), Ok(Exit::Bootloader));
+        assert_eq!(h.replies[0], "FAILfetch offset past the end");
+        assert_eq!(h.replies[1], "FAILunknown variable");
     }
 
     #[test]
