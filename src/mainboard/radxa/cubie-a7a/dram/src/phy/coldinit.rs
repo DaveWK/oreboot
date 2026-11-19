@@ -16,10 +16,10 @@
 //!
 //! This covers DevInit at the boot pstate: part 1 after the DRAM reset is
 //! released (CS initialization, a two-row command with rising code 0x70 and
-//! operand 6, multi-purpose command class, purpose not verified, and MRW of
+//! operand 6: MPC with OP 0x86, ZQCAL LATCH by `jedec_lpddr::lp5::cmd::mpc`, and MRW of
 //! MR16/MR1/MR28, then MR16/MR41, per channel and rank), and the command bus
 //! training blocks ([`CBT_BLOCKS`]: per channel, rank and CBT phase, the
-//! entry with WCK2CK sync and I/O mode registers, CBT pattern points and the
+//! entry with REFRESH all banks and I/O mode registers, CBT pattern points and the
 //! exit). The second and later blocks are checked against the oracle's
 //! decoded record in `tests/fixtures/devinit-cbt-blocks-pstate1.txt`. Mode
 //! register values are inputs ([`Mrs`], [`Mrs2`]); the CA search on the
@@ -733,7 +733,9 @@ pub fn block_entry(b: &CbtBlock, m: &Mrs2, emit: &mut impl FnMut(Step)) {
             ls_off(mask, emit);
             ls_on(mask, emit);
         }
-        // MR18, WCK2CK sync (CAS 0x38/0x40), then the I/O mode registers.
+        // MR18, REFRESH all banks (CA 0x38/0x40: REF with AB by the public
+        // LPDDR5 command table, LiteDRAM 74522f7; earlier read as a CAS /
+        // WCK2CK sync), then the I/O mode registers.
         let mut r = Rows::new();
         r.push(&HEAD);
         r.push(&mrw(cs, 18, m.mr18));
