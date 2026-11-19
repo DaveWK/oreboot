@@ -1276,6 +1276,29 @@ pub(crate) const fn handover_mrl(trained: u16, mrl_add: u16) -> Result<u16, Erro
     }
 }
 
+/// Check whether an `A7A_HO_CSRS` lab override explicitly writes valid
+/// (1..=`MRL_CSR_MAX`) `DFIMRL` values to all four DBYTEs (`0x10000..=0x13000`).
+fn ho_csrs_overrides_all_dfimrl(spec: &str) -> bool {
+    let mut seen = 0u8;
+    for pair in spec.split(',') {
+        let mut it = pair.split('=');
+        if let (Some(a), Some(v)) = (it.next(), it.next()) {
+            if let (Ok(a), Ok(v)) = (u32::from_str_radix(a, 16), u16::from_str_radix(v, 16)) {
+                if (1..=crate::rdtrain::MRL_CSR_MAX).contains(&v) {
+                    match a {
+                        0x10000 => seen |= 1 << 0,
+                        0x11000 => seen |= 1 << 1,
+                        0x12000 => seen |= 1 << 2,
+                        0x13000 => seen |= 1 << 3,
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+    seen == 0x0f
+}
+
 /// [`mission_handover`]; with `relock`, first the training firmware's end
 /// state (PLL powered down, ClockingCtrl 1, TxRdPtrInit 1) and then our
 /// mission bring-up (`phy::devinit::mission_bringup` level 3) before the
@@ -1285,6 +1308,25 @@ pub fn mission_handover_relock<H: Hw>(
     p: &Para,
     pstate: u32,
     relock: bool,
+) -> Result<u32, Error> {
+    mission_handover_relock_with(
+        hw,
+        p,
+        pstate,
+        relock,
+        HO_MRL_ADD(),
+        crate::knobs::env("A7A_HO_CSRS", crate::knob!("A7A_HO_CSRS")),
+    )
+}
+
+#[inline(always)]
+fn mission_handover_relock_with<H: Hw>(
+    hw: &mut H,
+    p: &Para,
+    pstate: u32,
+    relock: bool,
+    mrl_add: u16,
+    ho_csrs: Option<&str>,
 ) -> Result<u32, Error> {
     use crate::ctrl::{ddrc, freq, sw_done, DDRC_B84, DDRC_B88, SWCTL, SWSTAT};
     use crate::hw::wait;
@@ -1307,25 +1349,12 @@ pub fn mission_handover_relock<H: Hw>(
             }
         }
     }
-    if let Some(spec) = crate::knobs::env("A7A_HO_CSRS", crate::knob!("A7A_HO_CSRS")) {
-        // FEL lab A7A_HO_CSRS="csr=hex,...": PHY CSR writes before the
-        // mission CSRs and the DFI init (measurement: transplant of a
-        // working state's values while CSR writes still take effect).
-        for pair in spec.split(',') {
-            let mut it = pair.split('=');
-            if let (Some(a), Some(v)) = (it.next(), it.next()) {
-                if let (Ok(a), Ok(v)) = (u32::from_str_radix(a, 16), u16::from_str_radix(v, 16)) {
-                    hw.write16(csr(a), v);
-                }
-            }
-        }
-    }
-    let mrl_add = HO_MRL_ADD();
-    if mrl_add != 0 {
-        // The mission read latency: the read training's applied DFIMRL plus
-        // `mrl_add` on every DBYTE, applied by the held update below. Not
-        // the CSR as found: launches after the training (the select's 8)
-        // overwrite it. Fail closed if read training did not apply an MRL.
+    // Always validate APPLIED_MRL and write the mission read latency
+    // (`trained + mrl_add`, including `mrl_add = 0` or unset) to every DBYTE
+    // so the post-training select's 8 cannot remain in mission mode. An
+    // explicit full-DBYTE `A7A_HO_CSRS` lab override stays separate and runs
+    // after this write so it is never clobbered.
+    if !ho_csrs.is_some_and(ho_csrs_overrides_all_dfimrl) {
         let trained = crate::rdtrain::APPLIED_MRL.load(core::sync::atomic::Ordering::Relaxed);
         let mission = match handover_mrl(trained, mrl_add) {
             Ok(v) => v,
@@ -1338,14 +1367,26 @@ pub fn mission_handover_relock<H: Hw>(
             hw.write16(csr(0x10000 + 0x1000 * db), mission);
         }
     }
-    if mrl_add != 0 || crate::knobs::env("A7A_HO_FIU", crate::knob!("A7A_HO_FIU")).is_some() {
-        // FEL lab: ForceInternalUpdate with the DFI still offline, held
-        // well over 32 DFICLKs (TRM), so every delay CSR is applied.
-        hw.write16(csr(0x200a3), 1);
-        hw.udelay(5);
-        hw.write16(csr(0x200a3), 0);
-        hw.udelay(5);
+    if let Some(spec) = ho_csrs {
+        // FEL lab A7A_HO_CSRS="csr=hex,...": explicit PHY CSR writes before
+        // the latch pulse and DFI init (includes absolute DFIMRL overrides
+        // separate from `A7A_HO_MRL_ADD`).
+        for pair in spec.split(',') {
+            let mut it = pair.split('=');
+            if let (Some(a), Some(v)) = (it.next(), it.next()) {
+                if let (Ok(a), Ok(v)) = (u32::from_str_radix(a, 16), u16::from_str_radix(v, 16)) {
+                    hw.write16(csr(a), v);
+                }
+            }
+        }
     }
+    // Always pulse ForceInternalUpdate with the DFI still offline (held well
+    // over 32 DFICLKs, TRM), so every DBYTE's mission DFIMRL and any delay CSR
+    // write is latched regardless of `A7A_HO_MRL_ADD` or `A7A_HO_FIU`.
+    hw.write16(csr(0x200a3), 1);
+    hw.udelay(5);
+    hw.write16(csr(0x200a3), 0);
+    hw.udelay(5);
     if crate::obs::OBS_ARM() & crate::obs::ARM_CHECK != 0 {
         // FEL lab A7A_OBS_ARM bit 0: the PHY's RX FIFO pointer check,
         // armed (masked off the interrupt pin) before the DFI init, so the
@@ -1508,12 +1549,14 @@ pub fn HO_CDD() -> Option<u32> {
     }
 }
 
-/// `A7A_HO_MRL_ADD=<hex>`: every DBYTE's DFIMRL (0x1n000) set to the read
-/// training's applied latency plus this by the lean hand-over, with the
-/// held ForceInternalUpdate. Measured:
-/// our read training's DFIMRL 4 reads isolated bursts but not the CPU's
-/// line fills (two gapless BL16); 4 + 1 passes every fetch probe, while
-/// training at 5 does not (the gate follows). Unset: 0.
+/// `A7A_HO_MRL_ADD=<hex>`: offset (0..=3, unset: 0) added to the read
+/// training's applied latency (`rdtrain::APPLIED_MRL`) when the lean
+/// hand-over writes every DBYTE's DFIMRL (`0x1n000`) and pulses
+/// `ForceInternalUpdate` (`0x200a3`). Validation, the per-DBYTE write, and
+/// the latch pulse run unconditionally even when `A7A_HO_MRL_ADD` is 0 or
+/// unset. Absolute lab overrides stay explicit and separate: `A7A_RD_MRL`
+/// (training-time override, `knobs.rs`) and `A7A_HO_CSRS` (hand-over CSR
+/// override, e.g. `10000=m,11000=m,12000=m,13000=m`).
 #[allow(non_snake_case)]
 pub fn HO_MRL_ADD() -> u16 {
     match crate::knobs::env("A7A_HO_MRL_ADD", crate::knob!("A7A_HO_MRL_ADD")) {
@@ -1975,5 +2018,335 @@ mod tests {
         assert!(!clean.handover_result(false).mission_ok());
         assert!(!clean.read_training_result(false).mission_ok());
         assert!(!clean.mr16_after_result(Some(failure.unwrap())).mission_ok());
+    }
+
+    struct HandoverHw {
+        swctl: [u32; 2],
+        writes16: [(usize, u16); 256],
+        writes16_len: usize,
+    }
+
+    impl HandoverHw {
+        fn new() -> Self {
+            Self {
+                swctl: [0; 2],
+                writes16: [(0, 0); 256],
+                writes16_len: 0,
+            }
+        }
+
+        fn recorded(&self) -> &[(usize, u16)] {
+            &self.writes16[..self.writes16_len]
+        }
+
+        fn dfimrl_writes(&self) -> [(usize, Option<u16>); 4] {
+            core::array::from_fn(|db| {
+                let addr = crate::phy::csr(0x10000 + 0x1000 * db as u32);
+                let last = self
+                    .recorded()
+                    .iter()
+                    .rev()
+                    .find(|(a, _)| *a == addr)
+                    .map(|(_, v)| *v);
+                (db, last)
+            })
+        }
+
+        fn fiu_pulsed_after_last_dfimrl(&self) -> bool {
+            let fiu = crate::phy::csr(0x200a3);
+            let recs = self.recorded();
+            let last_dfimrl = recs.iter().rposition(|(a, _)| {
+                (0..4u32).any(|db| *a == crate::phy::csr(0x10000 + 0x1000 * db))
+            });
+            let Some(dfimrl_idx) = last_dfimrl else {
+                return false;
+            };
+            let after = &recs[dfimrl_idx + 1..];
+            let hi = after.iter().position(|&(a, v)| a == fiu && v == 1);
+            let Some(hi_idx) = hi else {
+                return false;
+            };
+            after[hi_idx + 1..].iter().any(|&(a, v)| a == fiu && v == 0)
+        }
+    }
+
+    impl crate::hw::RegIo for HandoverHw {
+        fn read32(&mut self, addr: usize) -> u32 {
+            use crate::ctrl::{ddrc, DDRC_B88, SWSTAT};
+            use dwc_ddrctl::regs::{DFISTAT, OPERATING_MODE_NORMAL, STAT};
+            if addr == ddrc(0, SWSTAT) {
+                self.swctl[0] & 1
+            } else if addr == ddrc(1, SWSTAT) {
+                self.swctl[1] & 1
+            } else if addr == ddrc(0, DDRC_B88) {
+                3 << 25
+            } else if addr == ddrc(0, DFISTAT) || addr == ddrc(1, DFISTAT) {
+                1
+            } else if addr == ddrc(0, STAT) || addr == ddrc(1, STAT) {
+                OPERATING_MODE_NORMAL
+            } else {
+                0
+            }
+        }
+        fn write32(&mut self, addr: usize, val: u32) {
+            use crate::ctrl::{ddrc, SWCTL};
+            if addr == ddrc(0, SWCTL) {
+                self.swctl[0] = val;
+            } else if addr == ddrc(1, SWCTL) {
+                self.swctl[1] = val;
+            }
+        }
+        fn read16(&mut self, _: usize) -> u16 {
+            0
+        }
+        fn write16(&mut self, addr: usize, val: u16) {
+            assert!(self.writes16_len < self.writes16.len(), "write16 log full");
+            self.writes16[self.writes16_len] = (addr, val);
+            self.writes16_len += 1;
+        }
+        fn udelay(&mut self, _: u32) {}
+        fn now_us(&mut self) -> u64 {
+            0
+        }
+        fn log(&mut self, _: core::fmt::Arguments) {}
+    }
+
+    impl crate::hw::Hw for HandoverHw {
+        fn set_voltage(&mut self, _: crate::hw::Rail, _: u32) -> bool {
+            true
+        }
+    }
+
+    static HANDOVER_LOCK: core::sync::atomic::AtomicBool =
+        core::sync::atomic::AtomicBool::new(false);
+
+    struct HandoverGuard;
+    impl HandoverGuard {
+        fn acquire() -> Self {
+            use core::sync::atomic::Ordering;
+            while HANDOVER_LOCK
+                .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_err()
+            {
+                core::hint::spin_loop();
+            }
+            Self
+        }
+    }
+    impl Drop for HandoverGuard {
+        fn drop(&mut self) {
+            #[cfg(feature = "lab-knobs")]
+            crate::knobs::set(crate::knobs::BUILD);
+            crate::rdtrain::APPLIED_MRL.store(0, core::sync::atomic::Ordering::Relaxed);
+            HANDOVER_LOCK.store(false, core::sync::atomic::Ordering::Release);
+        }
+    }
+
+    fn cxmt_4g() -> crate::para::Para {
+        crate::para::Para::from_sysconfig(&crate::sets::PARAM_SETS[crate::sets::CXMT_4G].para)
+    }
+
+    #[test]
+    fn handover_mrl_unset_writes_dfimrl_and_pulses_latch() {
+        let _g = HandoverGuard::acquire();
+        crate::rdtrain::APPLIED_MRL.store(4, core::sync::atomic::Ordering::Relaxed);
+        let p = cxmt_4g();
+        let mut hw = HandoverHw::new();
+        let r = super::mission_handover_relock(&mut hw, &p, 0, false);
+        assert!(r.is_ok(), "handover failed: {r:?}");
+        assert_eq!(
+            hw.dfimrl_writes(),
+            [(0, Some(4)), (1, Some(4)), (2, Some(4)), (3, Some(4))]
+        );
+        assert!(
+            hw.fiu_pulsed_after_last_dfimrl(),
+            "ForceInternalUpdate not pulsed after DFIMRL writes"
+        );
+    }
+
+    #[test]
+    fn handover_mrl_unset_fails_closed_on_missing_applied_mrl() {
+        let _g = HandoverGuard::acquire();
+        let p = cxmt_4g();
+        crate::rdtrain::APPLIED_MRL.store(0, core::sync::atomic::Ordering::Relaxed);
+        let mut hw = HandoverHw::new();
+        let r = super::mission_handover_relock(&mut hw, &p, 0, false);
+        assert!(
+            r.is_err(),
+            "expected Err for missing APPLIED_MRL, got {r:?}"
+        );
+        assert_eq!(
+            hw.dfimrl_writes(),
+            [(0, None), (1, None), (2, None), (3, None)]
+        );
+        assert!(!hw.fiu_pulsed_after_last_dfimrl());
+    }
+
+    #[test]
+    fn handover_mrl_unset_fails_closed_on_invalid_applied_mrl() {
+        let _g = HandoverGuard::acquire();
+        let p = cxmt_4g();
+        for bad in [crate::rdtrain::MRL_CSR_MAX + 1, crate::rdtrain::NONE] {
+            crate::rdtrain::APPLIED_MRL.store(bad, core::sync::atomic::Ordering::Relaxed);
+            let mut hw = HandoverHw::new();
+            let r = super::mission_handover_relock(&mut hw, &p, 0, false);
+            assert!(
+                r.is_err(),
+                "expected Err for invalid APPLIED_MRL={bad:#x}, got {r:?}"
+            );
+            assert_eq!(
+                hw.dfimrl_writes(),
+                [(0, None), (1, None), (2, None), (3, None)]
+            );
+            assert!(!hw.fiu_pulsed_after_last_dfimrl());
+        }
+    }
+
+    #[test]
+    fn handover_mrl_add_zero_and_one_and_ho_csrs_override() {
+        let _g = HandoverGuard::acquire();
+        let p = cxmt_4g();
+
+        // add = 0: validates, writes trained + 0, pulses latch.
+        crate::rdtrain::APPLIED_MRL.store(4, core::sync::atomic::Ordering::Relaxed);
+        let mut hw = HandoverHw::new();
+        assert!(super::mission_handover_relock_with(&mut hw, &p, 0, false, 0, None).is_ok());
+        assert_eq!(
+            hw.dfimrl_writes(),
+            [(0, Some(4)), (1, Some(4)), (2, Some(4)), (3, Some(4))]
+        );
+        assert!(hw.fiu_pulsed_after_last_dfimrl());
+
+        // add = 1: validates, writes trained + 1, pulses latch.
+        let mut hw = HandoverHw::new();
+        assert!(super::mission_handover_relock_with(&mut hw, &p, 0, false, 1, None).is_ok());
+        assert_eq!(
+            hw.dfimrl_writes(),
+            [(0, Some(5)), (1, Some(5)), (2, Some(5)), (3, Some(5))]
+        );
+        assert!(hw.fiu_pulsed_after_last_dfimrl());
+
+        // add = 1 with overflow (0x1f + 1 > 5-bit CSR): fails closed.
+        crate::rdtrain::APPLIED_MRL.store(
+            crate::rdtrain::MRL_CSR_MAX,
+            core::sync::atomic::Ordering::Relaxed,
+        );
+        let mut hw = HandoverHw::new();
+        assert!(super::mission_handover_relock_with(&mut hw, &p, 0, false, 1, None).is_err());
+        assert_eq!(
+            hw.dfimrl_writes(),
+            [(0, None), (1, None), (2, None), (3, None)]
+        );
+
+        // Explicit full-DBYTE A7A_HO_CSRS override stays separate from add
+        // and works even when APPLIED_MRL is 0; partial override still fails
+        // closed without APPLIED_MRL.
+        crate::rdtrain::APPLIED_MRL.store(0, core::sync::atomic::Ordering::Relaxed);
+        let mut hw = HandoverHw::new();
+        assert!(super::mission_handover_relock_with(
+            &mut hw,
+            &p,
+            0,
+            false,
+            0,
+            Some("10000=5,11000=5,12000=5,13000=5"),
+        )
+        .is_ok());
+        assert_eq!(
+            hw.dfimrl_writes(),
+            [(0, Some(5)), (1, Some(5)), (2, Some(5)), (3, Some(5))]
+        );
+        assert!(hw.fiu_pulsed_after_last_dfimrl());
+
+        let mut hw = HandoverHw::new();
+        assert!(super::mission_handover_relock_with(
+            &mut hw,
+            &p,
+            0,
+            false,
+            0,
+            Some("10000=5,11000=5"),
+        )
+        .is_err());
+        assert_eq!(
+            hw.dfimrl_writes(),
+            [(0, None), (1, None), (2, None), (3, None)]
+        );
+    }
+
+    #[cfg(feature = "lab-knobs")]
+    #[test]
+    fn handover_mrl_add_zero_writes_and_latches() {
+        let _g = HandoverGuard::acquire();
+        let p = cxmt_4g();
+        let mut k = crate::knobs::BUILD;
+        k.apply("A7A_HO_MRL_ADD=0").unwrap();
+        crate::knobs::set(k);
+        crate::rdtrain::APPLIED_MRL.store(4, core::sync::atomic::Ordering::Relaxed);
+        let mut hw = HandoverHw::new();
+        let r = super::mission_handover_relock(&mut hw, &p, 0, false);
+        assert!(r.is_ok(), "add=0 failed: {r:?}");
+        assert_eq!(
+            hw.dfimrl_writes(),
+            [(0, Some(4)), (1, Some(4)), (2, Some(4)), (3, Some(4))]
+        );
+        assert!(hw.fiu_pulsed_after_last_dfimrl());
+    }
+
+    #[cfg(feature = "lab-knobs")]
+    #[test]
+    fn handover_mrl_add_zero_fails_closed_on_missing_applied_mrl() {
+        let _g = HandoverGuard::acquire();
+        let p = cxmt_4g();
+        let mut k = crate::knobs::BUILD;
+        k.apply("A7A_HO_MRL_ADD=0").unwrap();
+        crate::knobs::set(k);
+        crate::rdtrain::APPLIED_MRL.store(0, core::sync::atomic::Ordering::Relaxed);
+        let mut hw = HandoverHw::new();
+        let r = super::mission_handover_relock(&mut hw, &p, 0, false);
+        assert!(
+            r.is_err(),
+            "add=0 with missing APPLIED_MRL must fail closed"
+        );
+    }
+
+    #[cfg(feature = "lab-knobs")]
+    #[test]
+    fn handover_mrl_add_one_writes_and_latches() {
+        let _g = HandoverGuard::acquire();
+        let p = cxmt_4g();
+        let mut k = crate::knobs::BUILD;
+        k.apply("A7A_HO_MRL_ADD=1").unwrap();
+        crate::knobs::set(k);
+        crate::rdtrain::APPLIED_MRL.store(4, core::sync::atomic::Ordering::Relaxed);
+        let mut hw = HandoverHw::new();
+        let r = super::mission_handover_relock(&mut hw, &p, 0, false);
+        assert!(r.is_ok(), "add=1 failed: {r:?}");
+        assert_eq!(
+            hw.dfimrl_writes(),
+            [(0, Some(5)), (1, Some(5)), (2, Some(5)), (3, Some(5))]
+        );
+        assert!(hw.fiu_pulsed_after_last_dfimrl());
+    }
+
+    #[cfg(feature = "lab-knobs")]
+    #[test]
+    fn handover_mrl_ho_csrs_override_preserved_with_add() {
+        let _g = HandoverGuard::acquire();
+        let p = cxmt_4g();
+        let mut k = crate::knobs::BUILD;
+        k.apply("A7A_HO_MRL_ADD=1").unwrap();
+        k.apply("A7A_HO_CSRS=10000=6,11000=6,12000=6,13000=6")
+            .unwrap();
+        crate::knobs::set(k);
+        crate::rdtrain::APPLIED_MRL.store(4, core::sync::atomic::Ordering::Relaxed);
+        let mut hw = HandoverHw::new();
+        let r = super::mission_handover_relock(&mut hw, &p, 0, false);
+        assert!(r.is_ok(), "ho_csrs override failed: {r:?}");
+        assert_eq!(
+            hw.dfimrl_writes(),
+            [(0, Some(6)), (1, Some(6)), (2, Some(6)), (3, Some(6))]
+        );
+        assert!(hw.fiu_pulsed_after_last_dfimrl());
     }
 }
