@@ -1862,10 +1862,10 @@ mod tests {
             other => panic!("expected a hard failure, got {other:?}"),
         }
         // The failed sequence itself undid the delays it applied.
-        for tg in 0..2 {
-            for db in 0..DBYTES {
-                for lane in 0..LANES {
-                    assert_eq!(s.tx_dq(db, lane, tg).unwrap(), before[tg][db][lane]);
+        for (tg, timing_group) in before.iter().enumerate() {
+            for (db, byte_lanes) in timing_group.iter().enumerate() {
+                for (lane, &delay) in byte_lanes.iter().enumerate() {
+                    assert_eq!(s.tx_dq(db, lane, tg).unwrap(), delay);
                 }
             }
         }
