@@ -330,7 +330,7 @@ extern "C" fn primary_main(mpidr: u64, core: usize) -> ! {
     if cfg!(feature = "memtest-cached") {
         #[cfg(feature = "memtest-cached")]
         {
-            memtest_cached::run(&h).unwrap_or_else(|e| panic!("memtest-cached failed: {e}"));
+            memtest_cached::run(&h);
             println!("[main] memtest-cached: payload withheld; halting for watchdog reset");
             Uart::attach(soc::UART0_BASE).drain();
         }

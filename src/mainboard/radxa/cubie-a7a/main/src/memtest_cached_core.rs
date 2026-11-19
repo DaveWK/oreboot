@@ -149,6 +149,26 @@ pub enum LiveRankMap {
     SingleRank,
 }
 
+/// Finish the mapping before publishing any verdict, including a pass error.
+/// A refused setup never installed our map: report that fact, not a timing.
+pub fn with_test_map<P, M, T>(
+    setup: Result<(P, M), &'static str>,
+    exercise: impl FnOnce(P) -> Result<T, &'static str>,
+    finish: impl FnOnce(Option<M>),
+) -> Result<T, &'static str> {
+    match setup {
+        Ok((plan, map)) => {
+            let outcome = exercise(plan);
+            finish(Some(map));
+            outcome
+        }
+        Err(reason) => {
+            finish(None);
+            Err(reason)
+        }
+    }
+}
+
 impl LiveRankMap {
     pub const fn rank_bit(self) -> Option<u32> {
         match self {
@@ -1151,6 +1171,31 @@ mod tests {
 
     const GIB: u64 = 1u64 << 30;
     const MIB: u64 = 1u64 << 20;
+
+    #[test]
+    fn map_lifetime_on_setup_failure_pass_error_and_success() {
+        use core::cell::Cell;
+        for (setup, expected) in [
+            (Err("bad map"), Err("bad map")),
+            (Ok((Err("pass error"), 1)), Err("pass error")),
+            (Ok((Ok(()), 1)), Ok(())),
+        ] {
+            let stage = Cell::new(0);
+            let result = with_test_map(
+                setup,
+                |outcome| {
+                    assert_eq!(stage.replace(1), 0);
+                    outcome
+                },
+                |map| {
+                    assert_eq!(map, setup.ok().map(|(_, m)| m));
+                    assert_eq!(stage.replace(2), usize::from(map.is_some()));
+                },
+            );
+            assert_eq!(stage.get(), 2);
+            assert_eq!(result, expected);
+        }
+    }
 
     fn sample_handoff(dram_size: u64, payload_size: u64, dtb: Option<(u64, u64)>) -> Handoff {
         let (dtb_addr, dtb_size) = dtb.unwrap_or((0, 0));

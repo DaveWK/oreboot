@@ -9,18 +9,18 @@
 //! every write-back is a gapless burst across both ranks and above 4 GiB.
 
 use ::memtest::arch::aarch64::{l1_table, TCR};
-use ::memtest::{Memory, Runner, Step, PROFILE_FAST};
+use ::memtest::{Memory, Plan, Runner, Step, PROFILE_FAST};
 use core::arch::asm;
-use cubie_a7a_common::{uart::Uart, Handoff};
+use cubie_a7a_common::Handoff;
 use util::mmio::read32;
 
 use crate::memtest_cached_core::{
     build_copy_plan, cached_plan_from_handoff, evaluate_verdict,
     plan_covers_both_ranks_and_above_4g, rank_of_addr, run_bit37_pass, run_copy_leg,
-    validate_live_rank_map, wb_mapped_range, Bit37Shape, CopyLegStats, ErrorDecode, LiveRankMap,
-    PassReport, RunCoverage, UnlocalizedMismatch, Verdict, ABOVE_4G, ADDRMAP1_CH0, BIT37_SEED_1000,
-    BIT37_SEED_1010, COPY_BLOCK_BYTES, COPY_SEED_BASE, MAIR_WB, SCTLR_C, SCTLR_I, SCTLR_M,
-    STRESS_BLOCK_BYTES, TEARDOWN_WDT_RELOAD_LINES, WDT0_CTRL_ADDR, WDT0_RELOAD_VAL,
+    validate_live_rank_map, wb_mapped_range, with_test_map, Bit37Shape, CopyLegStats, ErrorDecode,
+    LiveRankMap, PassReport, RunCoverage, UnlocalizedMismatch, ABOVE_4G, ADDRMAP1_CH0,
+    BIT37_SEED_1000, BIT37_SEED_1010, COPY_BLOCK_BYTES, COPY_SEED_BASE, MAIR_WB, SCTLR_C, SCTLR_I,
+    SCTLR_M, STRESS_BLOCK_BYTES, TEARDOWN_WDT_RELOAD_LINES, WDT0_CTRL_ADDR, WDT0_RELOAD_VAL,
 };
 
 /// Level-1 table of the cached EL3 flat map (4 KiB aligned).
@@ -378,31 +378,14 @@ fn print_pass_summary(name: &str, ms: u64, report: &PassReport, copy: Option<Cop
     }
 }
 
-pub fn run(h: &Handoff) -> Result<(), &'static str> {
+fn prepare(
+    h: &Handoff,
+    am1: u32,
+    line_size: u64,
+) -> Result<((Plan, LiveRankMap), CachedEl3FlatMap), &'static str> {
     let plan = cached_plan_from_handoff(h)?;
-    let am1 = read32(ADDRMAP1_CH0);
-    let rank_map = validate_live_rank_map(am1, h.dram_size);
-    let line_size = dcache_line_size();
-
-    let live_map = match rank_map {
-        Ok(m) => m,
-        Err(reason) => {
-            println!(
-                "[main] memtest-cached: FAIL reason=\"{reason}\" ADDRMAP1={am1:#x} dram_size={:#x} copy_bytes=[r0->r1:0 r1->r0:0 r1>4g:0]",
-                h.dram_size
-            );
-            Uart::attach(crate::soc::UART0_BASE).drain();
-            return Err(reason);
-        }
-    };
+    let live_map = validate_live_rank_map(am1, h.dram_size)?;
     let rank_bit = live_map.rank_bit();
-    let plan_dual_full = match live_map {
-        LiveRankMap::DualRank { rank_bit: b } => {
-            plan_covers_both_ranks_and_above_4g(&plan, h.dram_base, b)
-        }
-        LiveRankMap::SingleRank => false,
-    };
-
     println!(
         "[main] memtest-cached: DRAM {:#x}..{:#x} ({} MiB), ADDRMAP1 {:#x}, rank_map {:?}, dcache {} B, MAIR {:#x}",
         h.dram_base,
@@ -436,9 +419,25 @@ pub fn run(h: &Handoff) -> Result<(), &'static str> {
     l1_table(&mut l1.0, h.dram_base + h.dram_size, Some(EXEC_BLOCK))?;
     let map = unsafe { CachedEl3FlatMap::enter(&l1.0, line_size)? };
 
-    let t_total = crate::ticks();
-    let mut total = PassReport::new(h.dram_base, h.dram_size);
-    let mut cov = RunCoverage::default();
+    Ok(((plan, live_map), map))
+}
+
+fn run_passes(
+    h: &Handoff,
+    plan: &Plan,
+    live_map: LiveRankMap,
+    line_size: u64,
+    total: &mut PassReport,
+    cov: &mut RunCoverage,
+) -> Result<(), &'static str> {
+    let rank_bit = live_map.rank_bit();
+    let plan_dual_full = match live_map {
+        LiveRankMap::DualRank { rank_bit: b } => {
+            plan_covers_both_ranks_and_above_4g(plan, h.dram_base, b)
+        }
+        LiveRankMap::SingleRank => false,
+    };
+
     let mut dram = CachedDram { line_size };
 
     // Phase 1: stress::Runner with PROFILE_FAST, 64 KiB blocks.
@@ -447,7 +446,7 @@ pub fn run(h: &Handoff) -> Result<(), &'static str> {
         for step in PROFILE_FAST {
             let t0 = crate::ticks();
             let mut rep = PassReport::new(h.dram_base, h.dram_size);
-            runner.step(&plan, step, &mut rep);
+            runner.step(plan, step, &mut rep);
             print_pass_summary(step.name(), elapsed_ms(t0), &rep, None);
             total.merge(&rep);
             match step {
@@ -466,7 +465,7 @@ pub fn run(h: &Handoff) -> Result<(), &'static str> {
         let mut rep = PassReport::new(h.dram_base, h.dram_size);
         run_bit37_pass(
             &mut dram,
-            &plan,
+            plan,
             STRESS_BLOCK_BYTES,
             crate::soc::TIMER_HZ,
             seed,
@@ -479,14 +478,13 @@ pub fn run(h: &Handoff) -> Result<(), &'static str> {
     cov.bit37_ran_both_ranks = plan_dual_full;
 
     // Phase 3: 16 MiB cross-rank and above-4-GiB copy passes with SHA-256 compare.
-    let copy_plan = build_copy_plan(&plan, h.dram_base, rank_bit, COPY_BLOCK_BYTES);
-    let mut leg_bytes = [0u64; 3];
-    for (leg_idx, leg) in [
-        &copy_plan.r0_to_r1,
-        &copy_plan.r1_to_r0,
-        &copy_plan.r1_above4g,
+    let copy_plan = build_copy_plan(plan, h.dram_base, rank_bit, COPY_BLOCK_BYTES);
+    for (leg_idx, (leg, bytes)) in [
+        (&copy_plan.r0_to_r1, &mut cov.copy_r0_to_r1_bytes),
+        (&copy_plan.r1_to_r0, &mut cov.copy_r1_to_r0_bytes),
+        (&copy_plan.r1_above4g, &mut cov.copy_r1_above4g_bytes),
     ]
-    .iter()
+    .into_iter()
     .enumerate()
     {
         if leg.count == 0 {
@@ -507,22 +505,44 @@ pub fn run(h: &Handoff) -> Result<(), &'static str> {
             seed_base,
             &mut rep,
         )?;
-        leg_bytes[leg_idx] = stats.bytes;
+        *bytes = stats.bytes;
         print_pass_summary(leg.name, elapsed_ms(t0), &rep, Some(stats));
         total.merge(&rep);
     }
-    cov.copy_r0_to_r1_bytes = leg_bytes[0];
-    cov.copy_r1_to_r0_bytes = leg_bytes[1];
-    cov.copy_r1_above4g_bytes = leg_bytes[2];
+    Ok(())
+}
 
-    let (wb_start, wb_end, teardown_ticks) = map.finish();
-    let teardown_ms = teardown_ticks / (crate::soc::TIMER_HZ / 1000);
-    println!(
-        "[main] memtest-cached: teardown {wb_start:#x}..{wb_end:#x} ms={teardown_ms} ticks={teardown_ticks}"
+pub fn run(h: &Handoff) {
+    let am1 = read32(ADDRMAP1_CH0);
+    let line_size = dcache_line_size();
+    let mut total = PassReport::new(h.dram_base, h.dram_size);
+    let mut cov = RunCoverage::default();
+    let t_total = crate::ticks();
+    let result = with_test_map(
+        prepare(h, am1, line_size),
+        |(plan, live_map)| {
+            run_passes(h, &plan, live_map, line_size, &mut total, &mut cov)?;
+            Ok(live_map)
+        },
+        |map| match map {
+            Some(map) => {
+                let (wb_start, wb_end, ticks) = map.finish();
+                let ms = ticks / (crate::soc::TIMER_HZ / 1000);
+                println!("[main] memtest-cached: teardown {wb_start:#x}..{wb_end:#x} ms={ms} ticks={ticks}");
+            }
+            None => {
+                println!("[main] memtest-cached: teardown skipped (cached map not entered)");
+            }
+        },
     );
-
     let total_ms = elapsed_ms(t_total);
-    let (verdict, reason) = evaluate_verdict(Ok(live_map), total.errors, &cov);
+    let (verdict, reason) = match result {
+        Ok(map) => evaluate_verdict(Ok(map), total.errors, &cov),
+        Err(reason) => {
+            println!("[main] memtest-cached: FAIL reason=\"{reason}\" ADDRMAP1={am1:#x} dram_size={:#x} copy_bytes=[r0->r1:{} r1->r0:{} r1>4g:{}]", h.dram_size, cov.copy_r0_to_r1_bytes, cov.copy_r1_to_r0_bytes, cov.copy_r1_above4g_bytes);
+            return;
+        }
+    };
     print!(
         "[main] memtest-cached: {} total_errors={} total_ms={total_ms} copy_bytes=[r0->r1:{} r1->r0:{} r1>4g:{}] ",
         verdict.as_str(),
@@ -538,11 +558,5 @@ pub fn run(h: &Handoff) -> Result<(), &'static str> {
     }
     if let Some(u) = total.first_unlocalized.as_ref() {
         print_unlocalized_mismatch("total", total.unlocalized_count, u);
-    }
-    Uart::attach(crate::soc::UART0_BASE).drain();
-
-    match verdict {
-        Verdict::Pass | Verdict::Limited => Ok(()),
-        Verdict::Fail => Err(reason),
     }
 }
