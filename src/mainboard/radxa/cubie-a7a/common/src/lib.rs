@@ -13,6 +13,10 @@
 //! ```
 #![no_std]
 
+#[cfg(test)]
+#[path = "../../bt0/src/smhc/sd_width.rs"]
+mod bt0_sd_width;
+
 pub mod ethernet;
 pub mod fwlog;
 pub mod memtest;

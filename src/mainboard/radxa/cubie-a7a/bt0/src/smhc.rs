@@ -31,6 +31,8 @@ use crate::ccu;
 use crate::gpio::{self, Port, Pull};
 use crate::soc::{time_us, udelay};
 
+mod sd_width;
+
 const GCTRL: usize = 0x00;
 const CLKDIV: usize = 0x04;
 const TMOUT: usize = 0x08;
@@ -393,8 +395,13 @@ impl Smhc {
         r
     }
 
-    /// Identify the card and put it into 4-bit transfer state.
+    /// Identify the card and use 4-bit transfer only if it agrees.
     pub fn init_card(&mut self) -> Result<(), Error> {
+        self.init_card_width(true)
+    }
+
+    fn init_card_width(&mut self, try_four_bit: bool) -> Result<(), Error> {
+        self.rca = 0;
         self.reset_controller()?;
         self.w(NTSR, self.r(NTSR) | NTSR_MODE_NEW);
         self.w(TMOUT, 0xffff_ff40);
@@ -433,21 +440,38 @@ impl Smhc {
         self.cmd(2, 0, Resp::R2)?;
         self.rca = self.cmd(3, 0, Resp::R6)?[0] >> 16;
         self.cmd(7, self.rca << 16, Resp::R1b)?;
-        // ACMD6 SET_BUS_WIDTH 4-bit, then the controller.
-        self.app_cmd(6, 2, Resp::R1)?;
-        self.w(CTYPE, 1);
+        let wide = if try_four_bit {
+            match sd_width::switch(
+                |idx, arg| {
+                    self.app.set(idx == 6);
+                    let response = self.cmd(idx, arg, Resp::R1);
+                    self.app.set(false);
+                    response.map(|r| r[0])
+                },
+                self.rca,
+                || self.w(CTYPE, 1),
+            ) {
+                Ok(wide) => wide,
+                // No valid R1: ACMD6 may have reached the card. CMD0 from
+                // identification resets its width before using the data bus.
+                Err(_) => return self.init_card_width(false),
+            }
+        } else {
+            false
+        };
         if !self.high_capacity {
             self.cmd(16, BLOCK_SIZE as u32, Resp::R1)?;
         }
         self.set_card_clock(0)?;
         println!(
-            "[bt0] SD: {} card, RCA {:04x}, OCR {ocr:08x}, 4-bit bus",
+            "[bt0] SD: {} card, RCA {:04x}, OCR {ocr:08x}, {}-bit bus",
             if self.high_capacity {
                 "SDHC/SDXC"
             } else {
                 "SDSC"
             },
-            self.rca
+            self.rca,
+            if wide { 4 } else { 1 },
         );
         Ok(())
     }
