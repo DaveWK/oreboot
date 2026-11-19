@@ -934,6 +934,7 @@ version = "0.1.0"
 dependencies = [
  "arm-ppu",
  "cubie-a7a-common",
+ "cubie-a7a-dram",
  "dwc-pcie",
  "fdt-writer",
  "log 0.1.0",

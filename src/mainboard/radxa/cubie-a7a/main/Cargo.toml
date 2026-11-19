@@ -16,6 +16,9 @@ memtest = { path = "../../../../lib/memtest" }
 psci-el3 = { path = "../../../../lib/psci-el3", features = ["vectors"] }
 regio = { path = "../../../../lib/regio" }
 
+[dev-dependencies]
+cubie-a7a-dram = { path = "../dram", features = ["rank-map"] }
+
 # Peripheral bring-up in main, each one a build option so a first boot on new
 # hardware can leave out what has not run yet (Makefile BRINGUP=...). The
 # modules are always compiled; a disabled one never touches its hardware and
