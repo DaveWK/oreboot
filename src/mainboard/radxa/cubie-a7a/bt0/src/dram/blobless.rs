@@ -455,7 +455,10 @@ fn wck_level(p: &mut Para) {
 /// lanes 0..8, and the same dump's VrefDAC0/VrefDAC1 per lane
 /// (the receiver references; ours are a constant 0x35 from the init
 /// tables).
-#[cfg(not(feature = "wck-alias-probe"))]
+#[cfg(all(
+    not(feature = "wck-alias-probe"),
+    any(feature = "rd-measure", feature = "rd-train-only")
+))]
 const AV3C_START: cubie_a7a_dram::rd::ReadStart = cubie_a7a_dram::rd::ReadStart {
     rx_clk: [
         [
@@ -820,7 +823,9 @@ fn read_training(bases: [Option<cubie_a7a_dram::phy::wcklevel::Mr18Base>; 4]) ->
     use cubie_a7a_dram::phy::rxen::ModeMrs;
     use cubie_a7a_dram::phy::wcklevel::{Channel, Rank};
     use cubie_a7a_dram::rd;
-    use cubie_a7a_dram::rdtrain::{self, clk_code, clk_eff, TrainConfig, CHECK_PATTERNS, MRR_MAS};
+    #[cfg(feature = "rd-train-only")]
+    use cubie_a7a_dram::rdtrain::clk_eff;
+    use cubie_a7a_dram::rdtrain::{self, clk_code, TrainConfig, CHECK_PATTERNS, MRR_MAS};
     use cubie_a7a_dram::wl;
     const TRAIN_ONLY: bool = cfg!(feature = "rd-train-only");
     const ALL: [(Channel, Rank); 5] = [
@@ -883,8 +888,12 @@ fn read_training(bases: [Option<cubie_a7a_dram::phy::wcklevel::Mr18Base>; 4]) ->
         // pstate 0: the same mode MRs (the reference's pstate-0 read enable
         // writes the same values), no vendor starts; another pstate: MR18
         // from the block's WL base, no vendor starts.
+        #[cfg(feature = "rd-train-only")]
+        let start_ps1 = Some(&AV3C_START);
+        #[cfg(not(feature = "rd-train-only"))]
+        let start_ps1 = None;
         let (cfg, start) = if ps == 1 {
-            (base_cfg, if TRAIN_ONLY { Some(&AV3C_START) } else { None })
+            (base_cfg, start_ps1)
         } else if ps == 0 {
             (base_cfg, None)
         } else {
@@ -922,6 +931,7 @@ fn read_training(bases: [Option<cubie_a7a_dram::phy::wcklevel::Mr18Base>; 4]) ->
         mrl_pub.record(t);
         ok += t.ok() as u32;
         let nm = rdtrain::block_name(ch, rank);
+        #[cfg(feature = "rd-train-only")]
         let r = (rank == Rank::R1) as usize;
         let dbs: [usize; 2] = if ch == Channel::A { [0, 1] } else { [2, 3] };
         let ps = |taps: u16| taps as u32 * cfg.ui_ps as u32 / 64;
@@ -944,13 +954,23 @@ fn read_training(bases: [Option<cubie_a7a_dram::phy::wcklevel::Mr18Base>; 4]) ->
             );
             for (lane, l) in b.lanes.iter().enumerate() {
                 let (tw, cw) = (span(l.t, cfg.lane_step), span(l.c, cfg.lane_step));
-                let vt = clk_eff(AV3C_START.rx_clk[dbs[i]][r][lane]);
-                let vc = clk_eff(AV3C_START.rx_clk[dbs[i]][2 + r][lane]);
+                #[cfg(feature = "rd-train-only")]
+                {
+                    let vt = clk_eff(AV3C_START.rx_clk[dbs[i]][r][lane]);
+                    let vc = clk_eff(AV3C_START.rx_clk[dbs[i]][2 + r][lane]);
+                    println!(
+                        "[dram] RDT {nm} run {n} TABLE b{i} l{lane}: T {:03x} {} eye {}-{} {} taps {} ps | C {:03x} {} eye {}-{} {} taps {} ps | both {}-{} | vendor T {} C {}",
+                        clk_code(l.t_eff), l.t_eff, l.t[0], l.t[1], tw, ps(tw),
+                        clk_code(l.c_eff), l.c_eff, l.c[0], l.c[1], cw, ps(cw),
+                        l.both[0], l.both[1], vt, vc
+                    );
+                }
+                #[cfg(not(feature = "rd-train-only"))]
                 println!(
-                    "[dram] RDT {nm} run {n} TABLE b{i} l{lane}: T {:03x} {} eye {}-{} {} taps {} ps | C {:03x} {} eye {}-{} {} taps {} ps | both {}-{} | vendor T {} C {}",
+                    "[dram] RDT {nm} run {n} TABLE b{i} l{lane}: T {:03x} {} eye {}-{} {} taps {} ps | C {:03x} {} eye {}-{} {} taps {} ps | both {}-{}",
                     clk_code(l.t_eff), l.t_eff, l.t[0], l.t[1], tw, ps(tw),
                     clk_code(l.c_eff), l.c_eff, l.c[0], l.c[1], cw, ps(cw),
-                    l.both[0], l.both[1], vt, vc
+                    l.both[0], l.both[1]
                 );
             }
         }
