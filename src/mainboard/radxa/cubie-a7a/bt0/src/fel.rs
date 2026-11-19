@@ -8,6 +8,10 @@
 //! |-------------------|------------------------------------------------------|
 //! | `LINK_BASE + 0x40` | 1: clocks, UART, PMIC, DRAM, CPU boost; back to FEL |
 //! | `LINK_BASE + 0x44` | 2: check the images the host placed, enter main     |
+//! | `LINK_BASE + 0x48` | 3: lab command list (`lab.rs`)                       |
+//! | `LINK_BASE + 0x4c` | 4: fastboot (feature `fastboot`, `fastboot.rs`): DRAM |
+//! |                   | as entry 1 unless it ran, then the stock fastboot   |
+//! |                   | tool on the same USB port instead of FEL            |
 //!
 //! Between the two the host writes oreboot main, the EDK2 FD (and a DTB, if
 //! the layout has one) to their load addresses in DRAM and the image's boot
@@ -51,6 +55,8 @@ pub const LINK_BASE: usize = 0x0009_0000;
 /// | 0x010  | bt0        | the ROM's SCTLR at entry                       |
 /// | 0x014  | bt0        | the ROM's CPSR at entry                        |
 /// | 0x018  | bt0        | the ROM's VBAR at entry                        |
+/// | 0x020  | bt0        | lab: ops, output words, error (entry 3)        |
+/// | 0x030  | bt0        | fastboot: why it gave FEL back (entry 4)       |
 /// | 0x200  | host       | the image's 512-byte layout table frame        |
 pub const MAILBOX: usize = 0x000d_f000;
 const MB_MAGIC: usize = MAILBOX;
@@ -81,9 +87,16 @@ pub mod state {
     /// Entry 3 (lab) running / done.
     pub const LAB_RUNNING: u32 = 0x30;
     pub const LAB_DONE: u32 = 0x31;
+    /// Entry 4: fastboot serving (FEL is gone until it returns).
+    pub const FASTBOOT: u32 = 0x40;
+    /// Entry 4 in a build without feature `fastboot`.
+    pub const NO_FASTBOOT: u32 = 0xe3;
     /// Entry 1 halted (DRAM init or test failed) and returned to FEL.
     pub const HALTED: u32 = 0xef;
 }
+
+/// Mailbox word: why entry 4 returned (fastboot.rs `Back`: 1 asked, 2 USB).
+const MB_FASTBOOT_BACK: usize = MAILBOX + 0x30;
 
 /// CCU+0x518, the bus clock register bt0's clock setup (ccu_control.rs
 /// `init`) sets to source 0, divider 1.
@@ -104,6 +117,9 @@ global_asm!(
     .global fel_save
 fel_save:
     .space  64                  @ sp, lr, cpsr, sctlr, vbar, r4-r11
+    .global fel_init_done
+fel_init_done:
+    .word   0                   @ FEL_INIT_DONE once entry 1's work is done
 
     .section .text.entry, "ax"
     .arm
@@ -112,6 +128,7 @@ start:
     b       fel_entry1          @ LINK_BASE + 0x40
     b       fel_entry2          @ LINK_BASE + 0x44
     b       fel_entry3          @ LINK_BASE + 0x48 (lab)
+    b       fel_entry4          @ LINK_BASE + 0x4c (fastboot)
 
     .section .text.fel, "ax"
     .arm
@@ -123,6 +140,9 @@ fel_entry2:
     b       fel_common
 fel_entry3:
     mov     r3, #2
+    b       fel_common
+fel_entry4:
+    mov     r3, #3
 fel_common:
     ldr     r12, =fel_save
     str     sp, [r12, #0]
@@ -201,14 +221,26 @@ fel_common:
     beq     9f
     cmp     r12, #0
     beq     7f
-    @ entry 1: clear .bss
+    cmp     r12, #3
+    bne     10f
+    @ entry 4: keep .bss (entry 1's results) if entry 1 ran in this load
+    ldr     r0, =fel_init_done
+    ldr     r0, [r0]
+    ldr     r1, ={init_done}
+    cmp     r0, r1
+    beq     11f
+10: @ entry 1, or entry 4 first: clear .bss
     ldr     r0, =_sbss
     ldr     r1, =_ebss
     mov     r2, #0
 6:  cmp     r0, r1
     strlo   r2, [r0], #4
     blo     6b
+    cmp     r12, #3
+    beq     11f
     bl      fel_init
+    b       8f
+11: bl      fel_fastboot
     b       8f
 7:  bl      fel_boot                    @ returns only if it refused
     b       8f
@@ -236,11 +268,18 @@ fel_return:
     ldmia   r0, {{r4-r11}}
     bx      lr
     .ltorg
-    "#
+    "#,
+    init_done = const FEL_INIT_DONE,
 );
+
+/// fel_init_done once entry 1's work (bring-up) is done in this load of
+/// the image: entry 4 then skips the bring-up and keeps .bss. The word is
+/// in .data, so every `xfel write` of the image resets it.
+const FEL_INIT_DONE: u32 = u32::from_le_bytes(*b"A7AD");
 
 unsafe extern "C" {
     static fel_save: [u32; 16];
+    static mut fel_init_done: u32;
     fn fel_return() -> !;
 }
 
@@ -254,13 +293,21 @@ pub fn halt_to_fel() -> ! {
         state::HALTED
     );
     Uart::attach(UART0_BASE).drain();
+    give_back_to_rom();
+    write32(MB_STATE, state::HALTED);
+    unsafe { fel_return() }
+}
+
+/// What every return to FEL puts back: the ROM's USB0 set-up if fastboot
+/// took it over, the ROM's AHB clock; the watchdog stops.
+fn give_back_to_rom() {
+    #[cfg(feature = "fastboot")]
+    crate::musb::restore_rom();
     recovery::stop_watchdog();
     let rom_ahb = unsafe { *core::ptr::addr_of!(ROM_AHB) };
     if rom_ahb != 0 {
         write32(AHB, rom_ahb);
     }
-    write32(MB_STATE, state::HALTED);
-    unsafe { fel_return() }
 }
 
 /// (sp, lr, cpsr, sctlr, vbar) as the ROM called us.
@@ -269,9 +316,10 @@ fn rom_state() -> [u32; 5] {
     core::array::from_fn(|i| unsafe { core::ptr::read_volatile(p.add(i)) })
 }
 
-/// Entry 1: everything bt0 does before the boot medium, then back to FEL.
-#[unsafe(no_mangle)]
-extern "C" fn fel_init() {
+/// Entry 1's work: the mailbox header, then everything bt0 does before the
+/// boot medium (halts back to FEL if DRAM does not come up). Entry 4 runs
+/// it too when entry 1 has not.
+fn fel_bring_up() -> Bringup {
     let [_, _, cpsr, sctlr, vbar] = rom_state();
     write32(MB_STATE, state::INIT_RUNNING);
     write32(MB_ROM_SCTLR, sctlr);
@@ -281,21 +329,29 @@ extern "C" fn fel_init() {
     let rom_ahb = read32(AHB);
     unsafe { *core::ptr::addr_of_mut!(ROM_AHB) = rom_ahb };
 
-    // Halts (watchdog reset, back into FEL) if DRAM does not come up.
     let b = crate::bring_up();
     unsafe { *core::ptr::addr_of_mut!(BRINGUP) = Some(b) };
+    write32(MB_DRAM_MB, b.dram_mb);
+    write32(MB_DRAM_MHZ, b.dram_mhz);
+    unsafe { core::ptr::write_volatile(core::ptr::addr_of_mut!(fel_init_done), FEL_INIT_DONE) };
 
     println!(
         "[bt0] FEL: mask ROM state at entry: CPSR {cpsr:#010x} SCTLR {sctlr:#010x} VBAR {vbar:#010x}{}",
         if sctlr & 1 != 0 { " (MMU was on)" } else { "" }
     );
+    b
+}
+
+/// Entry 1: everything bt0 does before the boot medium, then back to FEL.
+#[unsafe(no_mangle)]
+extern "C" fn fel_init() {
+    let b = fel_bring_up();
+    let rom_ahb = unsafe { *core::ptr::addr_of!(ROM_AHB) };
     let ours = read32(AHB);
     if ours != rom_ahb {
         println!("[bt0] FEL: CCU+0x518 {ours:#010x} -> {rom_ahb:#010x} (the ROM's) until entry 2");
         write32(AHB, rom_ahb);
     }
-    write32(MB_DRAM_MB, b.dram_mb);
-    write32(MB_DRAM_MHZ, b.dram_mhz);
     println!(
         "[bt0] FEL: DRAM up, {} ms; back to FEL. Next: images to DRAM, layout table to {TABLE:#x}, entry 2 at {:#x}",
         (soc::ticks() - b.t_start) / (soc::TIMER_HZ / 1000),
@@ -359,7 +415,12 @@ extern "C" fn fel_boot() {
     let Some(main_entry) = main_entry else {
         return refuse(state::BOOT_TABLE, "boot layout", "no oreboot main");
     };
+    hand_over(&b, handoff, main_entry)
+}
 
+/// The hand-over to main once the images are in place and checked (entry
+/// 2, and fastboot's `boot`).
+pub fn hand_over(b: &Bringup, handoff: cubie_a7a_common::Handoff, main_entry: u32) -> ! {
     // The ROM's interrupts off, or the warm reset never happens (rmr_switch).
     quiesce_rom_interrupts();
     // As the SD boot from here: bt0's bus clock, the attempt marker and the
@@ -367,7 +428,43 @@ extern "C" fn fel_boot() {
     soc::clr_set_bits(AHB, AHB_BT0_CLEAR, 0);
     recovery::begin_attempt();
     write32(MB_STATE, state::BOOT_HANDOVER);
-    crate::enter_main(&b, handoff, main_entry)
+    crate::enter_main(b, handoff, main_entry)
+}
+
+/// Entry 4: fastboot on the USB-C port (fastboot.rs). Runs entry 1's
+/// bring-up unless entry 1 already ran in this load of the image; returns
+/// to FEL (DRAM up, entries 2 and 4 usable) only when the host asks or USB
+/// keeps failing. The watchdog stays armed while fastboot waits (its poll
+/// loop restarts it), so a hang ends in a reset.
+#[cfg(feature = "fastboot")]
+#[unsafe(no_mangle)]
+extern "C" fn fel_fastboot() {
+    let done = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(fel_init_done)) };
+    let b = match unsafe { *core::ptr::addr_of!(BRINGUP) } {
+        Some(b) if done == FEL_INIT_DONE => b,
+        _ => fel_bring_up(),
+    };
+    // The bus clock the ROM's USB ran with (as entry 1 leaves it for FEL);
+    // hand_over sets bt0's again.
+    let rom_ahb = unsafe { *core::ptr::addr_of!(ROM_AHB) };
+    if rom_ahb != 0 {
+        write32(AHB, rom_ahb);
+    }
+    write32(MB_STATE, state::FASTBOOT);
+    recovery::arm_watchdog();
+    println!("[bt0] FEL: entry 4: fastboot on USB0 (the USB-C port)");
+    let back = crate::fastboot::run(&b);
+    Uart::attach(UART0_BASE).drain();
+    give_back_to_rom();
+    write32(MB_FASTBOOT_BACK, back as u32);
+    write32(MB_STATE, state::DRAM_UP);
+}
+
+/// Entry 4 without fastboot built in: say so and return.
+#[cfg(not(feature = "fastboot"))]
+#[unsafe(no_mangle)]
+extern "C" fn fel_fastboot() {
+    write32(MB_STATE, state::NO_FASTBOOT);
 }
 
 /// Mailbox words of the lab entry (entry 3, `lab.rs`).

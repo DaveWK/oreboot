@@ -1,0 +1,569 @@
+//! fastboot over FEL (feature `fastboot`): after DRAM is up, bt0 leaves the
+//! mask ROM's FEL session on the USB-C port (USB0) and enumerates as a
+//! standard fastboot device (18d1:4ee0), so the host uses the stock
+//! `fastboot` tool instead of chained xfel calls (fel.rs entry 4).
+//!
+//! | Command                     | Here                                          |
+//! |-----------------------------|-----------------------------------------------|
+//! | `getvar`                    | product, serialno, DRAM, partitions, `all`    |
+//! | `download`                  | to DRAM at [`BUF`], up to [`BUF_MAX`]         |
+//! | `boot`                      | a bundle (layout table + images): checked,    |
+//! |                             | then the FEL entry 2 hand-over to main        |
+//! | `continue`                  | `boot` of the last download                   |
+//! | `reboot`                    | watchdog reset of the board                   |
+//! | `reboot-bootloader`, `oem fel` | back to the mask ROM's FEL (DRAM stays up) |
+//! | `oem help/log/read32`       | diagnostics                                   |
+//! | `flash`/`erase`, `oem nor-*`| SPI NOR, only with `fastboot-nor-write`       |
+//!
+//! A bundle is any cut of the boot medium that holds the layout table and
+//! the images it names (cubie_a7a_fastboot::bundle): the image's
+//! `firmware.bin`, the 8 MiB NOR image, or the medium from the table on.
+//! `fastboot boot` wraps a plain file in an Android boot image; the kernel
+//! of one is the bundle. Everything `boot` checks (table, extents against
+//! DRAM, overlaps with the download, every CRC) is checked before the OKAY;
+//! after it the images are copied, checked again in place and bt0 hands
+//! over exactly as FEL entry 2 does.
+use core::fmt::Write;
+use core::sync::atomic::{AtomicBool, Ordering};
+
+use cubie_a7a_common::{crc32, fwlog};
+use cubie_a7a_fastboot::proto::{self, Command, Device, Exit, Info, Line};
+use cubie_a7a_fastboot::{nor, plan, usb};
+use util::mmio::{read32, read64le, read8};
+
+use crate::musb::{self, Musb};
+use crate::{soc, Bringup};
+
+/// The download buffer in DRAM: above main (0x40000000), its log and
+/// handoff (below 0x40200000) and the EDK2 FD (0x41000000, 4 MiB), so a
+/// bundle's images never land in it (plan::check checks that too).
+pub const BUF: usize = 0x4800_0000;
+pub const BUF_MAX: usize = 0x0800_0000;
+/// Read-back scratch for NOR writes, after the download buffer.
+#[cfg(feature = "fastboot-nor-write")]
+const SCRATCH: usize = BUF + BUF_MAX;
+#[cfg(feature = "fastboot-nor-write")]
+const SCRATCH_LEN: usize = 0x1_0000;
+
+/// USB sessions (take-over, serve) before bt0 gives up and goes back to FEL.
+const SESSIONS: u32 = 4;
+
+/// The checked plan of a `boot`: a bundle in the download buffer.
+#[derive(Clone, Copy)]
+pub struct Plan {
+    checked: plan::Checked,
+    /// The download.
+    image: usize,
+    len: usize,
+}
+
+impl Plan {
+    fn image(&self) -> &'static [u8] {
+        // SAFETY: the download buffer, which only fastboot writes.
+        unsafe { core::slice::from_raw_parts(self.image as *const u8, self.len) }
+    }
+}
+
+/// After the acknowledgement: copy the images, check them in place, hand
+/// over to main (fel.rs, as entry 2). Back to FEL if a copy is bad.
+fn execute(b: &Bringup, p: Plan) -> ! {
+    let mut handoff = crate::handoff(b);
+    let mut main_entry = None;
+    let mut bad = false;
+    let placed = plan::for_each_image(&p.checked, p.image(), b.dram_end as u64, |e, addr, src| {
+        let t0 = soc::time_us();
+        // SAFETY: plan::check validated the extent against DRAM, the other
+        // images and the download buffer.
+        let dst = unsafe { core::slice::from_raw_parts_mut(addr as *mut u8, src.len()) };
+        dst.copy_from_slice(src);
+        let crc = crc32(dst);
+        if e.crc32 != 0 && crc != e.crc32 {
+            println!(
+                "[fastboot] kind {} at 0x{addr:08x}: CRC {crc:08x} after the copy, table {:08x}",
+                e.kind, e.crc32
+            );
+            bad = true;
+            return;
+        }
+        println!(
+            "[fastboot] kind {} ({} KiB) at 0x{addr:08x}{} ({} ms)",
+            e.kind,
+            e.size / 1024,
+            if e.crc32 != 0 { ", CRC ok" } else { "" },
+            (soc::time_us() - t0) / 1000
+        );
+        if let Some(entry) = crate::place(&mut handoff, e, addr) {
+            main_entry = Some(entry);
+        }
+    });
+    match (placed, main_entry, bad) {
+        (Ok(()), Some(entry), false) => crate::fel::hand_over(b, handoff, entry),
+        _ => {
+            println!("[fastboot] the images in DRAM do not match the bundle; back to FEL");
+            crate::fel::halt_to_fel()
+        }
+    }
+}
+
+const NAMES: &[&str] = &[
+    "product",
+    "serialno",
+    "version-bootloader",
+    "secure",
+    "unlocked",
+    "hw-revision",
+    "boot-mode",
+    "dram-size",
+    "dram-mhz",
+    "usb-speed",
+    "nor-writes",
+    "partition-type:bt0",
+    "partition-size:bt0",
+    "partition-type:layout",
+    "partition-size:layout",
+    "partition-type:main",
+    "partition-size:main",
+    "partition-type:edk2",
+    "partition-size:edk2",
+];
+
+const HELP: &[&str] = &[
+    "oem log [hex bytes]: tail of the bt0 console log",
+    "oem read32 <hex addr>: one 32-bit register read",
+    "oem fel: back to the mask ROM's FEL (as reboot-bootloader)",
+];
+#[cfg(feature = "fastboot-nor-write")]
+const HELP_NOR: &[&str] = &[
+    "oem nor-id: SPI NOR JEDEC ID and status register 1",
+    "oem nor-arm <part> flash <hex len> <hex crc32> | <part> erase",
+];
+#[cfg(not(feature = "fastboot-nor-write"))]
+const HELP_NOR: &[&str] = &[];
+
+/// The negotiated speed, for `getvar:usb-speed`.
+static HIGH_SPEED: AtomicBool = AtomicBool::new(true);
+
+struct A7a<'b> {
+    b: &'b Bringup,
+    serial: &'b str,
+    guard: nor::Guard,
+    #[cfg(feature = "fastboot-nor-write")]
+    nor: Option<crate::spinor::SpiNor>,
+}
+
+fn now_ms() -> u64 {
+    soc::time_us() / 1000
+}
+
+/// The tail of bt0's console log (cubie_a7a_common::fwlog), `n` bytes,
+/// as INFO lines.
+fn oem_log(n: usize, info: &mut dyn Info) -> Result<(), &'static str> {
+    let base = fwlog::CUR_BASE;
+    if (0..8).any(|i| read8(base + i) != fwlog::MAGIC[i]) {
+        return Err("no console log in DRAM");
+    }
+    let written = read64le(base + 16);
+    let n = (n as u64).min(written).min(fwlog::DATA_SIZE as u64);
+    let mut line = [0u8; 56];
+    let mut len = 0;
+    let mut emit = |line: &[u8]| {
+        info.info(format_args!(
+            "{}",
+            core::str::from_utf8(line).unwrap_or("?")
+        ));
+    };
+    for i in written - n..written {
+        let c = read8(base + fwlog::HEADER_SIZE + (i % fwlog::DATA_SIZE as u64) as usize);
+        if c == b'\n' || len == line.len() {
+            emit(&line[..len]);
+            len = 0;
+            if c == b'\n' {
+                continue;
+            }
+        }
+        if (0x20..0x7f).contains(&c) {
+            line[len] = c;
+            len += 1;
+        }
+    }
+    if len > 0 {
+        emit(&line[..len]);
+    }
+    Ok(())
+}
+
+/// `oem read32 <addr>`: one aligned 32-bit read. Not the USB0 FIFOs
+/// (reading one would take fastboot's own packets).
+fn oem_read32(arg: &str, info: &mut dyn Info) -> Result<(), &'static str> {
+    let a = proto::hex_u32(arg).ok_or("usage: oem read32 <hex address>")? as usize;
+    if !a.is_multiple_of(4) {
+        return Err("address not 4-byte aligned");
+    }
+    if (0x0410_0000..0x0410_0040).contains(&a) {
+        return Err("USB0 FIFO window: refused");
+    }
+    let v = read32(a);
+    println!("[fastboot] read32 0x{a:08x}: 0x{v:08x}");
+    info.info(format_args!("0x{a:08x}: 0x{v:08x}"));
+    Ok(())
+}
+
+#[cfg(feature = "fastboot-nor-write")]
+impl A7a<'_> {
+    fn nor(&mut self) -> Result<&mut crate::spinor::SpiNor, &'static str> {
+        if self.nor.is_none() {
+            match crate::spinor::SpiNor::new() {
+                Ok(n) => self.nor = Some(n),
+                Err(e) => {
+                    println!("[fastboot] SPI NOR controller init failed: {e:?}");
+                    return Err("SPI NOR controller init failed");
+                }
+            }
+        }
+        Ok(self.nor.as_mut().unwrap())
+    }
+}
+
+#[cfg(feature = "fastboot-nor-write")]
+fn scratch() -> &'static mut [u8] {
+    // SAFETY: DRAM after the download buffer, used only here.
+    unsafe { core::slice::from_raw_parts_mut(SCRATCH as *mut u8, SCRATCH_LEN) }
+}
+
+/// The layout partition's content check: a valid frame for this board
+/// whose images all lie in the main and EDK2 partitions.
+#[cfg(feature = "fastboot-nor-write")]
+fn check_nor_image(b: &Bringup, p: &nor::Partition, image: &[u8]) -> Result<(), &'static str> {
+    use cubie_a7a_common::layout;
+    use cubie_a7a_fastboot::bundle;
+    if p.content != nor::Content::Layout {
+        return Ok(());
+    }
+    let frame = image
+        .get(..bundle::SECTOR)
+        .ok_or("layout frame shorter than 512 bytes")?;
+    let t = layout::decode(frame).map_err(|_| "not a valid A7ABOOT1 layout frame")?;
+    layout::validate(&t, b.dram_end as u64).map_err(|_| "layout table does not fit this board")?;
+    for e in &t.entries[..t.count as usize] {
+        if e.kind == layout::KIND_VENDOR_SPL {
+            return Err("vendor SPL entry: not on the NOR");
+        }
+        if nor::holding(e.offset, e.size, nor::Content::Raw).is_none() {
+            return Err("an image lies outside the main and edk2 partitions");
+        }
+    }
+    Ok(())
+}
+
+impl Device for A7a<'_> {
+    type Boot = Plan;
+
+    fn getvar(&mut self, name: &str, out: &mut Line) -> bool {
+        let b = self.b;
+        match name {
+            "product" => write!(out, "cubie-a7a"),
+            "serialno" => write!(out, "{}", self.serial),
+            "version-bootloader" => {
+                write!(out, "oreboot-bt0-{}-fastboot", env!("CARGO_PKG_VERSION"))
+            }
+            "secure" => write!(out, "no"),
+            "unlocked" => write!(out, "yes"),
+            "hw-revision" => write!(out, "{}", (b'A' + b.version as u8) as char),
+            "boot-mode" => write!(out, "fel"),
+            "dram-size" => write!(out, "{} MiB", b.dram_mb),
+            "dram-mhz" => write!(out, "{}", b.dram_mhz),
+            "usb-speed" => write!(
+                out,
+                "{}",
+                if HIGH_SPEED.load(Ordering::Relaxed) {
+                    "high"
+                } else {
+                    "full"
+                }
+            ),
+            "nor-writes" => write!(
+                out,
+                "{}",
+                if self.guard.enabled() {
+                    "built in"
+                } else {
+                    "no"
+                }
+            ),
+            _ => {
+                let (p, size) = if let Some(p) = name.strip_prefix("partition-type:") {
+                    (p, false)
+                } else if let Some(p) = name.strip_prefix("partition-size:") {
+                    (p, true)
+                } else {
+                    return false;
+                };
+                match nor::partition(p) {
+                    Some(p) if size => write!(out, "0x{:x}", p.size),
+                    Some(_) => write!(out, "raw"),
+                    None => return false,
+                }
+            }
+        }
+        .is_ok()
+    }
+
+    fn getvar_names(&self) -> &'static [&'static str] {
+        NAMES
+    }
+
+    fn command(&mut self, c: &Command) {
+        self.guard.observe(c);
+    }
+
+    #[cfg(feature = "fastboot-nor-write")]
+    fn flash(&mut self, part: &str, image: &[u8], info: &mut dyn Info) -> Result<(), &'static str> {
+        let b = self.b;
+        // The arm first: no SPI controller access unless this exact
+        // flash is armed (and the arm is used up whatever happens next).
+        let p = self.guard.take(part, Some(image), now_ms())?;
+        let f = self.nor()?;
+        nor::program_partition(
+            f,
+            p,
+            image,
+            &mut |p, i| check_nor_image(b, p, i),
+            scratch(),
+            info,
+        )
+        .map_err(|e| {
+            println!("[fastboot] flash {part}: {e:?}");
+            e.message()
+        })
+    }
+
+    #[cfg(not(feature = "fastboot-nor-write"))]
+    fn flash(
+        &mut self,
+        _part: &str,
+        _image: &[u8],
+        _info: &mut dyn Info,
+    ) -> Result<(), &'static str> {
+        Err("NOR writes are not built in (bt0 feature fastboot-nor-write)")
+    }
+
+    #[cfg(feature = "fastboot-nor-write")]
+    fn erase(&mut self, part: &str, info: &mut dyn Info) -> Result<(), &'static str> {
+        let p = self.guard.take(part, None, now_ms())?;
+        let f = self.nor()?;
+        nor::erase_partition(f, p, scratch(), info).map_err(|e| {
+            println!("[fastboot] erase {part}: {e:?}");
+            e.message()
+        })
+    }
+
+    #[cfg(not(feature = "fastboot-nor-write"))]
+    fn erase(&mut self, _part: &str, _info: &mut dyn Info) -> Result<(), &'static str> {
+        Err("NOR writes are not built in (bt0 feature fastboot-nor-write)")
+    }
+
+    fn boot(&mut self, image: Option<&[u8]>, info: &mut dyn Info) -> Result<Plan, &'static str> {
+        let image = image.ok_or("download a bundle first")?;
+        let t0 = soc::time_us();
+        let r = plan::check(image, image.as_ptr() as u64, self.b.dram_end as u64, info).map(
+            |checked| Plan {
+                checked,
+                image: image.as_ptr() as usize,
+                len: image.len(),
+            },
+        );
+        match &r {
+            Ok(_) => {
+                println!(
+                    "[fastboot] bundle checked in {} ms",
+                    (soc::time_us() - t0) / 1000
+                );
+            }
+            Err(e) => {
+                println!("[fastboot] bundle refused: {e}");
+            }
+        }
+        r
+    }
+
+    fn continue_boot(
+        &mut self,
+        image: Option<&[u8]>,
+        info: &mut dyn Info,
+    ) -> Result<Plan, &'static str> {
+        if image.is_none() {
+            return Err("nothing staged; fastboot stage <bundle> first");
+        }
+        self.boot(image, info)
+    }
+
+    fn reboot(&mut self, _bootloader: bool) -> Result<(), &'static str> {
+        Ok(())
+    }
+
+    fn oem(
+        &mut self,
+        args: &str,
+        _image: Option<&[u8]>,
+        info: &mut dyn Info,
+    ) -> Result<Option<Exit<Plan>>, &'static str> {
+        let (cmd, rest) = args.split_once(' ').unwrap_or((args, ""));
+        match cmd {
+            "help" | "" => {
+                for l in HELP.iter().chain(HELP_NOR) {
+                    info.info(format_args!("{l}"));
+                }
+                Ok(None)
+            }
+            "log" => {
+                let n = if rest.is_empty() {
+                    4096
+                } else {
+                    proto::hex_u32(rest).ok_or("usage: oem log [hex bytes]")? as usize
+                };
+                oem_log(n.min(0x8000), info).map(|()| None)
+            }
+            "read32" => oem_read32(rest, info).map(|()| None),
+            "fel" => Ok(Some(Exit::Bootloader)),
+            #[cfg(feature = "fastboot-nor-write")]
+            "nor-id" => {
+                use nor::NorFlash;
+                let f = self.nor()?;
+                let id = f.jedec_id().map_err(|_| "RDID failed")?;
+                let sr = f.status().map_err(|_| "RDSR failed")?;
+                info.info(format_args!(
+                    "JEDEC ID {:02x} {:02x} {:02x}, SR1 0x{sr:02x}",
+                    id[0], id[1], id[2]
+                ));
+                Ok(None)
+            }
+            #[cfg(feature = "fastboot-nor-write")]
+            "nor-arm" => {
+                let (p, op) = self.guard.arm(rest, now_ms())?;
+                println!("[fastboot] NOR armed: {} {op:?}", p.name);
+                info.info(format_args!(
+                    "armed: {} {:?} (next flash/erase only, 60 s)",
+                    p.name, op
+                ));
+                Ok(None)
+            }
+            _ => Err("unknown oem command (oem help)"),
+        }
+    }
+}
+
+/// Why fastboot gave the board back to FEL.
+#[derive(Clone, Copy, Debug)]
+pub enum Back {
+    /// `reboot-bootloader` or `oem fel`.
+    Asked = 1,
+    /// The USB sessions kept failing.
+    Usb = 2,
+}
+
+/// Serve fastboot until the host boots a bundle (no return), resets the
+/// board (no return), or asks for FEL (returns; the caller puts the ROM's
+/// USB set-up back and returns to the ROM).
+pub fn run(b: &Bringup) -> Back {
+    let mut hex = [0u8; 16];
+    let serial = usb::serial(soc::chip_sid(), &mut hex);
+    let desc = usb::Descriptors {
+        vendor: usb::FASTBOOT_VID,
+        product: usb::FASTBOOT_PID,
+        class: usb::FASTBOOT_CLASS,
+        strings: ["oreboot", "Radxa Cubie A7A bt0", serial, "fastboot"],
+    };
+    let max = BUF_MAX.min(b.dram_end.saturating_sub(BUF + 0x10_0000));
+    // SAFETY: DRAM bt0 tested and owns; nothing else uses this range.
+    let buf = unsafe { core::slice::from_raw_parts_mut(BUF as *mut u8, max) };
+    for session in 1..=SESSIONS {
+        let (mut usb, found) = Musb::take_over(desc);
+        println!(
+            "[fastboot] USB0 {} (ROM: POWER {:#04x} FADDR {} ISCR {:#010x}, CCU USB0 {:#010x}/{:#010x}); \
+             fastboot 18d1:4ee0 serial {serial}, download buffer 0x{BUF:08x} + 0x{max:x}",
+            if found.rom_ready { "taken over from the mask ROM" } else { "brought up (the ROM had it off)" },
+            found.rom_power,
+            found.rom_faddr,
+            found.iscr,
+            found.usb0_clk,
+            found.usb0_bgr
+        );
+        let mut dev = A7a {
+            b,
+            serial,
+            guard: nor::Guard::new(cfg!(feature = "fastboot-nor-write")),
+            #[cfg(feature = "fastboot-nor-write")]
+            nor: None,
+        };
+        let r = proto::serve(&mut Speed(&mut usb), &mut dev, buf);
+        match r {
+            Ok(Exit::Boot(plan)) => {
+                musb::release();
+                println!("[fastboot] boot: USB0 off the bus, copying the images");
+                execute(b, plan)
+            }
+            Ok(Exit::Reset) => {
+                musb::release();
+                println!("[fastboot] reboot: watchdog reset");
+                cubie_a7a_common::uart::Uart::attach(crate::UART0_BASE).drain();
+                soc::watchdog_reset()
+            }
+            Ok(Exit::Bootloader) => {
+                println!("[fastboot] back to the mask ROM's FEL");
+                return Back::Asked;
+            }
+            Err(e) => {
+                println!("[fastboot] USB session {session} ended: {e:?}; enumerating again");
+            }
+        }
+    }
+    println!("[fastboot] giving up after {SESSIONS} USB sessions; back to FEL");
+    Back::Usb
+}
+
+/// The controller, with the negotiated speed noted for `getvar` and the
+/// download rate on the console.
+struct Speed<'u, 'a>(&'u mut Musb<'a>);
+
+impl proto::Transport for Speed<'_, '_> {
+    type Error = musb::Error;
+    fn wait_configured(&mut self) -> Result<(), musb::Error> {
+        let r = self.0.wait_configured();
+        HIGH_SPEED.store(self.0.high_speed(), Ordering::Relaxed);
+        r
+    }
+    fn recv(&mut self, out: &mut [u8]) -> Result<usize, musb::Error> {
+        self.0.recv(out)
+    }
+    fn recv_exact(&mut self, out: &mut [u8]) -> Result<(), musb::Error> {
+        let t0 = soc::time_us();
+        let r = self.0.recv_exact(out);
+        let us = (soc::time_us() - t0).max(1);
+        match r {
+            Ok(()) => {
+                println!(
+                    "[fastboot] downloaded {} bytes in {} ms ({} KiB/s)",
+                    out.len(),
+                    us / 1000,
+                    out.len() as u64 * 1_000_000 / 1024 / us
+                );
+            }
+            Err(e) => {
+                println!("[fastboot] download failed: {e:?}");
+            }
+        }
+        r
+    }
+    fn send(&mut self, data: &[u8]) -> Result<(), musb::Error> {
+        self.0.send(data)
+    }
+    fn disconnect(&mut self) -> Result<(), musb::Error> {
+        self.0.disconnect()
+    }
+    fn is_reset(e: &musb::Error) -> bool {
+        <Musb as proto::Transport>::is_reset(e)
+    }
+    fn log(&mut self, dir: &str, line: &[u8]) {
+        self.0.log(dir, line)
+    }
+}

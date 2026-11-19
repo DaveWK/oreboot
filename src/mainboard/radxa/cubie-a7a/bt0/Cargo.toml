@@ -71,6 +71,18 @@ fel = ["cubie-a7a-dram/vendor-vdd2l"]
 # offsets. Same DRAM rails as the FEL boot that runs on the board; combine
 # with the DRAM backend (dramlib). Excludes `fel`.
 spinor = ["cubie-a7a-dram/vendor-vdd2l"]
+# fastboot over FEL (src/fastboot.rs, src/musb.rs; scripts/fastboot-boot.sh
+# in radxa-a7a-workspace): FEL entry 4 at 0x9004c brings DRAM up (unless
+# entry 1 did), takes USB0 over from the mask ROM and serves the stock
+# fastboot tool (18d1:4ee0): getvar, download, boot/continue of a layout
+# bundle (the FEL entry 2 hand-over), reboot, reboot-bootloader (back to
+# FEL), oem log/read32/fel. No SPI NOR code is built in.
+fastboot = ["fel", "dep:cubie-a7a-fastboot"]
+# fastboot flash/erase of the SPI NOR partitions (bt0, layout, main, edk2)
+# behind cubie_a7a_fastboot::nor's guards (oem nor-arm with the image's
+# length and CRC-32, JEDEC ID, no protection bits, erase/program/read-back
+# inside the partition, never at or above 0x700000). Bench builds only.
+fastboot-nor-write = ["fastboot"]
 # The blobless probe at pstate 3 (the lowest) instead of 1, the
 # timing-independence test of the data-mode compare.
 probe-ps3 = ["blobless"]
@@ -80,6 +92,7 @@ log = { path = "../../../../lib/log" }
 util = { path = "../../../../lib/util" }
 cubie-a7a-common = { path = "../common" }
 cubie-a7a-dram = { path = "../dram" }
+cubie-a7a-fastboot = { path = "../fastboot", optional = true }
 
 [build-dependencies]
 sha256 = { path = "../../../../lib/sha256" }

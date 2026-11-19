@@ -27,9 +27,9 @@ const DSU_PLL: usize = CPU_PLL_CFG_BASE + 0x3000;
 pub const UART0_BGR: usize = CCU_BASE + 0xe00;
 pub const SMHC0_CLK: usize = CCU_BASE + 0xd00;
 pub const SMHC0_BGR: usize = CCU_BASE + 0xd0c;
-#[cfg(feature = "spinor")]
+#[cfg(any(feature = "spinor", feature = "fastboot-nor-write"))]
 pub const SPI0_CLK: usize = CCU_BASE + 0xf00;
-#[cfg(feature = "spinor")]
+#[cfg(any(feature = "spinor", feature = "fastboot-nor-write"))]
 pub const SPI0_BGR: usize = CCU_BASE + 0xf04;
 pub const R_TWI0_BGR: usize = R_PRCM_BASE + 0x19c;
 

@@ -10,10 +10,13 @@
 //! work unchanged: table at `layout::TABLE_OFFSET` (0x1ff000), oreboot
 //! main at 0x200000, the EDK2 FD at 0x300000, all below the 8 MiB end.
 //!
-//! Read-only by construction: the only opcodes this module ever puts in
-//! the TX FIFO are READ (0x03) and RDID (0x9f). Each command is loaded
-//! after a FIFO reset, and the data phase sends no TX bytes (MTC = command
-//! length), so no other byte can reach the flash as an opcode.
+//! Read-only by construction unless built with `fastboot-nor-write`: the
+//! only opcodes the read path ever puts in the TX FIFO are READ (0x03) and
+//! RDID (0x9f). Each command is loaded after a FIFO reset, and the data
+//! phase sends no TX bytes (MTC = command length), so no other byte can
+//! reach the flash as an opcode. The erase/program part at the end of this
+//! file exists only in `fastboot-nor-write` builds (fastboot `flash` and
+//! `erase` behind cubie_a7a_fastboot::nor's guards).
 //!
 //! Controller settings are the ones the read-only FEL dump of this NOR used
 //! (two identical 8 MiB passes): SYS_CLK24M / 4 = 6 MHz,
@@ -69,11 +72,17 @@ const CMD_TIMEOUT_US: u64 = 1_000_000;
 
 // Fields are only read through Debug when reporting failures.
 #[allow(dead_code)]
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub enum Error {
     Timeout { what: &'static str, fsr: u32 },
     Range { offset: u32, len: usize },
     Fifo(u32),
+    /// A write-side guard in this driver refused (never sent).
+    #[cfg(feature = "fastboot-nor-write")]
+    Refused(&'static str),
+    /// Status register 1 after WREN or a busy timeout.
+    #[cfg(feature = "fastboot-nor-write")]
+    Status(u8),
 }
 
 pub struct SpiNor;
@@ -189,5 +198,183 @@ impl SpiNor {
             addr += chunk.len() as u32;
         }
         Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Erase and program (feature `fastboot-nor-write`, for fastboot's guarded
+// `flash`/`erase`; cubie_a7a_fastboot::nor has the guards and the plan).
+// Built for the bench only.
+//
+// Opcodes this part can send, besides READ and RDID above: 06 WREN, 05 RDSR1,
+// 20 4 KiB sector erase, D8 64 KiB block erase, 02 page program. No chip
+// erase (C7/60), no status or configuration register write (01/31/11), no
+// security/OTP register access, no lock, reset, 4-byte or quad command
+// exists here. Every erase and program checks its range against the write
+// window again, and WEL must read back set after each WREN.
+
+#[cfg(feature = "fastboot-nor-write")]
+mod write {
+    use cubie_a7a_fastboot::nor::{self, NorFlash};
+    use util::mmio::{read32, read8, write32, write8};
+
+    use super::*;
+
+    const OP_WREN: u8 = 0x06;
+    const OP_RDSR1: u8 = 0x05;
+    const OP_SE: u8 = 0x20;
+    const OP_BE: u8 = 0xd8;
+    const OP_PP: u8 = 0x02;
+    const FIFO_DEPTH: u32 = 64;
+    /// W25Q64FW maxima: sector erase 400 ms, block erase 2 s, page 3 ms.
+    const ERASE_TIMEOUT_US: u64 = 3_000_000;
+    const PROGRAM_TIMEOUT_US: u64 = 50_000;
+
+    fn allowed(op: u8) -> bool {
+        matches!(op, OP_READ | OP_RDID | OP_WREN | OP_RDSR1 | OP_SE | OP_BE | OP_PP)
+    }
+
+    impl SpiNor {
+        /// One command, CS low throughout: `hdr` (opcode and address, 1 to 4
+        /// bytes), `tx` data bytes, then `rx.len()` bytes clocked in. The TX
+        /// FIFO is refilled while the burst runs; every clocked byte also
+        /// lands in the RX FIFO (TP_EN pauses the clock while it is full).
+        fn xfer(&self, hdr: &[u8], tx: &[u8], rx: &mut [u8]) -> Result<(), Error> {
+            if hdr.is_empty() || hdr.len() > 4 || !allowed(hdr[0]) {
+                return Err(Error::Refused("opcode not allowed"));
+            }
+            write32(FCR, FCR_RF_RST | FCR_TF_RST);
+            wait_clear(FCR, FCR_RF_RST | FCR_TF_RST, "FIFO reset")?;
+            let fsr = read32(FSR);
+            if fsr & (FSR_RF_CNT | FSR_TF_CNT) != 0 {
+                return Err(Error::Fifo(fsr));
+            }
+            let ntx = hdr.len() + tx.len();
+            let total = ntx + rx.len();
+            let byte = |i: usize| if i < hdr.len() { hdr[i] } else { tx[i - hdr.len()] };
+            let mut sent = 0;
+            while sent < ntx && sent < FIFO_DEPTH as usize {
+                write8(TXD, byte(sent));
+                sent += 1;
+            }
+            write32(ISR, 0xffff_ffff);
+            write32(MBC, total as u32);
+            write32(MTC, ntx as u32);
+            write32(BCC, ntx as u32);
+            cs(false);
+            write32(TCR, read32(TCR) | TCR_XCH);
+            let t0 = time_us();
+            let mut got = 0;
+            while got < total {
+                while sent < ntx && (read32(FSR) & FSR_TF_CNT) >> 16 < FIFO_DEPTH {
+                    write8(TXD, byte(sent));
+                    sent += 1;
+                }
+                let n = (read32(FSR) & FSR_RF_CNT) as usize;
+                for _ in 0..n.min(total - got) {
+                    let b = read8(RXD);
+                    if got >= ntx {
+                        rx[got - ntx] = b;
+                    }
+                    got += 1;
+                }
+                if n == 0 && time_us() - t0 > CMD_TIMEOUT_US {
+                    cs(true);
+                    return Err(Error::Timeout {
+                        what: "transfer",
+                        fsr: read32(FSR),
+                    });
+                }
+            }
+            let done = wait_clear(TCR, TCR_XCH, "burst end");
+            cs(true);
+            done
+        }
+
+        fn rdsr1(&self) -> Result<u8, Error> {
+            let mut sr = [0u8];
+            self.xfer(&[OP_RDSR1], &[], &mut sr)?;
+            Ok(sr[0])
+        }
+
+        /// WREN, then WEL must be set and no protection bit.
+        fn write_enable(&self) -> Result<(), Error> {
+            self.xfer(&[OP_WREN], &[], &mut [])?;
+            let sr = self.rdsr1()?;
+            if sr & nor::SR1_PROTECT != 0 {
+                return Err(Error::Status(sr));
+            }
+            if sr & nor::SR1_WEL == 0 {
+                return Err(Error::Status(sr));
+            }
+            Ok(())
+        }
+
+        fn wait_ready(&self, timeout_us: u64) -> Result<(), Error> {
+            let t0 = time_us();
+            loop {
+                let sr = self.rdsr1()?;
+                if sr & nor::SR1_BUSY == 0 {
+                    return Ok(());
+                }
+                recovery::kick();
+                if time_us() - t0 > timeout_us {
+                    return Err(Error::Status(sr));
+                }
+            }
+        }
+    }
+
+    fn addr(op: u8, a: u32) -> [u8; 4] {
+        let b = a.to_be_bytes();
+        [op, b[1], b[2], b[3]]
+    }
+
+    impl NorFlash for SpiNor {
+        type Error = Error;
+
+        fn jedec_id(&mut self) -> Result<[u8; 3], Error> {
+            self.id()
+        }
+
+        fn status(&mut self) -> Result<u8, Error> {
+            self.rdsr1()
+        }
+
+        fn read(&mut self, offset: u32, buf: &mut [u8]) -> Result<(), Error> {
+            SpiNor::read(self, offset, buf)
+        }
+
+        fn erase(&mut self, offset: u32, len: u32) -> Result<(), Error> {
+            let op = match len {
+                nor::SECTOR => OP_SE,
+                nor::BLOCK => OP_BE,
+                _ => return Err(Error::Refused("erase size")),
+            };
+            if !offset.is_multiple_of(len) || !nor::in_window(offset, len) {
+                return Err(Error::Refused("erase outside the write window"));
+            }
+            self.write_enable()?;
+            self.xfer(&addr(op, offset), &[], &mut [])?;
+            self.wait_ready(ERASE_TIMEOUT_US)
+        }
+
+        fn program(&mut self, offset: u32, data: &[u8]) -> Result<(), Error> {
+            let n = data.len() as u32;
+            if n == 0
+                || n > nor::PAGE
+                || offset / nor::PAGE != (offset + n - 1) / nor::PAGE
+                || !nor::in_window(offset, n)
+            {
+                return Err(Error::Refused("program outside one page of the write window"));
+            }
+            self.write_enable()?;
+            self.xfer(&addr(OP_PP, offset), data, &mut [])?;
+            self.wait_ready(PROGRAM_TIMEOUT_US)
+        }
+
+        fn kick(&mut self) {
+            recovery::kick();
+        }
     }
 }

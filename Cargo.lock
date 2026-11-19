@@ -408,6 +408,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "cubie-a7a-fastboot"
+version = "0.1.0"
+dependencies = [
+ "bootlayout",
+ "cubie-a7a-common",
+]
+
+[[package]]
 name = "d1-pac"
 version = "0.0.31"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -914,6 +922,7 @@ dependencies = [
  "bootlog",
  "cubie-a7a-common",
  "cubie-a7a-dram",
+ "cubie-a7a-fastboot",
  "log 0.1.0",
  "sha256",
  "util",

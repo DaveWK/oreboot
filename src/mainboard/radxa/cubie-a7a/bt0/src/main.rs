@@ -9,7 +9,9 @@
 //! With feature `fel` the same bring-up runs from the mask ROM's USB FEL
 //! mode instead, and the host supplies what the SD card would (fel.rs).
 //! With feature `spinor` the mask ROM loads it from the SPI NOR, and bt0
-//! reads the layout table and the images from there (spinor.rs).
+//! reads the layout table and the images from there (spinor.rs). Feature
+//! `fastboot` (with `fel`) adds FEL entry 4: bt0 serves the stock fastboot
+//! tool on the USB-C port (fastboot.rs, musb.rs).
 #![no_std]
 #![no_main]
 #![cfg_attr(feature = "dramlib", feature(c_variadic))]
@@ -41,16 +43,20 @@ mod axp;
 mod ccu;
 mod dram;
 mod dvfs;
+#[cfg(feature = "fastboot")]
+mod fastboot;
 #[cfg(feature = "fel")]
 mod fel;
 mod gpadc;
 mod gpio;
 #[cfg(feature = "fel")]
 mod lab;
+#[cfg(feature = "fastboot")]
+mod musb;
 mod recovery;
 mod smhc;
 mod soc;
-#[cfg(feature = "spinor")]
+#[cfg(any(feature = "spinor", feature = "fastboot-nor-write"))]
 mod spinor;
 
 use gpio::{Port, Pull};
