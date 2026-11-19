@@ -10,9 +10,13 @@
 //! clock.
 //!
 //! The code in the table is [`VENDOR_VREF_DAC`]: not ours. Build
-//! variable `A7A_VREF_INIT=<hex>` (FEL lab) replaces it at all 156 CSRs,
-//! to measure whether a code of our own does as well; unset, the table and
-//! the image are what they were.
+//! variable `A7A_VREF_INIT=<hex>` (one or two hex digits without `0x`,
+//! `00..7f`, FEL lab) replaces it at all 156 CSRs, to measure whether a
+//! code of our own does as well; unset, the table and the image are what
+//! they were. In a build with feature `boot-profile`, `A7A_VREF_INIT=-`
+//! ([`crate::knobs::profile::UNSET`]) also means unset through
+//! [`crate::knob!`]; without `boot-profile`, `"-"` reaches [`parse`] raw
+//! and is rejected as not hex.
 //!
 //! Register names and the 7-bit field are those of the EIC7700X TRM Part 2
 //! register list (public; another SoC with the same DWC LPDDR5/4 PHY
@@ -86,10 +90,18 @@ impl VrefInitError {
     }
 }
 
-/// The VrefDAC code step C writes in a build whose `A7A_VREF_INIT` is
-/// `text`: unset, [`VENDOR_VREF_DAC`]; else the code `text` names,
-/// one or two hex digits, at most [`VREF_DAC_MAX`]. Anything else is
-/// refused (the build fails), never ignored or clamped.
+/// The VrefDAC code step C writes in a build whose resolved
+/// `A7A_VREF_INIT` knob is `text`: `None` gives [`VENDOR_VREF_DAC`]; else
+/// the code `text` names, one or two hex digits without `0x`, at most
+/// [`VREF_DAC_MAX`] (`00..7f`). Anything else is refused (the build fails),
+/// never ignored or clamped.
+///
+/// With feature `boot-profile`, [`crate::knob!`] runs
+/// [`crate::knobs::profile::resolve`] before this parser, mapping
+/// [`crate::knobs::profile::UNSET`] (`"-"`) in the environment to `None`
+/// (so `A7A_VREF_INIT=-` yields [`VENDOR_VREF_DAC`]). Without
+/// `boot-profile`, [`crate::knob!`] passes `option_env!` raw, so `"-"` is
+/// refused here with [`VrefInitError::NotHex`].
 #[inline]
 pub const fn parse(text: Option<&str>) -> Result<u16, VrefInitError> {
     let Some(text) = text else {
@@ -117,14 +129,22 @@ pub const fn parse(text: Option<&str>) -> Result<u16, VrefInitError> {
     Ok(v)
 }
 
-/// The VrefDAC code of this build's `tables::C_PSTATE` ([`parse`] of
-/// `A7A_VREF_INIT`). The table is a constant of the image, so the knob is
-/// a build variable only: the lab mode's run-time knobs
+/// The VrefDAC code for a build whose resolved `A7A_VREF_INIT` knob (as
+/// returned by [`crate::knob!`]) is `resolved`. Panics at compile time
+/// with [`VrefInitError::message`] if [`parse`] rejects `resolved`.
+#[inline]
+pub const fn value(resolved: Option<&str>) -> u16 {
+    match parse(resolved) {
+        Ok(v) => v,
+        Err(why) => panic!("{}", why.message()),
+    }
+}
+
+/// The VrefDAC code of this build's `tables::C_PSTATE` ([`value`] of
+/// `crate::knob!("A7A_VREF_INIT")`). The table is a constant of the image,
+/// so the knob is a build variable only: the lab mode's run-time knobs
 /// (`crate::knobs::EXTRA`) do not have it.
-pub const VREF_DAC_INIT: u16 = match parse(crate::knob!("A7A_VREF_INIT")) {
-    Ok(v) => v,
-    Err(why) => panic!("{}", why.message()),
-};
+pub const VREF_DAC_INIT: u16 = value(crate::knob!("A7A_VREF_INIT"));
 
 #[cfg(test)]
 mod tests {
