@@ -22,6 +22,12 @@
 //! | 9 FILL | base, bytes, seed | ms |
 //! | 10 CHECK | base, bytes, seed | as MEMTEST |
 //! | 11 MRW | channel, rank, mr, value | 0, or 0xdead_0000 \| error |
+//! | 12 PTEST | base, bytes, mode | errors, first address, wanted, got, OR of all xors, bit-28 0->1 count, bit-28 1->0 count, first bit-28 address, ms |
+//!
+//! PTEST modes (fill the whole range, then check it): 0 address in
+//! address, 1 its inverse, 2 checkerboard 0x5555_5555/0xaaaa_aaaa by word,
+//! 3 its inverse, 4 walking one (bit = word index mod 32), 5 walking zero,
+//! 6 bit 28 alone toggling by word (rest 0), 7 its inverse (rest 1).
 //!
 //! PHY CSRs are given as their APB address (0x20000 = MASTER); the CPU
 //! address is `0x0A900000 + 2 * csr`. The CSR mux (MicroContMuxSel) is not
@@ -49,6 +55,7 @@ pub mod op {
     pub const FILL: u32 = 9;
     pub const CHECK: u32 = 10;
     pub const MRW: u32 = 11;
+    pub const PTEST: u32 = 12;
 }
 
 const PHY_BASE: usize = 0x0a90_0000;
@@ -123,6 +130,93 @@ fn fill(base: usize, bytes: usize, seed: u32) {
     }
 }
 
+fn ptest_word(addr: usize, mode: u32) -> u32 {
+    let a = addr as u32;
+    let w = a >> 2;
+    match mode {
+        0 => a,
+        1 => !a,
+        2 => {
+            if w & 1 == 0 {
+                0x5555_5555
+            } else {
+                0xaaaa_aaaa
+            }
+        }
+        3 => {
+            if w & 1 == 0 {
+                0xaaaa_aaaa
+            } else {
+                0x5555_5555
+            }
+        }
+        4 => 1 << (w & 31),
+        5 => !(1 << (w & 31)),
+        6 => {
+            if w & 1 == 0 {
+                1 << 28
+            } else {
+                0
+            }
+        }
+        _ => {
+            if w & 1 == 0 {
+                !(1 << 28)
+            } else {
+                !0
+            }
+        }
+    }
+}
+
+/// PTEST: fill `bytes` at `base` with `mode`'s pattern, then check it.
+/// Errors, first address, wanted, got, OR of all xors, bit-28 0->1 and
+/// 1->0 counts, first address with bit 28 wrong.
+fn ptest(base: usize, bytes: usize, mode: u32) -> [u32; 8] {
+    let end = base + bytes;
+    let mut a = base;
+    while a < end {
+        let stop = a + (end - a).min(1 << 20);
+        while a < stop {
+            unsafe { core::ptr::write_volatile(a as *mut u32, ptest_word(a, mode)) };
+            a += 4;
+        }
+        recovery::kick();
+    }
+    let mut r = [0u32; 8];
+    let mut a = base;
+    while a < end {
+        let stop = a + (end - a).min(1 << 20);
+        while a < stop {
+            let want = ptest_word(a, mode);
+            let got = unsafe { core::ptr::read_volatile(a as *const u32) };
+            let x = got ^ want;
+            if x != 0 {
+                if r[0] == 0 {
+                    r[1] = a as u32;
+                    r[2] = want;
+                    r[3] = got;
+                }
+                r[0] = r[0].saturating_add(1);
+                r[4] |= x;
+                if x & (1 << 28) != 0 {
+                    if r[5] == 0 && r[6] == 0 {
+                        r[7] = a as u32;
+                    }
+                    if got & (1 << 28) != 0 {
+                        r[5] = r[5].saturating_add(1);
+                    } else {
+                        r[6] = r[6].saturating_add(1);
+                    }
+                }
+            }
+            a += 4;
+        }
+        recovery::kick();
+    }
+    r
+}
+
 /// Errors, first address, wanted, got, OR of all xors.
 fn check(base: usize, bytes: usize, seed: u32) -> [u32; 5] {
     let mut r = [0u32; 5];
@@ -163,7 +257,7 @@ pub fn run() -> (u32, u32, u32) {
             op::END => return (ops, out.n as u32, 0),
             op::W16 | op::W32 | op::R16N => 2,
             op::R16 | op::R32 | op::DELAY => 1,
-            op::MEMTEST | op::MRR | op::FILL | op::CHECK => 3,
+            op::MEMTEST | op::MRR | op::FILL | op::CHECK | op::PTEST => 3,
             op::MRW => 4,
             _ => return (ops, out.n as u32, 0x100 | opc),
         };
@@ -193,6 +287,13 @@ pub fn run() -> (u32, u32, u32) {
                 }
                 let r = check(base, bytes, seed);
                 for v in r {
+                    out.push(v);
+                }
+                out.push(ms_since(t0));
+            }
+            op::PTEST => {
+                let t0 = soc::ticks();
+                for v in ptest(a(0) as usize, a(1) as usize & !3, a(2)) {
                     out.push(v);
                 }
                 out.push(ms_since(t0));
