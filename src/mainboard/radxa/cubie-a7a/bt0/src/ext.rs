@@ -30,7 +30,19 @@ use crate::{ehci, smhc, soc};
 pub struct UsbDisk {
     host: ehci::Ehci,
     disk: msc::Disk,
-    parts: [Option<gpt::Part>; gpt::MAX_PARTS],
+    parts: GptParts,
+}
+
+type GptParts = Result<[Option<gpt::Part>; gpt::MAX_PARTS], &'static str>;
+
+fn gpt_part(parts: &GptParts, index: usize) -> Result<gpt::Part, &'static str> {
+    parts
+        .as_ref()
+        .map_err(|e| *e)?
+        .get(index.checked_sub(1).ok_or("no such GPT partition")?)
+        .copied()
+        .flatten()
+        .ok_or("no such GPT partition")
 }
 
 /// DRAM for the GPT reads (not the download buffer: `getvar` may open the
@@ -57,26 +69,19 @@ pub fn usb_open() -> Result<UsbDisk, &'static str> {
     // SAFETY: DRAM reserved for this (ehci::DMA layout).
     let g = unsafe { core::slice::from_raw_parts_mut(GPT_BUF as *mut u8, GPT_BUF_LEN) };
     let bs = disk.block_size as usize;
-    let mut parts = [None; gpt::MAX_PARTS];
-    let note = match disk
+    let parts = disk
         .read(&mut host, 1, &mut g[..bs])
         .map_err(|e| e.message())
         .and_then(|()| {
-            let h = gpt::header(&g[..bs], disk.blocks)?;
-            let n = gpt::entries_len(&h).div_ceil(bs) * bs;
-            if n > GPT_BUF_LEN {
-                return Err("GPT entry array too large");
-            }
-            disk.read(&mut host, h.entries_lba, &mut g[..n])
+            let h = gpt::header(&mut g[..bs], disk.blocks)?;
+            let array = g
+                .get_mut(..h.entries_read_len())
+                .ok_or("GPT entry array too large")?;
+            disk.read(&mut host, h.entries_lba, array)
                 .map_err(|e| e.message())?;
-            gpt::parts(&h, &g[..n], disk.blocks)
-        }) {
-        Ok(p) => {
-            parts = p;
-            "GPT ok"
-        }
-        Err(e) => e,
-    };
+            gpt::parts(&h, array, disk.blocks)
+        });
+    let note = parts.as_ref().map_or_else(|e| *e, |_| "GPT ok");
     println!(
         "[fastboot] usb0: {:04x}:{:04x} '{}', {} blocks of {} ({} MiB), {note}, {} ms (RESCAL_CTRL was {:#010x})",
         found.vid,
@@ -99,10 +104,7 @@ pub fn usb_extent(u: &UsbDisk, part: Option<usize>) -> Result<(u64, u64), &'stat
     match part {
         None => Ok((0, u.disk.blocks * bs)),
         Some(i) => {
-            let p = i
-                .checked_sub(1)
-                .and_then(|i| u.parts.get(i).copied().flatten())
-                .ok_or("no such GPT partition on usb0")?;
+            let p = gpt_part(&u.parts, i)?;
             Ok((p.first * bs, (p.last - p.first + 1) * bs))
         }
     }
@@ -143,16 +145,7 @@ pub fn usb_info(u: &UsbDisk, info: &mut dyn Info) {
         "{}",
         core::str::from_utf8(&d.ident).unwrap_or("?").trim_end()
     ));
-    for (i, p) in u.parts.iter().enumerate() {
-        if let Some(p) = p {
-            info.info(format_args!(
-                "usb0p{}: blocks {}..={}",
-                i + 1,
-                p.first,
-                p.last
-            ));
-        }
-    }
+    gpt_info(&u.parts, "usb0p", info);
 }
 
 #[inline(never)]
@@ -219,7 +212,7 @@ pub struct Emmc {
     host: smhc::Smhc,
     card: emmc::Card,
     ext: [u32; emmc::WORDS],
-    parts: [Option<gpt::Part>; gpt::MAX_PARTS],
+    parts: GptParts,
 }
 
 const EMMC_WRITE: bool = cfg!(feature = "fastboot-emmc-write");
@@ -234,28 +227,26 @@ pub fn emmc_open() -> Result<Emmc, &'static str> {
         println!("[fastboot] emmc: {e:?}");
         e.message()
     })?;
-    let mut parts = [None; gpt::MAX_PARTS];
     // SAFETY: DRAM reserved for GPT reads (as usb_open).
     let g = unsafe { core::slice::from_raw_parts_mut(GPT_BUF as *mut u32, GPT_BUF_LEN / 4) };
-    let note = match card
+    let parts = card
         .read(&mut host, Part::User, 1, &mut g[..emmc::WORDS])
         .map_err(|e| e.message())
         .and_then(|()| {
-            let h = gpt::header(words_as_bytes(&g[..emmc::WORDS]), card.user_blocks)?;
-            let n = gpt::entries_len(&h).div_ceil(emmc::BLOCK) * emmc::BLOCK;
-            if n > GPT_BUF_LEN {
-                return Err("GPT entry array too large");
-            }
-            card.read(&mut host, Part::User, h.entries_lba, &mut g[..n / 4])
+            let header = &mut g[..emmc::WORDS];
+            // SAFETY: bytes of the initialized header words, only borrowed for parsing.
+            let header = unsafe {
+                core::slice::from_raw_parts_mut(header.as_mut_ptr().cast::<u8>(), emmc::BLOCK)
+            };
+            let h = gpt::header(header, card.user_blocks)?;
+            let array = g
+                .get_mut(..h.entries_read_len() / 4)
+                .ok_or("GPT entry array too large")?;
+            card.read(&mut host, Part::User, h.entries_lba, array)
                 .map_err(|e| e.message())?;
-            gpt::parts(&h, words_as_bytes(&g[..n / 4]), card.user_blocks)
-        }) {
-        Ok(p) => {
-            parts = p;
-            "GPT ok"
-        }
-        Err(e) => e,
-    };
+            gpt::parts(&h, words_as_bytes(array), card.user_blocks)
+        });
+    let note = parts.as_ref().map_or_else(|e| *e, |_| "GPT ok");
     let f = card.fields;
     println!(
         "[fastboot] emmc: CID {:08x}{:08x}{:08x}{:08x}, {} MiB, boot 2 x {} KiB, EXT_CSD rev {}, \
@@ -304,10 +295,7 @@ fn emmc_extent(d: &Emmc, name: &str) -> Result<(Option<Part>, u64, u64), &'stati
                 .strip_prefix("emmcp")
                 .and_then(|n| n.parse::<usize>().ok())
                 .ok_or("unknown eMMC partition")?;
-            let p = i
-                .checked_sub(1)
-                .and_then(|i| d.parts.get(i).copied().flatten())
-                .ok_or("no such GPT partition on the eMMC")?;
+            let p = gpt_part(&d.parts, i)?;
             Ok((Some(Part::User), p.first * b, (p.last - p.first + 1) * b))
         }
     }
@@ -387,10 +375,21 @@ pub fn emmc_info(d: &Emmc, info: &mut dyn Info) {
         f.rst_n,
         f.partition_setting_completed
     ));
-    for (i, p) in d.parts.iter().enumerate() {
+    gpt_info(&d.parts, "emmcp", info);
+}
+
+fn gpt_info(parts: &GptParts, prefix: &str, info: &mut dyn Info) {
+    let entries = match parts {
+        Ok(entries) => entries,
+        Err(e) => {
+            info.info(format_args!("GPT unavailable: {e}"));
+            return;
+        }
+    };
+    for (i, p) in entries.iter().enumerate() {
         if let Some(p) = p {
             info.info(format_args!(
-                "emmcp{}: blocks {}..={}",
+                "{prefix}{}: blocks {}..={}",
                 i + 1,
                 p.first,
                 p.last

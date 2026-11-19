@@ -788,6 +788,16 @@ mod tests {
             buf: &mut [u8],
             _info: &mut dyn Info,
         ) -> Result<core::ops::Range<usize>, &'static str> {
+            if part == "usb0p1" {
+                // Model the board's partition lookup with a disk whose array
+                // starts in the last sector but extends past the disk.
+                let (mut header, entries) = crate::gpt::build(1024, &[(50, 60)]);
+                header[72..80].copy_from_slice(&1023u64.to_le_bytes());
+                crate::gpt::fix_header_crc(&mut header);
+                let hdr = crate::gpt::header(&mut header, 1024)?;
+                crate::gpt::parts(&hdr, &entries, 1024)?;
+                return Err("test: invalid geometry accepted");
+            }
             // A 0x3000-byte device whose bytes are their offset's low byte.
             if part != "dev" {
                 return Err("unknown partition");
@@ -1170,6 +1180,17 @@ mod tests {
         // The model's continue boots "nothing" (0) when no image is staged.
         assert_eq!(run(&mut h, &mut b), Ok(Exit::Boot(0)));
         assert_eq!(b.booted_len, None);
+    }
+
+    #[test]
+    fn bad_gpt_geometry_fails_fetch_but_not_session() {
+        let mut h = Host::new(&["fetch:usb0p1", "getvar:version", "reboot-bootloader"]);
+        assert_eq!(run(&mut h, &mut Board::default()), Ok(Exit::Bootloader));
+        assert_eq!(
+            h.replies,
+            ["FAILGPT entry array outside the disk", "OKAY0.4", "OKAY"]
+        );
+        assert!(h.uploaded.is_empty());
     }
 
     #[test]

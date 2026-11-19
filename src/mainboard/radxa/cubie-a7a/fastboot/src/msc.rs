@@ -230,11 +230,14 @@ impl Disk {
             }
             let mut b8 = [0u8; 8];
             b8.copy_from_slice(&cap16[..8]);
-            d.blocks = u64::from_be_bytes(b8) + 1;
+            d.blocks = u64::from_be_bytes(b8).checked_add(1).ok_or(Error::Range)?;
             d.block_size = u32::from_be_bytes([cap16[8], cap16[9], cap16[10], cap16[11]]);
         }
-        if !matches!(d.block_size, 512 | 1024 | 2048 | 4096) {
-            return Err(Error::Unsupported("block size not 512..4096"));
+        if !crate::gpt::valid_block_size(d.block_size) {
+            return Err(Error::Unsupported("unsupported logical block size"));
+        }
+        if d.blocks.checked_mul(d.block_size as u64).is_none() {
+            return Err(Error::Range);
         }
         Ok(d)
     }
@@ -286,6 +289,7 @@ pub(crate) mod model {
     pub struct DiskModel {
         pub blocks: u64,
         pub block_size: u32,
+        pub capacity16_last: Option<u64>,
         pub not_ready: u32,
         pub stall_data_once: bool,
         pub short_data_once: bool,
@@ -303,6 +307,7 @@ pub(crate) mod model {
             DiskModel {
                 blocks,
                 block_size,
+                capacity16_last: None,
                 not_ready: 0,
                 stall_data_once: false,
                 short_data_once: false,
@@ -374,7 +379,11 @@ pub(crate) mod model {
                     (d, 0)
                 }
                 SERVICE_ACTION_IN_16 => {
-                    let mut d = (self.blocks - 1).to_be_bytes().to_vec();
+                    let mut d = self
+                        .capacity16_last
+                        .unwrap_or(self.blocks - 1)
+                        .to_be_bytes()
+                        .to_vec();
                     d.extend_from_slice(&self.block_size.to_be_bytes());
                     d.resize(32, 0);
                     (d, 0)
@@ -498,6 +507,29 @@ mod tests {
             d.read(&mut m, 0, &mut buf[..100]),
             Err(Error::Unsupported("partial block"))
         );
+    }
+
+    #[test]
+    fn read_capacity_rejects_overflow() {
+        let mut m = DiskModel::new(u32::MAX as u64 + 1, 4096);
+        for last in [u64::MAX, u64::MAX / 4096] {
+            m.capacity16_last = Some(last);
+            assert_eq!(Disk::open(&mut m, 0), Err(Error::Range));
+        }
+    }
+
+    #[test]
+    fn supported_logical_block_sizes() {
+        for bs in [512, 1024, 2048, 4096] {
+            let mut m = DiskModel::new(1024, bs);
+            let mut d = Disk::open(&mut m, 0).unwrap();
+            let mut one = vec![0; bs as usize];
+            assert_eq!(d.block_size, bs);
+            d.read(&mut m, 1, &mut one).unwrap();
+            assert_eq!(one[0], DiskModel::byte(bs.into()));
+        }
+        let mut m = DiskModel::new(1024, 520);
+        assert!(matches!(Disk::open(&mut m, 0), Err(Error::Unsupported(_))));
     }
 
     #[test]
