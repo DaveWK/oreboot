@@ -154,6 +154,38 @@ pub fn timing_after_phy<H: Hw>(hw: &mut H, ch: usize) -> Result<(), Error> {
     Ok(())
 }
 
+/// [`dfi::fold_cdd`] for frequency set `set` instead of set 0: the
+/// rank-to-rank turnaround margins (RANKTMG0 +0xd04 diff_rank_rd_gap and
+/// its alternate, RANKTMG1 +0xd08 the write pair, DRAMSET1TMG2 +0x08
+/// rd2wr/wr2rd, +0x60 [23:16], +0x24 [7:0], DFITMG1 +0x584 [20:16]) of the
+/// active set. The vendor library folds only set 0 (the message block's
+/// CDDs); the blob-free flow runs on set 1 and has no message block. Call
+/// with the controller's SWCTL.sw_done cleared (quasi-dynamic group).
+pub fn fold_cdd_set<H: Hw>(hw: &mut H, ch: usize, set: usize, cdd: &Cdd) {
+    let sat = |v: u32, add: u32, max: u32| (v + add).min(max);
+    let pair = |v: u32, hi: u32, lo: u32| {
+        (v & 0xffff_0000) | (sat((v >> 8) & 0xff, hi, 0xff) << 8) | sat(v & 0xff, lo, 0xff)
+    };
+    hw.modify32(crate::ctrl::freq(ch, set, 0xd04), |v| {
+        pair(v, cdd.rr, cdd.rr_alt)
+    });
+    hw.modify32(crate::ctrl::freq(ch, set, 0xd08), |v| {
+        pair(v, cdd.ww, cdd.ww_alt)
+    });
+    hw.modify32(crate::ctrl::freq(ch, set, 0x08), |v| {
+        pair(v, cdd.rw, cdd.wr)
+    });
+    hw.modify32(crate::ctrl::freq(ch, set, 0x60), |v| {
+        (v & !0xff_0000) | (sat((v >> 16) & 0xff, cdd.ww, 0xff) << 16)
+    });
+    hw.modify32(crate::ctrl::freq(ch, set, 0x24), |v| {
+        (v & !0xff) | sat(v & 0xff, cdd.ww_alt, 0xff)
+    });
+    hw.modify32(crate::ctrl::freq(ch, set, 0x584), |v| {
+        (v & !0x1f_0000) | (sat((v >> 16) & 0xff, cdd.rr, 31) << 16)
+    });
+}
+
 /// After the DFI handshake: DFIMISC [14] (DFI frequency-change handshake)
 /// on every channel, then the AXI ports of the two CPU clusters and the NSI
 /// QoS for one or two channels.

@@ -281,9 +281,14 @@ impl TrainConfig {
 }
 
 /// The read latency when the formula fails its vendor cross-check and no
-/// override is given: the vendor firmware's trained value at 1200 MHz CK
-/// (HwtMRL 4, DFIMRL 4).
-pub const MRL_FALLBACK: u16 = 4;
+/// override is given. The vendor firmware trains 4 at 1200 MHz CK
+/// (HwtMRL 4, DFIMRL 4), and 4 reads isolated bursts correctly;
+/// measured: with our trained gate, back-to-back reads (CPU line fills,
+/// 64 B = two gapless BL16) need 5. At 4 every line fill read wrong data
+/// and main never started; 5 passed every fetch probe (16, 1024 and 16384
+/// instructions at four addresses on both channels, before and after the
+/// CPU/DSU boost); 6 and 8 failed. The PIE-trained state also has 5.
+pub const MRL_FALLBACK: u16 = 5;
 /// The vendor's trained RxEnDly the formula is cross-checked against
 /// (1200 MHz CK) and the value it must give there.
 pub const MRL_CHECK_RX_EN: u16 = 0x369;

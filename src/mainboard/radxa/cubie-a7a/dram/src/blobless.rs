@@ -1293,6 +1293,21 @@ pub fn mission_handover_relock<H: Hw>(
             }
         }
         hw.clrset32(ddrc(ch, 0x008), 0x1f, pstate);
+        if let Some(n) = HO_CDD {
+            crate::post::fold_cdd_set(
+                hw,
+                ch,
+                pstate as usize,
+                &dwc_ddrctl::dfi::Cdd {
+                    rr: n,
+                    rr_alt: n,
+                    ww: n,
+                    ww_alt: n,
+                    rw: n,
+                    wr: n,
+                },
+            );
+        }
         if let Some(on) = HO_WCKON {
             // FEL lab: MSTR4.wck_on [0] (quasi-dynamic, written with
             // sw_done clear while the controller still holds the DRAM in
@@ -1377,6 +1392,21 @@ pub fn mission_handover_relock<H: Hw>(
     }
     Ok(rden)
 }
+
+/// FEL lab `A7A_HO_CDD=<hex>`: a flat rank-to-rank margin folded into the
+/// active set's turnaround timings by the lean hand-over
+/// ([`crate::post::fold_cdd_set`], every CDD field = the value, in the
+/// fields' own units: controller clocks). The vendor folds its trained
+/// CDDs into set 0 only, so set 1 runs with none; our own trained rank 0
+/// against rank 1 differences are below one clock (RxEnDly Tg0/Tg1 within
+/// 0x10 of 1/64 UI, TxDqDly equal), so 1 covers them. Unset: no fold.
+pub const HO_CDD: Option<u32> = match option_env!("A7A_HO_CDD") {
+    Some(s) => match u32::from_str_radix(s, 16) {
+        Ok(v) if v <= 0x1f => Some(v),
+        _ => panic!("A7A_HO_CDD is a hex value up to 0x1f"),
+    },
+    None => None,
+};
 
 /// DDRCTL DBICTL (DM/DBI control), main block +0xc94.
 pub const DBICTL: usize = 0xc94;
