@@ -264,7 +264,8 @@ pub fn best(
     near_r: usize,
     near_c: usize,
 ) -> Option<((usize, usize), [u8; 4])> {
-    let mut found: Option<((usize, usize), [u8; 4], (u32, u32, u32))> = None;
+    type ScoredCell = ((usize, usize), [u8; 4], (u32, u32, u32));
+    let mut found: Option<ScoredCell> = None;
     for r in 0..rows.min(grid.len()) {
         for c in 0..cols.min(64) {
             if grid[r] >> c & 1 == 0 {
@@ -283,7 +284,7 @@ pub fn best(
             let sum = l as u32 + rt as u32 + dn as u32 + up as u32;
             let dist = (r.abs_diff(near_r) * cols + c.abs_diff(near_c)) as u32;
             let key = (h.min(v), sum, u32::MAX - dist);
-            if found.map_or(true, |(_, _, k)| key > k) {
+            if found.is_none_or(|(_, _, k)| key > k) {
                 found = Some(((r, c), [l, rt, dn, up], key));
             }
         }
@@ -329,8 +330,8 @@ pub fn search<P: Probe>(
     };
     for i in 0..2 {
         out.coarse_clk0[i] = origin(clk0[i], COARSE_COLS, COARSE_STEP, CLK_MAX);
-        for lane in 0..LANES {
-            out.lanes[i][lane].found = found[i][lane];
+        for (lane, &cell) in found[i].iter().enumerate() {
+            out.lanes[i][lane].found = cell;
         }
     }
     // 1. Coarse: every lane at the same point.
@@ -345,9 +346,9 @@ pub fn search<P: Probe>(
             let Some(m) = launch(p, out, &at) else {
                 return;
             };
-            for i in 0..2 {
+            for (i, &mask) in m.iter().enumerate() {
                 for lane in 0..LANES {
-                    if m[i] >> lane & 1 != 0 {
+                    if mask >> lane & 1 != 0 {
                         out.lanes[i][lane].coarse[r] |= 1 << c;
                     }
                 }
@@ -402,9 +403,9 @@ pub fn search<P: Probe>(
             let Some(m) = launch(p, out, &at) else {
                 return;
             };
-            for i in 0..2 {
+            for (i, &mask) in m.iter().enumerate() {
                 for lane in 0..LANES {
-                    if m[i] >> lane & 1 != 0 {
+                    if mask >> lane & 1 != 0 {
                         out.lanes[i][lane].fine[r] |= 1 << c;
                     }
                 }
@@ -577,13 +578,13 @@ fn eye_stage<H: Hw>(
     let eye = unsafe { &mut *core::ptr::addr_of_mut!(EYE) };
     let mut found = [[Cell { vref: 0, clk: 0 }; LANES]; 2];
     for (i, &db) in dbs.iter().enumerate() {
-        for lane in 0..LANES {
+        for (lane, cell) in found[i].iter_mut().enumerate() {
             for (k, &off) in VREF_DAC.iter().enumerate() {
                 vr.found[i][k][lane] = ex.read(lane_csr(db, lane as u32, off));
             }
             // The lane's reference: the first selected DAC's.
             let k = (dacs & 1 == 0) as usize;
-            found[i][lane] = Cell {
+            *cell = Cell {
                 vref: vr.found[i][k][lane] & VREF_MAX,
                 clk: out.bytes[i].lanes[lane].t_eff,
             };
@@ -601,13 +602,13 @@ fn eye_stage<H: Hw>(
     // Back: every reference (both DACs) as found, the trained delays.
     let apply = plan.apply && out.rank == Rank::R0 && eye.stop.is_none();
     let mut last = found;
-    for i in 0..2 {
-        for lane in 0..LANES {
-            last[i][lane].clk = out.bytes[i].lanes[lane].t_eff;
+    for (i, cells) in last.iter_mut().enumerate() {
+        for (lane, cell) in cells.iter_mut().enumerate() {
+            cell.clk = out.bytes[i].lanes[lane].t_eff;
             let l = &eye.lanes[i][lane];
             vr.chosen[i][lane] = l.choice.map(|c| c.vref);
             if let (true, Some(c)) = (apply, applied(l)) {
-                last[i][lane] = c;
+                *cell = c;
                 vr.recentred[i][lane] = Some(c.clk);
             }
         }
@@ -733,9 +734,9 @@ mod tests {
             self.seen.push(*at);
             let mut m = [0u16; 2];
             for i in 0..2 {
-                for lane in 0..LANES {
-                    assert!(at[i][lane].vref <= VREF_MAX && at[i][lane].clk <= CLK_MAX);
-                    if self.lanes[i][lane].pass(at[i][lane]) {
+                for (lane, &cell) in at[i].iter().enumerate() {
+                    assert!(cell.vref <= VREF_MAX && cell.clk <= CLK_MAX);
+                    if self.lanes[i][lane].pass(cell) {
                         m[i] |= 1 << lane;
                     }
                 }
@@ -999,7 +1000,7 @@ mod tests {
         assert!(VrefPlan::parse(Some("eye")).is_err(), "the sweep's parser");
         assert_eq!(VrefPlan::parse_knob(None), Ok(None));
         assert!(VrefPlan::parse_knob(Some("eye,18,8,9,4")).is_err());
-        assert!(!SELECTED, "the search is off without its knob");
+        const { assert!(!SELECTED, "the search is off without its knob") };
     }
 
     #[test]

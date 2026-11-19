@@ -431,7 +431,7 @@ mod tests {
     #[test]
     fn the_host_tests_run_without_a_profile() {
         // The unit tests are written against the environment-only values.
-        assert!(!AVAILABLE);
+        const { assert!(!AVAILABLE) };
         assert_eq!(ACTIVE, None);
     }
 }

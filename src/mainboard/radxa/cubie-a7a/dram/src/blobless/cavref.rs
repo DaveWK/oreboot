@@ -118,6 +118,10 @@ pub struct Plan {
     pub step: u8,
 }
 
+/// Malformed CA Vref plan or sweep over the budget.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InvalidPlan;
+
 impl Plan {
     /// 0x18 codes each side in steps of 4 (13 codes: 12 % of VDDQ each
     /// way), measure only.
@@ -149,7 +153,7 @@ impl Plan {
 
     /// `measure` or `apply`, optionally `,<half>,<step>` (hex). None:
     /// unset; Err: malformed or over the budget.
-    pub const fn parse(s: Option<&str>) -> Result<Option<Plan>, ()> {
+    pub const fn parse(s: Option<&str>) -> Result<Option<Plan>, InvalidPlan> {
         let Some(s) = s else {
             return Ok(None);
         };
@@ -161,7 +165,7 @@ impl Plan {
             p.apply = true;
             5
         } else {
-            return Err(());
+            return Err(InvalidPlan);
         };
         let mut field = 0;
         while i < b.len() {
@@ -170,27 +174,27 @@ impl Plan {
             let mut digits = 0;
             while i < b.len() && b[i] != b',' {
                 let Some(d) = super::hex_nib(b[i]) else {
-                    return Err(());
+                    return Err(InvalidPlan);
                 };
                 v = v * 16 + d as u32;
                 digits += 1;
                 if v > 0x7f {
-                    return Err(());
+                    return Err(InvalidPlan);
                 }
                 i += 1;
             }
             if digits == 0 {
-                return Err(());
+                return Err(InvalidPlan);
             }
             match field {
                 0 => p.half = v as u8,
                 1 => p.step = v as u8,
-                _ => return Err(()),
+                _ => return Err(InvalidPlan),
             }
             field += 1;
         }
         if field == 1 || !p.valid() {
-            return Err(());
+            return Err(InvalidPlan);
         }
         Ok(Some(p))
     }
@@ -213,7 +217,9 @@ const fn starts(b: &[u8], w: &[u8]) -> bool {
 /// The plan of this build; None: the stage does not exist in it.
 pub const STAGE: Option<Plan> = match Plan::parse(crate::knob!("A7A_CA_VREF")) {
     Ok(p) => p,
-    Err(()) => panic!("A7A_CA_VREF: measure|apply[,half,step] (hex codes, at most 16 codes)"),
+    Err(InvalidPlan) => {
+        panic!("A7A_CA_VREF: measure|apply[,half,step] (hex codes, at most 16 codes)")
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -554,8 +560,7 @@ impl<H: Hw> Cbt for BlockPort<'_, '_, H> {
 /// block's CA training.
 fn pass<H: Hw>(
     hw: &mut H,
-    m1: &coldinit::Mrs,
-    m2: &coldinit::Mrs2,
+    (m1, m2): (&coldinit::Mrs, &coldinit::Mrs2),
     out: &mut CaTrainReport,
     first: bool,
     mut sweep: Option<&mut Report>,
@@ -657,7 +662,7 @@ pub fn ca_train<H: Hw>(
         r.default[ch] = entry_code(c, &r.lane_sel[ch]);
     }
     let maps = r.lane_sel;
-    pass(hw, m1, m2, out, true, Some(r), &[[None; 2]; 2], &maps);
+    pass(hw, (m1, m2), out, true, Some(r), &[[None; 2]; 2], &maps);
     for ch in 0..2 {
         let Some(default) = r.default[ch] else {
             continue;
@@ -671,7 +676,7 @@ pub fn ca_train<H: Hw>(
     let codes = to_apply(r);
     if trained(out) && codes.iter().flatten().any(|c| c.is_some()) {
         r.second_pass = true;
-        pass(hw, m1, m2, out, false, None, &codes, &maps);
+        pass(hw, (m1, m2), out, false, None, &codes, &maps);
         if trained(out) {
             r.applied = codes;
             *applied = codes;
@@ -679,7 +684,7 @@ pub fn ca_train<H: Hw>(
             // Back to the parameter set's code on every rank.
             r.reverted = true;
             let back = [[r.default[0]; 2], [r.default[1]; 2]];
-            pass(hw, m1, m2, out, false, None, &back, &maps);
+            pass(hw, (m1, m2), out, false, None, &back, &maps);
         }
     }
     log(hw, r);
@@ -966,8 +971,8 @@ mod tests {
         let mut b = Model::new(84.0, 14.0, 0.5);
         let (sa, sb) = (sweep_block(&mut a, &P, 0x44), sweep_block(&mut b, &P, 0x44));
         let w = combine(&sa, &sb);
-        for k in 0..P.n() {
-            assert_eq!(w[k], Some(sa.width[k].unwrap().min(sb.width[k].unwrap())));
+        for (k, &width) in w[..P.n()].iter().enumerate() {
+            assert_eq!(width, Some(sa.width[k].unwrap().min(sb.width[k].unwrap())));
         }
         // Between the two phases' best codes.
         let c = choose(&w, &P, 0x44);

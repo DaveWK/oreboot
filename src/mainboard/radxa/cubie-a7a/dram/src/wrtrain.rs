@@ -1181,11 +1181,10 @@ mod tests {
     impl Sim {
         fn new() -> Sim {
             let mut centre = [[[0u16; 2]; LANES]; DBYTES];
-            for db in 0..DBYTES {
-                for lane in 0..LANES {
-                    for tg in 0..2 {
-                        centre[db][lane][tg] =
-                            [0xa2, 0x72, 0x6d, 0x9c][db] + (lane as u16 * 3) % 7 + tg as u16;
+            for (db, lanes) in centre.iter_mut().enumerate() {
+                for (lane, groups) in lanes.iter_mut().enumerate() {
+                    for (tg, delay) in groups.iter_mut().enumerate() {
+                        *delay = [0xa2, 0x72, 0x6d, 0x9c][db] + (lane as u16 * 3) % 7 + tg as u16;
                     }
                 }
             }
@@ -1648,12 +1647,12 @@ mod tests {
         let m = discover(&mut s, &mut seed).unwrap();
         let base = s.dq.map(|l| l.map(|t| t[0]));
         sweep(&mut s, &m, 0, &base, &DMI_SPAN, DMI_ONLY, &mut seed).unwrap();
-        for db in 0..DBYTES {
-            for lane in 0..DMI_LANE {
-                assert_eq!(s.dq[db][lane][0], base[db][lane]);
+        for (db, delays) in base.iter().enumerate() {
+            for (lane, &delay) in delays[..DMI_LANE].iter().enumerate() {
+                assert_eq!(s.dq[db][lane][0], delay);
             }
-            assert_eq!(s.dq[db][DMI_LANE][0], base[db][DMI_LANE] + 63);
-            s.dq[db][DMI_LANE][0] = base[db][DMI_LANE];
+            assert_eq!(s.dq[db][DMI_LANE][0], delays[DMI_LANE] + 63);
+            s.dq[db][DMI_LANE][0] = delays[DMI_LANE];
         }
         let maps = sweep(&mut s, &m, 0, &base, &FINE, DQ_LANES, &mut seed).unwrap();
         for db in 0..DBYTES {
@@ -1925,7 +1924,7 @@ mod vref_cap_tests {
         assert_eq!(c[n - 1], 0x3c);
         // The byte-identification code 0x0a (84 mV) is above JEDEC's 75 mV
         // minimum at VDDQ 560 mV.
-        assert!(BOARD_VDDQ_MV * (100 + 5 * 0x0a) / 1000 >= 75);
+        const { assert!(BOARD_VDDQ_MV * (100 + 5 * 0x0a) / 1000 >= 75) };
         assert_eq!(vref_n_capped(0x40, 1, 5, 0x3c), 0);
         assert_eq!(vref_n_capped(0x20, 2, 31, 0x3c), 15);
     }
@@ -1991,11 +1990,10 @@ mod mem_tests {
     impl Mem {
         fn new(dm: bool, probe: [usize; BLOCKS]) -> Mem {
             let mut centre = [[[0u16; 2]; LANES]; DBYTES];
-            for db in 0..DBYTES {
-                for lane in 0..LANES {
-                    for tg in 0..2 {
-                        centre[db][lane][tg] =
-                            (BASE[db] as i16 + SKEW[lane] - 3 * tg as i16) as u16;
+            for (db, lanes) in centre.iter_mut().enumerate() {
+                for (lane, groups) in lanes.iter_mut().enumerate() {
+                    for (tg, delay) in groups.iter_mut().enumerate() {
+                        *delay = (BASE[db] as i16 + SKEW[lane] - 3 * tg as i16) as u16;
                     }
                 }
             }
@@ -2226,9 +2224,9 @@ mod mem_tests {
         let r = centre(&mut s, &m, 0, true, &mut seed).unwrap();
         for db in 0..DBYTES {
             let mut c = [0u16; DMI_LANE];
-            for lane in 0..DMI_LANE {
+            for (lane, delay) in c.iter_mut().enumerate() {
                 assert_eq!(r.applied[db][lane], s.centre[db][lane][0]);
-                c[lane] = r.applied[db][lane];
+                *delay = r.applied[db][lane];
             }
             c.sort_unstable();
             assert_eq!(r.applied[db][DMI_LANE], (c[3] + c[4]) / 2);
