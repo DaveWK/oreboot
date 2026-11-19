@@ -158,14 +158,27 @@ impl LiveRankMap {
     }
 }
 
+/// Defined chip-select fields of `ADDRMAP1` written by
+/// `src/lib/dwc-ddrctl/src/addrmap.rs:163-172`: `cs0` in `[5:0]`, `cs1` in
+/// `[13:8]` (always `0x3f` for unused second chip-select bit); bits `[7:6]`
+/// and `[31:14]` are reserved and ignored.
+const ADDRMAP1_CS_MASK: u32 = 0x3f;
+const ADDRMAP1_CS1_SHIFT: u32 = 8;
+const ADDRMAP1_CS_UNUSED: u32 = 0x3f;
+
 /// Validate the live channel-0 `ADDRMAP1` readback against `dram_size` and the
-/// supported A7A board maps (`cubie-a7a-dram/src/ctrl.rs` `RankMap`).
-/// Unreadable or unsupported decodes fail explicitly instead of silently
-/// dropping dual-rank legs.
+/// supported A7A board maps (`cubie-a7a-dram/src/ctrl.rs` `RankMap` and
+/// `dwc-ddrctl/src/addrmap.rs:163-172`). Matches both defined CS fields (`cs0`
+/// and `cs1 == 0x3f`, ignoring reserved bits); unreadable or unsupported
+/// decodes fail explicitly instead of silently dropping dual-rank legs.
 pub fn validate_live_rank_map(addrmap1: u32, dram_size: u64) -> Result<LiveRankMap, &'static str> {
     const GIB: u64 = 1u64 << 30;
     if addrmap1 == 0 || addrmap1 == u32::MAX {
         return Err("unreadable ADDRMAP1 register value");
+    }
+    let cs1 = (addrmap1 >> ADDRMAP1_CS1_SHIFT) & ADDRMAP1_CS_MASK;
+    if cs1 != ADDRMAP1_CS_UNUSED {
+        return Err("incompatible ADDRMAP1 second CS field");
     }
     match rank_bit_from_addrmap1(addrmap1, DUAL_CH_SHIFT) {
         None => Ok(LiveRankMap::SingleRank),
@@ -1775,5 +1788,40 @@ mod tests {
         let lines_6g = (6 * GIB) / CACHE_LINE_ALIGN;
         assert_eq!(lines_4g / TEARDOWN_WDT_RELOAD_LINES, 128);
         assert_eq!(lines_6g / TEARDOWN_WDT_RELOAD_LINES, 192);
+    }
+
+    #[test]
+    fn addrmap1_requires_both_cs_fields_and_ignores_reserved_bits() {
+        // 4 GB dual-rank: 0x0017 (cs1 = 0x00) refused, 0x3f17 (cs1 = 0x3f) accepted.
+        assert!(validate_live_rank_map(0x0017, 4 * GIB).is_err());
+        assert!(validate_live_rank_map(0x1f17, 4 * GIB).is_err());
+        assert_eq!(
+            validate_live_rank_map(0x3f17, 4 * GIB),
+            Ok(LiveRankMap::DualRank { rank_bit: 31 })
+        );
+        // Reserved bits [7:6] and [31:14] ignored when defined CS fields match.
+        assert_eq!(
+            validate_live_rank_map(0x8000_3fd7, 4 * GIB),
+            Ok(LiveRankMap::DualRank { rank_bit: 31 })
+        );
+
+        // 6 GB dual-rank: 0x0016 refused, 0x3f16 accepted (and reserved bits ignored).
+        assert!(validate_live_rank_map(0x0016, 6 * GIB).is_err());
+        assert!(validate_live_rank_map(0x2016, 6 * GIB).is_err());
+        assert_eq!(
+            validate_live_rank_map(0x3f16, 6 * GIB),
+            Ok(LiveRankMap::DualRank { rank_bit: 30 })
+        );
+        assert_eq!(
+            validate_live_rank_map(0x4000_3f56, 6 * GIB),
+            Ok(LiveRankMap::DualRank { rank_bit: 30 })
+        );
+
+        // Single-rank: 0x003f refused, 0x3f3f accepted.
+        assert!(validate_live_rank_map(0x003f, 4 * GIB).is_err());
+        assert_eq!(
+            validate_live_rank_map(0x3f3f, 4 * GIB),
+            Ok(LiveRankMap::SingleRank)
+        );
     }
 }
