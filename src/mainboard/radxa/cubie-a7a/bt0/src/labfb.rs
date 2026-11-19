@@ -10,6 +10,7 @@
 //! fastboot goes on (the pending `dram-run` gets its OKAY then). A second
 //! run in the same session is refused: retraining in a running session
 //! leaves the PHY read path broken, so every run starts from a SoC reset.
+//! `dram-run` checks that itself ([`dram_touched`]).
 //!
 //! # Leaving a session
 //!
@@ -641,11 +642,23 @@ impl Device for Lab {
     }
 }
 
+/// R_PRCM +0x250 [0], the DRAM PHY's isolation release: 0 after every SoC
+/// reset, set by every DRAM init and kept until the next reset. Set before
+/// a run, it means bt0 was loaded again without a reset (`reboot` leaves
+/// through the ROM's FEL entry, not a reset), and a DRAM init on top of the
+/// last one is not a lab result.
+fn dram_touched() -> bool {
+    read32(soc::R_PRCM_BASE + 0x250) & 1 != 0
+}
+
 /// `oem dram-run <knobs>`: once per session. Knob errors are refused
 /// before anything runs; then the run ends in [`resume`] (no return).
 fn dram_run(text: &str) -> Result<(), &'static str> {
     if state() != State::Idle {
         return Err("one DRAM run per session: fastboot reboot first");
+    }
+    if dram_touched() {
+        return Err("DRAM was up since the last SoC reset: reset from FEL first");
     }
     #[cfg(not(dram_blobfree))]
     if !crate::dram::open::lab_fw::loaded() {
