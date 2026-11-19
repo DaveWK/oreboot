@@ -648,6 +648,150 @@ mod tests {
         }
     }
 
+    /// The clock-dependent values the driver derives per pstate, against
+    /// the PHY's saved per-pstate copies (its PState SRAM, the records the
+    /// PHY replays at a frequency change) read on the 4 GB board after the
+    /// training firmware had trained all four pstates: MEASURED, pstates
+    /// 0, 1, 2, 3.
+    #[test]
+    fn derived_values_are_the_phys_saved_copies_at_all_four_pstates() {
+        use crate::phy::prog::{self, Kind, COMPUTED};
+        use crate::phy::{freq, init, tables};
+        // The configuration step's and the per-pstate PIE step's formulas
+        // (`freq::config`, `freq::pie`).
+        const CONFIG: [(u32, [u16; 4]); 2] = [
+            (0x20004, [0x258, 0x12c, 0xc8, 0x64]),
+            (0x90801, [0x3a, 0x1d, 0x13, 0x09]),
+        ];
+        const PIE: [(u32, [u16; 4]); 13] = [
+            (0x2004a, [0x0e3e, 0x0e3e, 0x123e, 0x123e]),
+            (0x2004b, [0x0e3e, 0x0e3e, 0x123e, 0x123e]),
+            (0x2004c, [0x080f, 0x081b, 0x4817, 0x4823]),
+            (0x1000f, [0x0c88, 0x0688, 0x0488, 0x0288]),
+            (0x1100f, [0x0c88, 0x0688, 0x0488, 0x0288]),
+            (0x1200f, [0x0c88, 0x0688, 0x0488, 0x0288]),
+            (0x1300f, [0x0c88, 0x0688, 0x0488, 0x0288]),
+            (0x90811, [0, 1, 1, 1]),
+            (0x90812, [0xff00, 0xff01, 0xff01, 0xff01]),
+            (0x908f0, [0x4c, 0x26, 0x1a, 0x0d]),
+            (0x908f1, [0xe1, 0x70, 0x4b, 0x25]),
+            (0x908f3, [0x58, 0x58, 0x40, 0x40]),
+            (0x908f4, [0x0f, 0x07, 0x05, 0x02]),
+        ];
+        // DevInit's gains, and the mission read latency the read training
+        // falls back to (DFIMRL of every DBYTE).
+        const DLL_GAIN: [u16; 4] = [0x7353, 0x7342, 0x5331, 0x5331];
+        const RX_REPLICA_DLL_GAIN: [u16; 4] = [0x73, 0x73, 0x53, 0x53];
+        const DFIMRL: [u16; 4] = [5, 4, 4, 3];
+        // The table's write of `csr` (its constant bits), else a bare one.
+        let op_of = |table: &[prog::Op], csr: u32| {
+            table
+                .iter()
+                .rev()
+                .find(|o| o.kind == Kind::Write && o.csr == csr && o.flags & COMPUTED != 0)
+                .copied()
+                .unwrap_or(prog::w(csr, 0))
+        };
+        for i in [CXMT_4G, CXMT_6G, HYNIX_4G] {
+            let p = set(i);
+            for ps in 0..4usize {
+                let c = init::ctx_with(&p, [&[]; 4], ps as u32);
+                for (csr, want) in CONFIG {
+                    let v = freq::config(&op_of(tables::C_PSTATE, csr), &c);
+                    assert_eq!(v, want[ps], "set {i} ps {ps} {csr:05x}");
+                }
+                for (csr, want) in PIE {
+                    let v = freq::pie(&op_of(tables::I_PSTATE, csr), &c);
+                    assert_eq!(v, want[ps], "set {i} ps {ps} {csr:05x}");
+                }
+                let gain = dll_gain_any(c.mhz).unwrap();
+                assert_eq!(gain, DLL_GAIN[ps]);
+                assert_eq!(rx_replica_dll_gain(gain), RX_REPLICA_DLL_GAIN[ps]);
+                let rd = crate::rdtrain::TrainConfig::for_pstate(ps as u32)
+                    .unwrap_or(crate::rdtrain::below_pstate1(ps as u32));
+                assert_eq!(rd.mrl_fallback, DFIMRL[ps], "ps {ps}");
+                assert_eq!(rd.ui_ps as u32, Point::of(&p, ps as u32).ui_ps());
+            }
+        }
+    }
+
+    /// The message block gives pstates 2 and 3 the mode registers of
+    /// pstates 0 and 1 (VENDOR-BOARD-DATA through `msgblock::build`): the
+    /// latency code of 4800 Mb/s at every rate, legal by JEDEC at the lower
+    /// ones, so every latency in clocks is the same at all four.
+    #[test]
+    fn mode_registers_and_latencies_at_pstates_2_and_3() {
+        let p2 = Point::board(2);
+        assert_eq!(
+            (p2.wck_mhz(), p2.data_rate(), p2.ui_ps(), p2.tck_ps()),
+            (800, 1600, 625, 5000)
+        );
+        let p3 = Point::board(3);
+        assert_eq!(
+            (p3.wck_mhz(), p3.data_rate(), p3.ui_ps(), p3.tck_ps()),
+            (400, 800, 1250, 10000)
+        );
+        for i in [CXMT_4G, CXMT_6G, HYNIX_4G] {
+            let mut p = set(i);
+            let m1 = Params::of(&mut p, 1).unwrap();
+            for ps in [2, 3] {
+                let m = Params::of(&mut p, ps).unwrap();
+                assert_eq!(m.point, Point::board(ps));
+                assert_eq!(
+                    Params {
+                        point: m1.point,
+                        code_required: m1.code_required,
+                        ..m
+                    },
+                    m1,
+                    "set {i} ps {ps}"
+                );
+                assert!(m.code_required < m1.code_required && m.code_ok());
+                assert_eq!((m.rl(), m.wl(), m.lat.nwr), (14, 7, 21));
+                // DQ Vref: JEDEC's limit of the lower WCK range, as at
+                // pstate 1.
+                assert_eq!(m.dq_vref_code_max(BOARD_VDDQ_MV), 0x69);
+            }
+        }
+    }
+
+    /// The controller's timing sets of pstates 2 and 3 as `timing.rs`
+    /// computes them (COMPUTED: no board read-back of these two sets
+    /// exists; the same code gives sets 0 and 1 as measured, test below):
+    /// the latencies follow the mode registers, which are the same at every
+    /// pstate, and the clock-dependent times shrink with the clock.
+    #[test]
+    fn controller_sets_2_and_3_follow_the_same_rules() {
+        use crate::ctrl::freq;
+        let mut p = set(CXMT_4G);
+        let mut hw = Ctl(HashMap::new());
+        assert_eq!(
+            crate::timing::set_channel_timing(&mut hw, &mut p, 0),
+            Ok(13)
+        );
+        let mut r = |ps: usize, off: usize| hw.read32_at(freq(0, ps, off));
+        for ps in [2, 3] {
+            // DRAMSET1TMG2: read latency 13, write latency 7.
+            let t2 = r(ps, 0x008);
+            assert_eq!((t2 >> 16 & 0x3f, t2 >> 24 & 0x3f), (13, 7), "set {ps}");
+            // Latency-derived DFI timings equal set 1's.
+            for off in [0x580, 0x584, 0x588, 0x060] {
+                assert_eq!(r(ps, off), r(1, off), "set {ps} +{off:#x}");
+            }
+        }
+        // tRAS (DRAMSET1TMG0 [5:0]) in clocks: 42 ns at 600, 300, 200 and
+        // 100 MHz, never below the minimum of 3.
+        let tras = [0, 1, 2, 3].map(|ps| r(ps, 0x000) & 0x3f);
+        assert_eq!(tras, [26, 13, 9, 5]);
+        // tXSR ([11:0] of +0x38) and the refresh interval ([11:0] of
+        // +0x600, in units of 32 clocks) scale with the clock.
+        let xsr = [0, 1, 2, 3].map(|ps| r(ps, 0x038) & 0xfff);
+        assert!(xsr[0] > xsr[1] && xsr[1] > xsr[2] && xsr[2] > xsr[3] && xsr[3] > 0);
+        assert_eq!((xsr[0], xsr[1]), (0xe9, 0x75));
+        let refi = [0, 1, 2, 3].map(|ps| r(ps, 0x600) & 0xfff);
+        assert!(refi[0] > refi[1] && refi[1] > refi[2] && refi[2] > refi[3] && refi[3] > 0);
+    }
+
     /// Register model for the controller set computation.
     struct Ctl(HashMap<usize, u32>);
     impl crate::hw::RegIo for Ctl {
