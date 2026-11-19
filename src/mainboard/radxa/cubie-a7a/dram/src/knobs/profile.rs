@@ -17,7 +17,7 @@
 //! [`crate::knob!`] is `option_env!` itself, every knob comes from the
 //! environment alone, and the crate compiles as it did before the
 //! profiles existed. Which profile is build variable `A7A_PROFILE`: the
-//! DRAM clock, `1200` or `2400`; unset: [`DEFAULT`]; `none`: no profile
+//! DRAM clock, `1200`, `2400`, `800` or `400`; unset: [`DEFAULT`]; `none`: no profile
 //! in a build that would have one (the same code, the knobs from the
 //! environment alone).
 //!
@@ -116,6 +116,54 @@ pub const BOOT_2400: Profile = Profile {
     ],
 };
 
+/// WCK 800 MHz (1600 Mb/s, pstate 2): [`BOOT_1200`]'s settings with the
+/// stages generated for pstate 2. The write Vref stays at the parameter
+/// set's 0x2e, as at 1200 MHz.
+///
+/// Not run on a board: the line is derived, not validated. Selectable for
+/// that work.
+pub const BOOT_800: Profile = Profile {
+    mhz: 800,
+    vdd2l_mv: 1080,
+    knobs: &[
+        ("A7A_PSTATE", "2"),
+        ("A7A_EI_FSPWR0", "04"),
+        ("A7A_BL_MRS", "3=06,18=00"),
+        ("A7A_RD_LANES", "ff"),
+        ("A7A_RD_FSPWR", "05,04"),
+        ("A7A_RD_EXIT", "1c,54"),
+        ("A7A_HO_EPILOGUE", "1"),
+        ("A7A_HO_FIFOINIT", "1"),
+        ("A7A_RD_PULSE_RESTORE", "1"),
+        ("A7A_WR_STAGE", "11"),
+        ("A7A_WR_APPLY", "1"),
+        ("A7A_HO_MRL_ADD", "1"),
+        ("A7A_BL_BOOT", "1"),
+    ],
+};
+
+/// WCK 400 MHz (800 Mb/s, pstate 3), the lowest clock of the parameter
+/// sets: as [`BOOT_800`] at pstate 3. Not run on a board.
+pub const BOOT_400: Profile = Profile {
+    mhz: 400,
+    vdd2l_mv: 1080,
+    knobs: &[
+        ("A7A_PSTATE", "3"),
+        ("A7A_EI_FSPWR0", "04"),
+        ("A7A_BL_MRS", "3=06,18=00"),
+        ("A7A_RD_LANES", "ff"),
+        ("A7A_RD_FSPWR", "05,04"),
+        ("A7A_RD_EXIT", "1c,54"),
+        ("A7A_HO_EPILOGUE", "1"),
+        ("A7A_HO_FIFOINIT", "1"),
+        ("A7A_RD_PULSE_RESTORE", "1"),
+        ("A7A_WR_STAGE", "11"),
+        ("A7A_WR_APPLY", "1"),
+        ("A7A_HO_MRL_ADD", "1"),
+        ("A7A_BL_BOOT", "1"),
+    ],
+};
+
 /// The profile of a build that names none (`A7A_PROFILE` unset). This
 /// line is the default DRAM clock of the blob-free boot: the clock Linux
 /// boots at.
@@ -137,7 +185,9 @@ pub const fn select(
         Some(s) if same(s, "none") => return Ok(None),
         Some(s) if same(s, "1200") => &BOOT_1200,
         Some(s) if same(s, "2400") => &BOOT_2400,
-        Some(_) => return Err("A7A_PROFILE is 1200, 2400 or none"),
+        Some(s) if same(s, "800") => &BOOT_800,
+        Some(s) if same(s, "400") => &BOOT_400,
+        Some(_) => return Err("A7A_PROFILE is 1200, 2400, 800, 400 or none"),
     };
     if available {
         Ok(Some(named))
@@ -273,6 +323,18 @@ mod tests {
     }
 
     #[test]
+    fn the_lower_clocks_are_the_1200_line_at_their_pstate() {
+        // Derived lines, not validated ones: the 1200 MHz line with the
+        // stages generated for the pstate.
+        for (p, pstate) in [(&BOOT_800, "2"), (&BOOT_400, "3")] {
+            assert_eq!(line(p), std::format!("A7A_PSTATE={pstate} {}", line(&BOOT_1200)));
+            let ps: usize = pstate.parse().unwrap();
+            assert_eq!(4 * crate::pstate::BOARD_DFI_MHZ[ps], p.mhz);
+            assert_eq!(p.vdd2l_mv, BOOT_1200.vdd2l_mv);
+        }
+    }
+
+    #[test]
     fn the_two_clocks_differ_in_the_pstate_the_write_vref_and_the_centred_start() {
         let only = |a: &Profile, b: &Profile| -> Vec<&'static str> {
             a.knobs
@@ -299,7 +361,7 @@ mod tests {
 
     #[test]
     fn every_profile_knob_is_a_knob_and_parses() {
-        for p in [&BOOT_2400, &BOOT_1200] {
+        for p in [&BOOT_2400, &BOOT_1200, &BOOT_800, &BOOT_400] {
             let mut seen: Vec<&str> = Vec::new();
             let mut k = crate::knobs::BUILD;
             for &(name, v) in p.knobs {
@@ -348,6 +410,8 @@ mod tests {
         assert_eq!(select(true, None), Ok(Some(DEFAULT)));
         assert_eq!(select(true, Some("1200")), Ok(Some(&BOOT_1200)));
         assert_eq!(select(true, Some("2400")), Ok(Some(&BOOT_2400)));
+        assert_eq!(select(true, Some("800")), Ok(Some(&BOOT_800)));
+        assert_eq!(select(true, Some("400")), Ok(Some(&BOOT_400)));
         assert_eq!(select(true, Some("none")), Ok(None));
         assert!(select(true, Some("1800")).is_err());
         assert!(select(true, Some("")).is_err());
@@ -357,6 +421,8 @@ mod tests {
         assert_eq!(select(false, Some("none")), Ok(None));
         assert!(select(false, Some("1200")).is_err());
         assert!(select(false, Some("2400")).is_err());
+        assert!(select(false, Some("800")).is_err());
+        assert!(select(false, Some("400")).is_err());
     }
 
     #[test]

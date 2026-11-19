@@ -30,6 +30,8 @@ No vendor binary is part of this tree, and the default build reads none.
   |---|---|---|
   | `1200` | WCK 1200 MHz, 2400 Mb/s | boots Linux |
   | `2400` | WCK 2400 MHz, 4800 Mb/s | does not boot Linux yet: the bring-up, bt0's DRAM test and memory tests from the host pass and the firmware runs, then the kernel fails to decompress (rare data errors under load) |
+  | `800` | WCK 800 MHz, 1600 Mb/s | not run on a board: the 1200 line with the stages generated for the clock |
+  | `400` | WCK 400 MHz, 800 Mb/s | not run on a board: the same at the lowest clock of the parameter sets |
 
   Unset, the profile is the line `pub const DEFAULT` in that file (1200).
   The profiles were made on the CXMT 4 GB board; the same image selects the
