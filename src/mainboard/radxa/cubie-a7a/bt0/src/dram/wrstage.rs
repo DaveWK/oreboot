@@ -31,7 +31,8 @@
 
 use cubie_a7a_dram::phy::{csr, csr_access};
 use cubie_a7a_dram::wrtrain::{
-    self, pattern, Delays, Folds, LaneFit, MrPort, WritePort, BLOCKS, DBYTES, LANES,
+    self, pattern, BlindRun, BlindStart, Delays, Folds, LaneFit, Ledger, MrPort, Snapshot,
+    WritePort, BLOCKS, DBYTES, LANES,
 };
 use cubie_a7a_dram::{Error, RegIo};
 
@@ -80,15 +81,37 @@ const VREF_MAX: u8 = cubie_a7a_dram::pstate::dq_vref_code_max(
 );
 const VREF_N_CAPPED: usize = wrtrain::vref_n_capped(VREF_FIRST, 1, VREF_N, VREF_MAX);
 
-struct Port(Bt0Hw);
+/// The write port and its staged-write ledger; the MR port never writes a
+/// delay, so its ledger stays clean.
+struct Port(Bt0Hw, Ledger);
 
 /// `A7A_WR_APPLY` (module docs).
 #[allow(non_snake_case)]
 fn APPLY() -> bool {
     cubie_a7a_dram::knobs::env("A7A_WR_APPLY", crate::knob!("A7A_WR_APPLY")).is_some()
 }
-/// TxDqDly written since the last compare (applied by the next one).
-static DIRTY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Undo the delays a failed stage left behind. The caller halts whether or
+/// not this succeeds, so a restore error is only logged.
+fn undo(p: &mut Port, before: &Snapshot) -> bool {
+    wrtrain::restore(p, before);
+    println!("[dram] WR: stage failed; the delays found before are back");
+    false
+}
+
+/// The final probe compare, propagated: a compare error fails the stage.
+fn finish(p: &mut Port, before: &Snapshot, seed: &mut u32) -> bool {
+    match wrtrain::final_check(p, seed) {
+        Ok(bad) => {
+            println!("[dram] WR: final probe check: failing blocks {bad:04x}");
+            bad == 0
+        }
+        Err(e) => {
+            println!("[dram] WR: final probe check failed: {e:?}; stopping");
+            undo(p, before)
+        }
+    }
+}
 
 impl WritePort for Port {
     type Error = Error;
@@ -96,7 +119,7 @@ impl WritePort for Port {
         csr_access(&mut self.0, true);
         self.0.write16(csr(wrtrain::tx_dq_csr(db, lane, tg)), v);
         csr_access(&mut self.0, false);
-        DIRTY.store(true, core::sync::atomic::Ordering::Relaxed);
+        self.1.wrote();
         Ok(())
     }
     fn tx_dq(&mut self, db: usize, lane: usize, tg: usize) -> Result<u16, Error> {
@@ -108,9 +131,12 @@ impl WritePort for Port {
     fn check(&mut self, seed: u32) -> Result<Folds, Error> {
         // Plain load and store: bt0 runs with the MMU off, where the
         // exclusive accesses of an atomic read-modify-write (swap) abort.
-        if APPLY() && DIRTY.load(core::sync::atomic::Ordering::Relaxed) {
-            DIRTY.store(false, core::sync::atomic::Ordering::Relaxed);
-            cubie_a7a_dram::blobless::apply_delays(&mut self.0, DBYTES / 2)?;
+        // Fail closed: the pending flag clears only after a successful apply,
+        // so an apply error propagates and leaves the stage failed.
+        if APPLY() {
+            let hw = &mut self.0;
+            self.1
+                .apply(&mut || cubie_a7a_dram::blobless::apply_delays(hw, DBYTES / 2))?;
         }
         for &b in self::probe!().iter() {
             for a in (b..b + BLOCK_BYTES).step_by(4) {
@@ -149,7 +175,7 @@ impl MrPort for Port {
 
 /// Two ports on one `Bt0Hw` (a unit struct): the write side and the MR side.
 fn ports() -> (Port, Port) {
-    (Port(Bt0Hw), Port(Bt0Hw))
+    (Port(Bt0Hw, Ledger::new()), Port(Bt0Hw, Ledger::new()))
 }
 
 fn print_delays(tag: &str, tg: usize, d: &Delays) {
@@ -171,15 +197,26 @@ pub fn run() -> bool {
         "[dram] WR: stage bits {:x}, probe blocks {PROBE:08x?} x {BLOCK_BYTES} B",
         BITS()
     );
-    let mut blind_clean = false;
+    let before = match wrtrain::snapshot(&mut p) {
+        Ok(b) => b,
+        Err(e) => {
+            println!("[dram] WR: reading the delays found before failed: {e:?}; stopping");
+            return false;
+        }
+    };
+    // A step that fails and is recovered from still fails the stage: the
+    // hand-over gate must not be set after any write-stage failure.
+    let mut degraded = false;
+    let mut blind_start: Option<BlindStart> = None;
     if BITS() & 0x10 != 0 {
         match wrtrain::blind_baseline(&mut p, &mut seed) {
             Ok((v, left)) => {
                 println!(
                     "[dram] WR: blind start: TxDqDly per DBYTE {v:03x?}, error bits left {left}"
                 );
-                blind_clean = left == 0;
-                if blind_clean
+                let mut clean = left == 0;
+                let mut delays = v;
+                if clean
                     && cubie_a7a_dram::knobs::env(
                         "A7A_WR_BLIND_CENTER",
                         crate::knob!("A7A_WR_BLIND_CENTER"),
@@ -191,31 +228,48 @@ pub fn run() -> bool {
                             println!(
                                 "[dram] WR: blind centre: TxDqDly per DBYTE {c:03x?}, clean runs {run:03x?}, error bits left {left}"
                             );
-                            blind_clean = left == 0;
+                            delays = c;
+                            clean = left == 0;
                         }
                         Err(e) => {
                             println!("[dram] WR: blind centre failed: {e:?}; stopping");
-                            return false;
+                            return undo(&mut p, &before);
                         }
                     }
                 }
+                blind_start = Some(BlindStart {
+                    delays,
+                    error_bits: if clean { 0 } else { left },
+                });
             }
             Err(e) => {
                 println!("[dram] WR: blind start failed: {e:?}; stopping");
-                return false;
+                return undo(&mut p, &before);
             }
         }
     }
-    let m = match wrtrain::measure(&mut p, &mut seed) {
-        Ok(m) => m,
-        Err(e) if blind_clean => {
-            println!("[dram] WR: discovery failed: {e:?}; the blind start is clean, keeping it");
-            return final_check(&mut p, &mut seed);
-        }
-        Err(e) => {
-            println!("[dram] WR: discovery failed: {e:?}; stopping");
-            return false;
-        }
+    let blind_clean = blind_start.as_ref().is_some_and(BlindStart::clean);
+    let m = match blind_start.as_ref() {
+        Some(start) => match wrtrain::discover_or_restore(&mut p, &mut seed, start, &before) {
+            BlindRun::Map(m) => m,
+            BlindRun::KeepBlind(e) => {
+                println!(
+                    "[dram] WR: discovery failed: {e:?}; the blind start is clean, keeping it"
+                );
+                return finish(&mut p, &before, &mut seed);
+            }
+            BlindRun::Failed(e) => {
+                println!("[dram] WR: discovery failed: {e:?}; the delays are back; stopping");
+                return false;
+            }
+        },
+        None => match wrtrain::discover(&mut p, &mut seed) {
+            Ok(m) => m,
+            Err(e) => {
+                println!("[dram] WR: discovery failed: {e:?}; stopping");
+                return undo(&mut p, &before);
+            }
+        },
     };
     println!(
         "[dram] WR: blocks tg {:?}, DBYTEs {:x?}, on both tg {:04x}",
@@ -229,28 +283,23 @@ pub fn run() -> bool {
             m.reachable(db, 1)
         );
     }
-    match m.check::<Error>() {
-        Ok(()) => {}
-        Err(e) if blind_clean => {
-            println!("[dram] WR: discovery failed: {e:?}; the blind start is clean, keeping it");
-            return final_check(&mut p, &mut seed);
-        }
-        Err(e) => {
-            println!("[dram] WR: discovery failed: {e:?}; stopping");
-            return false;
-        }
-    }
     if blind_clean && BITS() & 0x20 == 0 {
         println!(
             "[dram] WR: discovery holds; no centring asked for (stage bit 20): the blind start is clean, keeping it"
         );
-        return final_check(&mut p, &mut seed);
+        return finish(&mut p, &before, &mut seed);
     }
     let mut pmu = [[[0u16; LANES]; DBYTES]; 2];
     for (tg, d) in pmu.iter_mut().enumerate() {
         for (db, lanes) in d.iter_mut().enumerate() {
             for (lane, v) in lanes.iter_mut().enumerate() {
-                *v = p.tx_dq(db, lane, tg).unwrap_or(0);
+                *v = match p.tx_dq(db, lane, tg) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        println!("[dram] WR: reading a delay failed: {e:?}; stopping");
+                        return undo(&mut p, &before);
+                    }
+                };
             }
         }
         print_delays("before", tg, d);
@@ -299,6 +348,7 @@ pub fn run() -> bool {
                 println!(
                     "[dram] WR: centring tg {tg} failed: {e:?}; the delays found before are back"
                 );
+                degraded = true;
             }
         }
     }
@@ -336,7 +386,15 @@ pub fn run() -> bool {
             let mut cur = [[0u8; 2]; 2];
             for (ch, c) in cur.iter_mut().enumerate() {
                 for (k, ma) in [14u8, 15].into_iter().enumerate() {
-                    c[k] = wrtrain::read_operating(&mut mp, ch, tg, ma).unwrap_or(0x2e) & 0x7f;
+                    c[k] = match wrtrain::read_operating(&mut mp, ch, tg, ma) {
+                        Ok(v) => v & 0x7f,
+                        Err(e) => {
+                            println!(
+                                "[dram] WR: tg {tg} ch {ch} MR{ma} read failed: {e:?}; stopping"
+                            );
+                            return undo(&mut p, &before);
+                        }
+                    };
                 }
             }
             println!("[dram] WR: tg {tg} operating MR14/MR15 per channel {cur:02x?}");
@@ -346,6 +404,7 @@ pub fn run() -> bool {
                 Ok(Some(b)) => b,
                 r => {
                     println!("[dram] WR: tg {tg} Vref byte identification: {r:?}; no sweep");
+                    degraded = true;
                     continue;
                 }
             };
@@ -382,12 +441,14 @@ pub fn run() -> bool {
                             }
                             Err(e) => {
                                 println!("[dram] WR: re-centring tg {tg} failed: {e:?}");
+                                degraded = true;
                             }
                         }
                     }
                 }
                 Err(e) => {
                     println!("[dram] WR: Vref sweep tg {tg} failed: {e:?}");
+                    degraded = true;
                 }
             }
         }
@@ -402,25 +463,12 @@ pub fn run() -> bool {
         }
         println!("[dram] WR: measurement only; the delays found before are back");
     }
-    final_check(&mut p, &mut seed)
-}
-
-/// Four compares of every probe block with fresh seeds; true when all are
-/// clean.
-fn final_check(p: &mut Port, seed: &mut u32) -> bool {
-    let mut bad = 0u32;
-    for _ in 0..4 {
-        *seed = seed.wrapping_add(0x9e37_79b9);
-        if let Ok(f) = p.check(*seed) {
-            for (b, v) in f.iter().enumerate() {
-                if *v != 0 {
-                    bad |= 1 << b;
-                }
-            }
-        }
+    let clean = finish(&mut p, &before, &mut seed);
+    if degraded {
+        println!("[dram] WR: a step failed; the stage does not pass");
+        return undo(&mut p, &before);
     }
-    println!("[dram] WR: final probe check: failing blocks {bad:04x}");
-    bad == 0
+    clean
 }
 
 /// The probe blocks of a compare: [`PROBE`] itself (the same tokens as

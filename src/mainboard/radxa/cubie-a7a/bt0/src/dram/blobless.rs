@@ -381,8 +381,13 @@ fn wck_level(p: &mut Para) {
         read_enable(bases);
         #[cfg(not(feature = "rd-measure"))]
         {
+            // Fail-closed: the hand-over gate is the conjunction of the read
+            // training, both MR16 window writes and the lean hand-over. Any
+            // failure leaves MISSION_OK unset and bt0 halts.
+            let mut stages = blobless::StageResults::new();
             if let Some((before, _)) = blobless::RD_FSPWR() {
                 let f = blobless::mr16_all(&mut Bt0Hw, before);
+                stages = stages.mr16_before_result(f);
                 println!("[dram] RD: MR16 {before:02x} to all ranks before the read training: failure {f:?}");
             }
             if blobless::RD_PULSE_RESTORE() {
@@ -393,12 +398,14 @@ fn wck_level(p: &mut Para) {
                 );
             }
             let applied = read_training_staged(bases);
+            stages = stages.read_training_result(applied);
             if let Some((_, after)) = blobless::RD_FSPWR() {
                 let f = blobless::mr16_all(&mut Bt0Hw, after);
+                stages = stages.mr16_after_result(f);
                 println!("[dram] RD: MR16 {after:02x} to all ranks after the read training: failure {f:?}");
             }
             #[cfg(any(dram_mission, feature = "hybrid"))]
-            if applied {
+            if stages.read_training && stages.mr16_before && stages.mr16_after {
                 let relock = cubie_a7a_dram::knobs::get().bl_relock;
                 let r = blobless::mission_handover_relock(&mut Bt0Hw, p, stage_pstate(), relock);
                 println!("[dram] MISSION: PLL/DLL relock before the DFI init: {relock}");
@@ -406,17 +413,18 @@ fn wck_level(p: &mut Para) {
                     "[dram] MISSION: lean hand-over at pstate {}: {r:?}",
                     stage_pstate()
                 );
+                stages = stages.handover_result(r.is_ok());
                 if r.is_ok() {
                     let clean = mission_stages();
+                    stages = stages.write_stage_result(clean);
                     #[cfg(dram_mission)]
                     // SAFETY: bt0 is single-threaded.
                     unsafe {
-                        MISSION_OK = clean;
+                        MISSION_OK = stages.mission_ok();
                     }
-                    let _ = clean;
                 }
             } else {
-                println!("[dram] MISSION: skipped, read training not applied on every block");
+                println!("[dram] MISSION: skipped, a required mode-register or read-training step failed");
             }
             #[cfg(feature = "handover")]
             if applied {
