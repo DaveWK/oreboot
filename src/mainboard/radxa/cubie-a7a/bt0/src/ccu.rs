@@ -27,9 +27,9 @@ const DSU_PLL: usize = CPU_PLL_CFG_BASE + 0x3000;
 pub const UART0_BGR: usize = CCU_BASE + 0xe00;
 pub const SMHC0_CLK: usize = CCU_BASE + 0xd00;
 pub const SMHC0_BGR: usize = CCU_BASE + 0xd0c;
-#[cfg(any(feature = "emmc", feature = "fastboot"))]
+#[cfg(any(medium, feature = "fastboot"))]
 pub const SMHC2_CLK: usize = CCU_BASE + 0xd20;
-#[cfg(any(feature = "emmc", feature = "fastboot"))]
+#[cfg(any(medium, feature = "fastboot"))]
 pub const SMHC2_BGR: usize = CCU_BASE + 0xd2c;
 #[cfg(any(feature = "spinor", feature = "fastboot"))]
 pub const SPI0_CLK: usize = CCU_BASE + 0xf00;

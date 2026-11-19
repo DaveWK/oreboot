@@ -165,6 +165,14 @@ SECTIONS {
 
 fn main() {
     let out = &PathBuf::from(env::var_os("OUT_DIR").unwrap());
+    // `medium`: a bt0 the mask ROM loads from an SD card or the eMMC
+    // module (every build but `fel` and `spinor`); it picks the medium at
+    // run time from the eGON boot_media byte (main.rs) and so carries both
+    // the SMHC0 and the SMHC2 code. Feature `emmc` is kept as an alias.
+    println!("cargo:rustc-check-cfg=cfg(medium)");
+    if env::var_os("CARGO_FEATURE_FEL").is_none() && env::var_os("CARGO_FEATURE_SPINOR").is_none() {
+        println!("cargo:rustc-cfg=medium");
+    }
     let fastboot = env::var_os("CARGO_FEATURE_FASTBOOT").is_some();
     let lab = env::var_os("CARGO_FEATURE_DRAM_LAB").is_some();
     let memory = if env::var_os("CARGO_FEATURE_FEL").is_some() {

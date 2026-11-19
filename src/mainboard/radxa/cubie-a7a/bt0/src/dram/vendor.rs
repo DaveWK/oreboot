@@ -100,6 +100,7 @@ fn av3_dump(size: c_int) {
 /// The full dump: read-path CSRs, the read-path read-backs, the TRM CSR
 /// snapshot, the controller's read latency, the per-pstate trained delays.
 #[cfg(not(any(feature = "av3g", feature = "av3h")))]
+#[cfg_attr(not(feature = "av3-dump"), allow(dead_code))]
 fn av3_dump_body(_size: c_int, _pstate: u16) {
     const PSTATE: usize = phy(0x2008b);
     let dbyte = |db: usize, off: usize| phy(0x10000 + 0x1000 * db + off);

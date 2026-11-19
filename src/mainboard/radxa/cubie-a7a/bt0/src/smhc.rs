@@ -39,11 +39,11 @@ const GCTRL: usize = 0x00;
 const CLKDIV: usize = 0x04;
 const TMOUT: usize = 0x08;
 const CTYPE: usize = 0x0c;
-#[cfg(any(feature = "emmc", feature = "fastboot"))]
+#[cfg(any(medium, feature = "fastboot"))]
 const HWRST: usize = 0x78;
 /// EMMC_DDR_SBIT_DET: HALF_START_BIT, set for eMMC 4.5 and later, clear
 /// for SD.
-#[cfg(any(feature = "emmc", feature = "fastboot"))]
+#[cfg(any(medium, feature = "fastboot"))]
 const EMMC_DDR_SBIT_DET: usize = 0x10c;
 const BLKSZ: usize = 0x10;
 const BYTECNT: usize = 0x14;
@@ -146,21 +146,21 @@ pub struct Smhc {
     rca: u32,
     high_capacity: bool,
     /// SMHC2 with an eMMC: the eMMC allow-list applies.
-    #[cfg(any(feature = "emmc", feature = "fastboot"))]
+    #[cfg(any(medium, feature = "fastboot"))]
     emmc: bool,
     /// The eMMC module detect (GPADC0) is consulted.
-    #[cfg(any(feature = "emmc", feature = "fastboot"))]
+    #[cfg(any(medium, feature = "fastboot"))]
     detect: bool,
 }
 
 /// The eMMC write commands exist in this build.
-#[cfg(any(feature = "emmc", feature = "fastboot"))]
+#[cfg(any(medium, feature = "fastboot"))]
 const EMMC_WRITE: bool = cfg!(feature = "fastboot-emmc-write");
 
 /// SDC2 pins on port C, function 3 (SoC pinout): DS PC0, RST PC1, CLK PC5,
 /// CMD PC6, D0 PC10, D1 PC13, D2 PC15, D3 PC8, D4 PC9, D5 PC11, D6 PC14,
 /// D7 PC16. PC2/3/4/12 are SPI0 (the NOR), PC7 the EEPROM write protect.
-#[cfg(any(feature = "emmc", feature = "fastboot"))]
+#[cfg(any(medium, feature = "fastboot"))]
 const SDC2_PINS: [u32; 12] = [0, 1, 5, 6, 8, 9, 10, 11, 13, 14, 15, 16];
 
 impl Smhc {
@@ -189,9 +189,9 @@ impl Smhc {
             base,
             rca: 0,
             high_capacity: false,
-            #[cfg(any(feature = "emmc", feature = "fastboot"))]
+            #[cfg(any(medium, feature = "fastboot"))]
             emmc: false,
-            #[cfg(any(feature = "emmc", feature = "fastboot"))]
+            #[cfg(any(medium, feature = "fastboot"))]
             detect: false,
         }
     }
@@ -201,7 +201,7 @@ impl Smhc {
     /// switched on again by `axp` as dc1sw2). `detect`: consult the
     /// module detect (BOOT-SEL on GPADC0) before identification; the eMMC
     /// boot leaves it off (the mask ROM just loaded bt0 from the module).
-    #[cfg(any(feature = "emmc", feature = "fastboot"))]
+    #[cfg(any(medium, feature = "fastboot"))]
     pub fn new_smhc2(base: usize, detect: bool) -> Self {
         for pin in SDC2_PINS {
             // CLK unpulled; DS (unused below HS400) pulled down; CMD, data
@@ -291,11 +291,11 @@ impl Smhc {
         resp: Resp,
         data: Option<&mut [u32]>,
     ) -> Result<[u32; 4], Error> {
-        #[cfg(not(any(feature = "emmc", feature = "fastboot")))]
+        #[cfg(not(any(medium, feature = "fastboot")))]
         if !cubie_a7a_fastboot::sd::command_allowed(idx) {
             return Err(Error::Unsupported("SD command not allowed (read-only)"));
         }
-        #[cfg(any(feature = "emmc", feature = "fastboot"))]
+        #[cfg(any(medium, feature = "fastboot"))]
         if self.emmc {
             if !cubie_a7a_fastboot::emmc::command_allowed(idx, arg, EMMC_WRITE)
                 || matches!(idx, 24 | 25)
@@ -547,7 +547,7 @@ impl Smhc {
 
 /// The eMMC controller for cubie_a7a_fastboot::emmc (the eMMC boot path
 /// and fastboot's eMMC targets; the gate in `cmd_data` applies).
-#[cfg(any(feature = "emmc", feature = "fastboot"))]
+#[cfg(any(medium, feature = "fastboot"))]
 impl cubie_a7a_fastboot::emmc::MmcBus for Smhc {
     fn present(&mut self) -> Option<bool> {
         if !self.detect {
@@ -704,7 +704,7 @@ impl cubie_a7a_fastboot::sd::SdBus for Smhc {
 #[cfg(feature = "fastboot")]
 const SD_CD_PIN: u32 = 6;
 
-#[cfg(any(feature = "emmc", feature = "fastboot"))]
+#[cfg(any(medium, feature = "fastboot"))]
 fn map_resp(r: cubie_a7a_fastboot::sd::Resp) -> Resp {
     use cubie_a7a_fastboot::sd::Resp as R;
     match r {
@@ -718,7 +718,7 @@ fn map_resp(r: cubie_a7a_fastboot::sd::Resp) -> Resp {
     }
 }
 
-#[cfg(any(feature = "emmc", feature = "fastboot"))]
+#[cfg(any(medium, feature = "fastboot"))]
 fn bus_error(e: Error) -> cubie_a7a_fastboot::sd::BusError {
     use cubie_a7a_fastboot::sd::BusError;
     match e {

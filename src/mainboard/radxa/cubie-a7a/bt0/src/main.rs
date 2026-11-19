@@ -12,17 +12,18 @@
 //! reads the layout table and the images from there (spinor.rs). With
 //! feature `emmc` the mask ROM loads it from the eMMC module (SMHC2), and
 //! bt0 reads the layout table and the images from the eMMC's user area at
-//! the SD card's offsets (smhc.rs, cubie_a7a_fastboot::emmc). Feature
+//! the SD card's offsets (smhc.rs, cubie_a7a_fastboot::emmc). Every build
+//! the mask ROM loads from a medium (all but `fel` and `spinor`, cfg
+//! `medium` from build.rs) carries both: the eGON boot_media byte picks the
+//! SD card or the eMMC at run time, the other medium is the fallback, and
+//! feature `emmc` is an alias kept for existing build lines. Feature
 //! `fastboot` (with `fel`) adds FEL entry 4: bt0 serves the stock fastboot
 //! tool on the USB-C port (fastboot.rs, musb.rs).
 #![no_std]
 #![no_main]
 #![cfg_attr(feature = "dramlib", feature(c_variadic))]
 // The FEL and SPI NOR builds have no SD boot path; its helpers stay compiled.
-#![cfg_attr(
-    any(feature = "fel", feature = "spinor", feature = "emmc"),
-    allow(dead_code)
-)]
+#![cfg_attr(any(feature = "fel", feature = "spinor"), allow(dead_code))]
 
 #[cfg(all(feature = "fel", feature = "spinor"))]
 compile_error!("features `fel` and `spinor` exclude each other");
@@ -487,8 +488,15 @@ fn bring_up_pre() -> Pre {
     dram::report_previous_trace();
     // The vendor recovery reads the SD card and replaces bt0 at 0x47000,
     // the FEL code's memory; the FEL boot starts its attempt in entry 2.
-    #[cfg(not(any(feature = "fel", feature = "spinor", feature = "emmc")))]
-    {
+    // From the eMMC (boot_media 0x02/0x12) there is no vendor SPL to fall
+    // back to: report and try again, as the NOR does.
+    #[cfg(medium)]
+    if boot_media_is_emmc(boot_media()) {
+        if recovery::previous_boot_failed() {
+            println!("[bt0] the previous boot never reached EDK2's boot manager; trying again");
+        }
+        recovery::begin_attempt();
+    } else {
         if recovery::previous_boot_failed() {
             println!("[bt0] the previous boot never reached EDK2's boot manager");
             let mut sd = smhc::Smhc::new_smhc0(soc::SMHC0_BASE);
@@ -502,9 +510,9 @@ fn bring_up_pre() -> Pre {
         }
         recovery::begin_attempt();
     }
-    // No vendor SPL on the NOR or the eMMC (and the SD slot of the board
-    // under test is dead): report the failed attempt and try oreboot again.
-    #[cfg(any(feature = "spinor", feature = "emmc"))]
+    // No vendor SPL on the NOR: report the failed attempt and try oreboot
+    // again.
+    #[cfg(feature = "spinor")]
     {
         if recovery::previous_boot_failed() {
             println!("[bt0] the previous boot never reached EDK2's boot manager; trying again");
@@ -653,15 +661,54 @@ fn enter_main(b: &Bringup, mut handoff: Handoff, main_entry: u32) -> ! {
     rmr_switch(main_entry)
 }
 
-#[cfg(not(any(feature = "fel", feature = "spinor", feature = "emmc")))]
+/// eGON boot_media byte, written by the mask ROM into the copy of bt0 it
+/// ran (sunxi convention: 0x00/0x10 SMHC0 at 8/128 KiB, 0x02/0x12 SMHC2
+/// at 8/128 KiB or a boot partition; 0x12 seen from the eMMC user area).
+/// Our image ships 0 there.
+#[cfg(medium)]
+fn boot_media() -> u8 {
+    unsafe { core::ptr::read_volatile((SRAM_BASE as usize + 0x28) as *const u8) }
+}
+
+#[cfg(medium)]
+fn boot_media_is_emmc(media: u8) -> bool {
+    media & 0x0f == 2
+}
+
+/// A medium boot (SD card or eMMC module): the boot_media byte picks the
+/// medium the mask ROM loaded bt0 from; the other one is the fallback if
+/// the first cannot be initialised (no card, no module). Any other value
+/// tries the SD card first. Once a medium is up, a failed read or CRC
+/// halts as before (the watchdog resets the board).
+#[cfg(medium)]
 #[unsafe(no_mangle)]
 extern "C" fn main() -> ! {
+    let media = boot_media();
     let b = bring_up();
+    println!("[bt0] boot media byte from the mask ROM: {media:#04x}");
+    let emmc_first = boot_media_is_emmc(media);
+    if !matches!(media & 0x0f, 0 | 2) {
+        println!("[bt0] boot media byte not SMHC0/SMHC2: trying the SD card, then the eMMC");
+    }
+    for emmc in [emmc_first, !emmc_first] {
+        if emmc {
+            // Module detect only when the ROM did not just load us from it.
+            boot_emmc(&b, !emmc_first);
+        } else {
+            boot_sd(&b);
+        }
+    }
+    println!("[bt0] no medium to boot from");
+    halt()
+}
 
+/// SD boot; returns only if the card cannot be initialised.
+#[cfg(medium)]
+fn boot_sd(b: &Bringup) {
     let mut sd = smhc::Smhc::new_smhc0(soc::SMHC0_BASE);
     if let Err(e) = sd.init_card() {
         println!("[bt0] SD init failed: {e:?}");
-        halt();
+        return;
     }
     soc::stage(8);
     let table = read_layout(&sd);
@@ -681,7 +728,7 @@ extern "C" fn main() -> ! {
         println!("[bt0] layout: no oreboot main image");
         halt();
     };
-    enter_main(&b, handoff, main_entry)
+    enter_main(b, handoff, main_entry)
 }
 
 /// SPI NOR boot: the SD path with the NOR as the medium (spinor.rs).
@@ -767,28 +814,26 @@ extern "C" fn main() -> ! {
 /// mask ROM loaded bt0 from the eMMC (user area at 128 KiB, or a boot
 /// partition); the layout table and the images are always read from the
 /// user area at the SD card's offsets (firmware gap 128 KiB..8 MiB).
-#[cfg(feature = "emmc")]
-#[unsafe(no_mangle)]
-extern "C" fn main() -> ! {
+/// Returns only if the module cannot be identified (`detect`: consult the
+/// BOOT-SEL module detect first, for the fallback after the SD card).
+#[cfg(medium)]
+fn boot_emmc(b: &Bringup, detect: bool) {
     use cubie_a7a_fastboot::emmc::{Card, WORDS};
     use cubie_a7a_fastboot::emmcarm::Part;
-    // eGON boot_media byte, written by the mask ROM into the copy it ran
-    // (sunxi: 0x02 SMHC2 at 8 KiB or a boot partition, 0x12 at 128 KiB).
-    let media = unsafe { core::ptr::read_volatile((SRAM_BASE as usize + 0x28) as *const u8) };
-    let b = bring_up();
-    println!("[bt0] boot media byte from the mask ROM: {media:#04x}");
-    if let Some(mv) = gpadc::read_mv(0) {
-        println!("[bt0] BOOT-SEL (GPADC0): {mv} mV");
+    if !detect {
+        if let Some(mv) = gpadc::read_mv(0) {
+            println!("[bt0] BOOT-SEL (GPADC0): {mv} mV");
+        }
     }
 
-    let mut host = smhc::Smhc::new_smhc2(soc::SMHC2_BASE, false);
+    let mut host = smhc::Smhc::new_smhc2(soc::SMHC2_BASE, detect);
     let mut ext = [0u32; WORDS];
     let t0 = soc::time_us();
     let mut card = match Card::identify(&mut host, &mut ext, 8, false) {
         Ok(c) => c,
         Err(e) => {
             println!("[bt0] eMMC init failed: {e:?}");
-            halt();
+            return;
         }
     };
     let f = card.fields;
@@ -857,7 +902,7 @@ extern "C" fn main() -> ! {
         println!("[bt0] layout: no oreboot main image");
         halt();
     };
-    enter_main(&b, handoff, main_entry)
+    enter_main(b, handoff, main_entry)
 }
 
 #[panic_handler]
