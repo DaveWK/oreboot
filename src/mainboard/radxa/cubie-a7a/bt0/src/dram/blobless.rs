@@ -928,10 +928,17 @@ fn end_of_init(p: &mut Para) -> blobless::EndInitReport {
         "[dram] end of init: {} launches, {} writes, max {} us, {} us, failure {:?}",
         e.launches, e.writes, e.max_launch_us, e.elapsed_us, e.failure
     );
+    let v = e.variant;
+    if !v.is_reference() {
+        println!(
+            "[dram] end of init BISECT: skip {:04x}, no MRW to MAs {:x} (bit n = MA n), MR16 {:02x}/{:02x}",
+            v.skip, v.no_mrw, v.mr16_write, v.mr16_switch
+        );
+    }
     for (k, m) in e.mrs.iter().enumerate() {
         println!(
-            "[dram] end of init block {k}: MR16 41, {:02x?}, then MR16 45",
-            m.mr
+            "[dram] end of init block {k}: MR16 {:02x}, {:02x?}, then MR16 {:02x}",
+            v.mr16_write, m.mr, v.mr16_switch
         );
     }
     e
@@ -1060,7 +1067,11 @@ pub fn init_one(para: &[u32; 32]) -> Option<u32> {
 /// trained the pstate and our mission bring-up relocked the PHY (open
 /// backend, variant bit 7), PUBMODE back to 1 and our own stages from
 /// WCK2CK leveling on (env `A7A_HYBRID_SKIP_WL`: from the read training
-/// on), then the lean hand-over (`bl-mission`), then the halt.
+/// on), then the lean hand-over (`bl-mission`), then the halt. Env
+/// `A7A_HYBRID_ENDINIT` runs our end of initialization first (bisect knobs:
+/// `blobless::END_OF_INIT_VARIANT`); `A7A_HYBRID_NO_WL` then goes straight
+/// to the lean hand-over, with no leveling or read training (the firmware's
+/// trained delays stay).
 #[cfg(feature = "hybrid")]
 pub fn hybrid_after_pmu(p: &mut Para) -> ! {
     use cubie_a7a_dram::phy::{csr, csr_access};
@@ -1077,7 +1088,10 @@ pub fn hybrid_after_pmu(p: &mut Para) -> ! {
             e.failure
         );
     }
-    if option_env!("A7A_HYBRID_SKIP_WL").is_some() {
+    if option_env!("A7A_HYBRID_NO_WL").is_some() {
+        let r = blobless::mission_handover(&mut Bt0Hw, p, PROBE_PSTATE);
+        println!("[dram] MISSION (hybrid, no leveling, no read training): {r:?}");
+    } else if option_env!("A7A_HYBRID_SKIP_WL").is_some() {
         let bases = blobless::wl_mr18_bases(p, PROBE_PSTATE);
         let applied = read_training(bases);
         if applied {

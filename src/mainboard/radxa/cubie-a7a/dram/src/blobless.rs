@@ -157,13 +157,31 @@ pub fn message_block(p: &mut Para, pstate: u32) -> [u16; crate::phy::msgblock::W
     crate::phy::msgblock::build(p, pstate, c.data_mhz, rl)
 }
 
+/// FEL lab, measurement only: the MR18 base of WCK2CK leveling and
+/// read training on every block instead of the message block's, from env
+/// `A7A_HYBRID_WL_MR18` (hex) at build time. The leveling's last MRW leaves
+/// MR18 = base in the DRAM's FSP-WR set; after our end of initialization
+/// FSP-WR is the operating set (MR16 0x45), in the PMU-trained state
+/// without it possibly not.
+const WL_MR18: Option<u8> = match option_env!("A7A_HYBRID_WL_MR18") {
+    Some(s) => match u8::from_str_radix(s, 16) {
+        Ok(v) => Some(v),
+        Err(_) => panic!("A7A_HYBRID_WL_MR18 is not a hex byte"),
+    },
+    None => None,
+};
+
 /// WCK2CK leveling MR18 bases per [`crate::wl::BLOCKS`] entry, from the
-/// message block (`wcklevel::Mr18Base::from_message_block`).
+/// message block (`wcklevel::Mr18Base::from_message_block`), or the FEL
+/// lab's `A7A_HYBRID_WL_MR18`.
 pub fn wl_mr18_bases(p: &mut Para, pstate: u32) -> [Option<crate::phy::wcklevel::Mr18Base>; 4] {
     let m = message_block(p, pstate);
     let mut out = [None; 4];
     for (o, &(ch, rank)) in out.iter_mut().zip(crate::wl::BLOCKS.iter()) {
-        *o = crate::phy::wcklevel::Mr18Base::from_message_block(&m, ch, rank);
+        *o = match WL_MR18 {
+            Some(v) => crate::phy::wcklevel::Mr18Base::new(v),
+            None => crate::phy::wcklevel::Mr18Base::from_message_block(&m, ch, rank),
+        };
     }
     out
 }
@@ -194,9 +212,28 @@ fn mission_mr_overrides(f: &mut crate::phy::endinit::FspMrs) {
     }
 }
 
+/// FEL lab bisect of the end of initialization, measurement only:
+/// the [`crate::phy::endinit::Variant`] from env at build time,
+/// `A7A_HYBRID_EI_SKIP` (hex `endinit::skip` bits), `A7A_HYBRID_EI_NO_MRW`
+/// (decimal MAs, comma-separated, or `all`) and `A7A_HYBRID_EI_MR16`
+/// (`write,switch` hex; either empty keeps the reference's). Unset: the
+/// reference stage. Applies wherever [`end_of_init`] runs (feature
+/// `hybrid` with `A7A_HYBRID_ENDINIT`, and the blobless flow).
+pub const END_OF_INIT_VARIANT: crate::phy::endinit::Variant =
+    match crate::phy::endinit::Variant::parse(
+        option_env!("A7A_HYBRID_EI_SKIP"),
+        option_env!("A7A_HYBRID_EI_NO_MRW"),
+        option_env!("A7A_HYBRID_EI_MR16"),
+    ) {
+        Some(v) => v,
+        None => panic!("A7A_HYBRID_EI_SKIP/_NO_MRW/_MR16 malformed"),
+    };
+
 /// The end-of-initialization stage's run ([`end_of_init`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EndInitReport {
+    /// The variant that ran ([`END_OF_INIT_VARIANT`]).
+    pub variant: crate::phy::endinit::Variant,
     /// MR values per [`crate::phy::endinit::BLOCKS`] entry.
     pub mrs: [crate::phy::endinit::FspMrs; 4],
     pub launches: u16,
@@ -224,16 +261,18 @@ pub fn end_of_init<H: Hw>(hw: &mut H, p: &mut Para, pstate: u32) -> EndInitRepor
     }
     let t0 = hw.now_us();
     let mut ex = crate::wl::WlExec::new(hw);
-    endinit::run(
+    endinit::run_with(
         Channel::B,
         |ch, rank| {
             let mut f = FspMrs::from_message_block(&m, ch, rank);
             mission_mr_overrides(&mut f);
             f
         },
+        &END_OF_INIT_VARIANT,
         &mut |s| ex.step(s),
     );
     let r = EndInitReport {
+        variant: END_OF_INIT_VARIANT,
         mrs,
         launches: ex.launches,
         writes: ex.writes,
