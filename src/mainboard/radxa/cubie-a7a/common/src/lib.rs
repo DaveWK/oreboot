@@ -66,7 +66,7 @@ pub mod mem {
             return false;
         };
         entry >= base
-            && entry % 4 == 0
+            && entry.is_multiple_of(4)
             && entry.checked_add(4).is_some_and(|end| end <= base + size)
     }
 
