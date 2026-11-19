@@ -266,11 +266,11 @@ fn wck_level(p: &mut Para) {
     }
     let bad = wl::end(&mut Bt0Hw, &saved);
     println!("[dram] WL: lane maps restored, mismatch mask {bad:x}");
-    if blobless::WL_TXWCK_ADD != 0 {
+    if blobless::WL_TXWCK_ADD() != 0 {
         let after = blobless::wl_txwck_add(&mut Bt0Hw);
         println!(
             "[dram] WL: TxWckDly +{:x} (held update): Tg0 per DBYTE {after:03x?}",
-            blobless::WL_TXWCK_ADD
+            blobless::WL_TXWCK_ADD()
         );
     }
     #[cfg(feature = "hybrid")]
@@ -287,11 +287,11 @@ fn wck_level(p: &mut Para) {
         read_enable(bases);
         #[cfg(not(feature = "rd-measure"))]
         {
-            if let Some((before, _)) = blobless::RD_FSPWR {
+            if let Some((before, _)) = blobless::RD_FSPWR() {
                 let f = blobless::mr16_all(&mut Bt0Hw, before);
                 println!("[dram] RD: MR16 {before:02x} to all ranks before the read training: failure {f:?}");
             }
-            if blobless::RD_PULSE_RESTORE {
+            if blobless::RD_PULSE_RESTORE() {
                 let v = blobless::acsm_pulse_restore(&mut Bt0Hw);
                 println!(
                     "[dram] RD: ACSM read pulses -{} before the read training: {v:03x?}",
@@ -299,7 +299,7 @@ fn wck_level(p: &mut Para) {
                 );
             }
             let applied = read_training(bases);
-            if let Some((_, after)) = blobless::RD_FSPWR {
+            if let Some((_, after)) = blobless::RD_FSPWR() {
                 let f = blobless::mr16_all(&mut Bt0Hw, after);
                 println!("[dram] RD: MR16 {after:02x} to all ranks after the read training: failure {f:?}");
             }
@@ -720,6 +720,7 @@ fn read_training(bases: [Option<cubie_a7a_dram::phy::wcklevel::Mr18Base>; 4]) ->
     let base_cfg = TrainConfig {
         apply: !TRAIN_ONLY,
         mrl_override: cubie_a7a_dram::knobs::get().rd_mrl,
+        exit: cubie_a7a_dram::rdtrain::EXIT_MRS(),
         ..TrainConfig::PSTATE1
     };
     println!(
@@ -743,10 +744,10 @@ fn read_training(bases: [Option<cubie_a7a_dram::phy::wcklevel::Mr18Base>; 4]) ->
         rdtrain::MRL_FALLBACK,
         rd::VENDOR_RX_EN,
     );
-    if rdtrain::PASS_LANES != rdtrain::FULL {
+    if rdtrain::PASS_LANES() != rdtrain::FULL {
         println!(
             "[dram] RDT: A7A_RD_LANES {:03x}: lanes outside the mask (DMI = lane 8) left out of the pass tests",
-            rdtrain::PASS_LANES
+            rdtrain::PASS_LANES()
         );
     }
     // SAFETY: bt0 is single-threaded and nothing else refers to it.
@@ -1033,55 +1034,56 @@ fn end_of_init(p: &mut Para) -> blobless::EndInitReport {
     e
 }
 
-/// FEL lab: print the hand-over knobs (`blobless::HO_RDDATA_EN`,
-/// `blobless::HO_MR2`) when set.
+/// FEL lab: print the hand-over knobs (`blobless::HO_RDDATA_EN()`,
+/// `blobless::HO_MR2()`) when set.
 fn print_ho_knobs() {
-    if blobless::HO_RDDATA_EN.is_some()
-        || blobless::HO_MR2.is_some()
-        || blobless::HO_TXWCK_ADD != 0
-        || blobless::HO_RXEN_ADD != 0
+    if blobless::HO_RDDATA_EN().is_some()
+        || blobless::HO_MR2().is_some()
+        || blobless::HO_TXWCK_ADD() != 0
+        || blobless::HO_RXEN_ADD() != 0
     {
         println!(
             "[dram] HO knobs: dfi_t_rddata_en {:x?}, MR2 after the hand-over {:x?}, TxWckDly +{:x}, RxEnDly +{:x}",
-            blobless::HO_RDDATA_EN,
-            blobless::HO_MR2,
-            blobless::HO_TXWCK_ADD,
-            blobless::HO_RXEN_ADD
+            blobless::HO_RDDATA_EN(),
+            blobless::HO_MR2(),
+            blobless::HO_TXWCK_ADD(),
+            blobless::HO_RXEN_ADD()
         );
     }
-    if cubie_a7a_dram::obs::OBS_ARM != 0 || cubie_a7a_dram::obs::HO_RDCSLAT.is_some() {
+    if cubie_a7a_dram::obs::OBS_ARM() != 0 || cubie_a7a_dram::obs::HO_RDCSLAT().is_some() {
         println!(
             "[dram] OBS knobs: A7A_OBS_ARM {:x} (1 RX FIFO pointer check armed before the DFI init, 2 snapshots), dfi_tphy_rdcslat {:x?}",
-            cubie_a7a_dram::obs::OBS_ARM,
-            cubie_a7a_dram::obs::HO_RDCSLAT
+            cubie_a7a_dram::obs::OBS_ARM(),
+            cubie_a7a_dram::obs::HO_RDCSLAT()
         );
     }
-    if let Some(s) = option_env!("A7A_HO_CSRS") {
+    if let Some(s) = cubie_a7a_dram::knobs::env("A7A_HO_CSRS", option_env!("A7A_HO_CSRS")) {
         println!(
             "[dram] HO knobs: {} PHY CSR writes before the hand-over",
             s.split(',').count()
         );
     }
-    if let Some(s) = option_env!("A7A_HO_MRS") {
+    if let Some(s) = cubie_a7a_dram::knobs::env("A7A_HO_MRS", option_env!("A7A_HO_MRS")) {
         println!("[dram] HO knobs: operating-set MRWs after the hand-over {s}");
     }
-    if blobless::HO_EPILOGUE.is_some() || blobless::HO_FIFOINIT || blobless::HO_PULSE_RESTORE {
+    if blobless::HO_EPILOGUE().is_some() || blobless::HO_FIFOINIT() || blobless::HO_PULSE_RESTORE()
+    {
         println!(
             "[dram] HO knobs: epilogue MR16 {:x?} MRs {:x?} + ZQ latch + SR cycle, RX FIFO init {}, ACSM read pulses -{} {} {:05x?}",
-            blobless::HO_EPILOGUE,
+            blobless::HO_EPILOGUE(),
             blobless::EPILOGUE_MRS,
-            blobless::HO_FIFOINIT,
+            blobless::HO_FIFOINIT(),
             blobless::ACSM_PULSE_ADJUST,
-            blobless::HO_PULSE_RESTORE,
+            blobless::HO_PULSE_RESTORE(),
             blobless::ACSM_READ_PULSES
         );
     }
-    if blobless::HO_WCKON.is_some() || blobless::HO_DBICTL.is_some() || blobless::HO_SRCYCLE {
+    if blobless::HO_WCKON().is_some() || blobless::HO_DBICTL().is_some() || blobless::HO_SRCYCLE() {
         println!(
             "[dram] HO knobs: MSTR4.wck_on {:x?}, DBICTL {:x?} before the DFI init; self-refresh cycle at the end {}",
-            blobless::HO_WCKON,
-            blobless::HO_DBICTL,
-            blobless::HO_SRCYCLE
+            blobless::HO_WCKON(),
+            blobless::HO_DBICTL(),
+            blobless::HO_SRCYCLE()
         );
     }
 }
@@ -1092,7 +1094,10 @@ fn print_ho_knobs() {
 /// halting, and bt0 goes on (its DRAM tests, then main): the blob-free
 /// boot attempt. Unset: the halt, as before.
 #[cfg(feature = "bl-mission")]
-const BL_BOOT: bool = option_env!("A7A_BL_BOOT").is_some();
+#[allow(non_snake_case)]
+fn BL_BOOT() -> bool {
+    cubie_a7a_dram::knobs::env("A7A_BL_BOOT", option_env!("A7A_BL_BOOT")).is_some()
+}
 #[cfg(feature = "bl-mission")]
 static mut MISSION_OK: bool = false;
 
@@ -1194,7 +1199,9 @@ pub fn init_one(para: &[u32; 32]) -> Option<u32> {
                 if t.done == 8 && t.exec.failure.is_none() {
                     // The reference's end of initialization (target
                     // FSP mode registers, FSP-OP switch) before WL.
-                    if let Some(spec) = option_env!("A7A_FSP0_MRS") {
+                    if let Some(spec) =
+                        cubie_a7a_dram::knobs::env("A7A_FSP0_MRS", option_env!("A7A_FSP0_MRS"))
+                    {
                         let f = blobless::fsp0_mrs(&mut Bt0Hw, &mut p, PROBE_PSTATE);
                         println!("[dram] FSP0 MRs {spec} written (MR16 40 .. 00): failure {f:?}");
                     }
@@ -1215,7 +1222,7 @@ pub fn init_one(para: &[u32; 32]) -> Option<u32> {
     }
     #[cfg(feature = "bl-mission")]
     // SAFETY: bt0 is single-threaded.
-    if BL_BOOT && unsafe { MISSION_OK } {
+    if BL_BOOT() && unsafe { MISSION_OK } {
         match cubie_a7a_dram::size::boot_size_mib(&p) {
             Ok(mib) => {
                 println!("[dram] BLOBLESS BOOT: hand-over and write stage clean; {mib} MiB, continuing the boot");
@@ -1477,7 +1484,9 @@ pub fn hybrid_after_pmu(p: &mut Para) -> ! {
         hybrid_pstate()
     );
     print_ho_knobs();
-    if let Some(stage) = option_env!("A7A_HYBRID_COLD") {
+    if let Some(stage) =
+        cubie_a7a_dram::knobs::env("A7A_HYBRID_COLD", option_env!("A7A_HYBRID_COLD"))
+    {
         // FEL lab: our DevInit / cold init / CBT over the
         // PMU-trained state (blobless::hybrid_cold).
         let stage = (stage.as_bytes()[0] - b'0') as u32;
@@ -1488,7 +1497,7 @@ pub fn hybrid_after_pmu(p: &mut Para) -> ! {
             t.devinit.failure, t.exec.failure, t.done, t.channels[0].delay, t.channels[1].delay
         );
     }
-    if let Some(spec) = option_env!("A7A_FSP0_MRS") {
+    if let Some(spec) = cubie_a7a_dram::knobs::env("A7A_FSP0_MRS", option_env!("A7A_FSP0_MRS")) {
         let f = blobless::fsp0_mrs(&mut Bt0Hw, p, PROBE_PSTATE);
         println!("[dram] FSP0 MRs {spec} written (MR16 40 .. 00): failure {f:?}");
     }
@@ -1514,14 +1523,14 @@ pub fn hybrid_after_pmu(p: &mut Para) -> ! {
         }
     } else if k.hybrid_skip_wl {
         let bases = blobless::wl_mr18_bases(p, PROBE_PSTATE);
-        if let Some((before, _)) = blobless::RD_FSPWR {
+        if let Some((before, _)) = blobless::RD_FSPWR() {
             let f = blobless::mr16_all(&mut Bt0Hw, before);
             println!(
                 "[dram] RD: MR16 {before:02x} to all ranks before the read training: failure {f:?}"
             );
         }
         let applied = read_training(bases);
-        if let Some((_, after)) = blobless::RD_FSPWR {
+        if let Some((_, after)) = blobless::RD_FSPWR() {
             let f = blobless::mr16_all(&mut Bt0Hw, after);
             println!(
                 "[dram] RD: MR16 {after:02x} to all ranks after the read training: failure {f:?}"

@@ -70,8 +70,50 @@ pub struct EiSpec {
     pub fspwr0: Option<&'static str>,
 }
 
+/// The later lab knobs, read at run time through
+/// [`env`]: the lab mode's override when one was given (`NAME=value`, or
+/// `-NAME` for unset), else the build's `option_env!` value. Each knob's
+/// parser runs where it is used, as at build time (a malformed value
+/// panics there; the lab mode turns a panic into a halted run).
+pub const EXTRA: [&str; 32] = [
+    "A7A_BL_BOOT",
+    "A7A_CBT_CA_ADD",
+    "A7A_EXEC_HOLD_US",
+    "A7A_FETCH_PROBE",
+    "A7A_FSP0_MRS",
+    "A7A_HO_CDD",
+    "A7A_HO_CSRS",
+    "A7A_HO_DBICTL",
+    "A7A_HO_EPILOGUE",
+    "A7A_HO_FIFOINIT",
+    "A7A_HO_FIU",
+    "A7A_HO_MR2",
+    "A7A_HO_MRS",
+    "A7A_HO_PULSE_RESTORE",
+    "A7A_HO_RDCSLAT",
+    "A7A_HO_RDDATA_EN",
+    "A7A_HO_RXEN_ADD",
+    "A7A_HO_SRCYCLE",
+    "A7A_HO_TXWCK_ADD",
+    "A7A_HO_WCKON",
+    "A7A_HYBRID_COLD",
+    "A7A_NO_BOOST",
+    "A7A_OBS_ARM",
+    "A7A_RD_EXIT",
+    "A7A_RD_FSPWR",
+    "A7A_RD_GAPS",
+    "A7A_RD_LANES",
+    "A7A_RD_PULSE_RESTORE",
+    "A7A_SYS_SNAP",
+    "A7A_WL_TXWCK_ADD",
+    "A7A_WR_APPLY",
+    "A7A_WR_STAGE",
+];
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Knobs {
+    /// Overrides of [`EXTRA`] (by index): None = the build's value.
+    pub extra: [Option<Option<&'static str>>; EXTRA.len()],
     /// `A7A_OPEN_OPTS` (hex bit mask; bt0 `dram/open.rs`).
     pub open_opts: u32,
     /// `A7A_HYBRID_ENDINIT`, `_NO_WL`, `_SKIP_WL`, `_SKIP_RD` (set or not).
@@ -148,6 +190,7 @@ const fn ei_variant(e: &EiSpec) -> Option<Variant> {
 
 /// The build environment's knobs (the former consts, same panics).
 pub const BUILD: Knobs = Knobs {
+    extra: [None; EXTRA.len()],
     open_opts: match option_env!("A7A_OPEN_OPTS") {
         Some(s) => match hex_u32(s) {
             Some(v) => v,
@@ -213,6 +256,29 @@ pub fn get() -> Knobs {
     let mut k = BUILD;
     k.bl_mrs = BUILD_BL_MRS.and_then(|s| MrList::parse(s, false));
     k
+}
+
+/// An [`EXTRA`] knob's value: the runtime override if the lab mode set
+/// one, else `build` (the caller's `option_env!`).
+#[cfg(feature = "lab-knobs")]
+pub fn env(name: &str, build: Option<&'static str>) -> Option<&'static str> {
+    // SAFETY: written only by the boot CPU before the DRAM init.
+    let cur = unsafe { &*core::ptr::addr_of!(CURRENT) };
+    if let Some(k) = cur {
+        if let Some(i) = EXTRA.iter().position(|n| *n == name) {
+            if let Some(v) = k.extra[i] {
+                return v;
+            }
+        }
+    }
+    build
+}
+
+/// Without the lab mode: the build's value (folds to a constant).
+#[cfg(not(feature = "lab-knobs"))]
+#[inline(always)]
+pub const fn env(_name: &str, build: Option<&'static str>) -> Option<&'static str> {
+    build
 }
 
 /// Install runtime knobs (bt0 lab mode, before the DRAM init).
@@ -292,7 +358,10 @@ impl Knobs {
                 self.ei = ei_variant(&e).ok_or("end-of-init knobs malformed or conflicting")?;
                 self.ei_spec = e;
             }
-            _ => return Err("unknown knob"),
+            _ => match EXTRA.iter().position(|n| *n == name) {
+                Some(i) => self.extra[i] = Some(value),
+                None => return Err("unknown knob"),
+            },
         }
         Ok(())
     }

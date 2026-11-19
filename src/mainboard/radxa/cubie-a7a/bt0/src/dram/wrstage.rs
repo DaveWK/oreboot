@@ -31,13 +31,16 @@ use cubie_a7a_dram::{Error, RegIo};
 
 use super::bt0hw::Bt0Hw;
 
-const BITS: u32 = match option_env!("A7A_WR_STAGE") {
-    Some(s) => match u32::from_str_radix(s, 16) {
-        Ok(v) if v < 0x20 => v,
-        _ => panic!("A7A_WR_STAGE is a hex mask below 0x20"),
-    },
-    None => 0,
-};
+#[allow(non_snake_case)]
+fn BITS() -> u32 {
+    match cubie_a7a_dram::knobs::env("A7A_WR_STAGE", option_env!("A7A_WR_STAGE")) {
+        Some(s) => match u32::from_str_radix(s, 16) {
+            Ok(v) if v < 0x20 => v,
+            _ => panic!("A7A_WR_STAGE is a hex mask below 0x20"),
+        },
+        None => 0,
+    }
+}
 
 /// Probe blocks: 128 bytes each, at power-of-two offsets (so that any
 /// channel interleave from 128 B to 8 KiB puts blocks on both channels),
@@ -71,7 +74,10 @@ fn pattern(addr: usize, seed: u32) -> u32 {
 struct Port(Bt0Hw);
 
 /// `A7A_WR_APPLY` (module docs).
-const APPLY: bool = option_env!("A7A_WR_APPLY").is_some();
+#[allow(non_snake_case)]
+fn APPLY() -> bool {
+    cubie_a7a_dram::knobs::env("A7A_WR_APPLY", option_env!("A7A_WR_APPLY")).is_some()
+}
 /// TxDqDly written since the last compare (applied by the next one).
 static DIRTY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
@@ -93,7 +99,7 @@ impl WritePort for Port {
     fn check(&mut self, seed: u32) -> Result<Folds, Error> {
         // Plain load and store: bt0 runs with the MMU off, where the
         // exclusive accesses of an atomic read-modify-write (swap) abort.
-        if APPLY && DIRTY.load(core::sync::atomic::Ordering::Relaxed) {
+        if APPLY() && DIRTY.load(core::sync::atomic::Ordering::Relaxed) {
             DIRTY.store(false, core::sync::atomic::Ordering::Relaxed);
             cubie_a7a_dram::blobless::apply_delays(&mut self.0, DBYTES / 2)?;
         }
@@ -147,14 +153,17 @@ fn print_delays(tag: &str, tg: usize, d: &Delays) {
 /// Returns whether the probe blocks write cleanly at the end (true when
 /// the stage is off).
 pub fn run() -> bool {
-    if BITS == 0 {
+    if BITS() == 0 {
         return true;
     }
     let (mut p, mut mp) = ports();
     let mut seed = 0x5eed_0001u32;
-    println!("[dram] WR: stage bits {BITS:x}, probe blocks {PROBE:08x?} x {BLOCK_BYTES} B");
+    println!(
+        "[dram] WR: stage bits {:x}, probe blocks {PROBE:08x?} x {BLOCK_BYTES} B",
+        BITS()
+    );
     let mut blind_clean = false;
-    if BITS & 0x10 != 0 {
+    if BITS() & 0x10 != 0 {
         match wrtrain::blind_baseline(&mut p, &mut seed) {
             Ok((v, left)) => {
                 println!(
@@ -203,7 +212,7 @@ pub fn run() -> bool {
         }
         print_delays("before", tg, d);
     }
-    if BITS & 2 != 0 {
+    if BITS() & 2 != 0 {
         for tg in 0..2 {
             for db in 0..DBYTES {
                 for lane in 0..LANES {
@@ -213,7 +222,7 @@ pub fn run() -> bool {
         }
         println!("[dram] WR: every TxDqDly at 0x20 (untrained)");
     }
-    let measure_only = BITS & 8 != 0;
+    let measure_only = BITS() & 8 != 0;
     let mut centred = [None; 2];
     for tg in 0..2 {
         if (0..DBYTES).all(|db| !m.reachable(db, tg)) {
@@ -247,7 +256,7 @@ pub fn run() -> bool {
             }
         }
     }
-    if BITS & 0x10 != 0 && !measure_only {
+    if BITS() & 0x10 != 0 && !measure_only {
         // Blind (blobless) mode: a timing group the probe blocks cannot
         // reach (rank 1 above the 32-bit window) would keep the untrained
         // 0x20 and corrupt every later write to that rank. Take the other
@@ -267,7 +276,7 @@ pub fn run() -> bool {
             }
         }
     }
-    if BITS & 4 != 0 {
+    if BITS() & 4 != 0 {
         for tg in 0..2 {
             let Some(centres) = centred[tg] else {
                 continue;

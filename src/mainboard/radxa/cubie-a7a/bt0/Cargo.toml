@@ -96,7 +96,7 @@ fastboot-nor-write = ["fastboot"]
 # op output, PHY CSR and controller register dumps) for `getvar`, `oem`
 # and `fetch`; `reboot` ends every run. Combine with the open driver and
 # `hybrid` or `bl-mission`.
-dram-lab = ["fastboot"]
+dram-lab = ["fastboot", "cubie-a7a-dram/lab-knobs"]
 # eMMC flash/erase and the boot configuration (PARTITION_CONFIG bits 6:3,
 # BOOT_BUS_CONDITIONS) behind arming and content checks.
 fastboot-emmc-write = ["fastboot"]

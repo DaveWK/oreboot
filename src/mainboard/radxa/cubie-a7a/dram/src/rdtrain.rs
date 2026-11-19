@@ -111,15 +111,20 @@ pub const FULL: u16 = (1 << LANES) - 1;
 /// out of every pass test of this stage (gate, RxEnDly, per-lane receive
 /// clock, read latency, data check): it then counts as passing and its
 /// receive clock goes to the centre of its sweep, the byte's `clk0`.
-pub const PASS_LANES: u16 = match option_env!("A7A_RD_LANES") {
-    Some(s) => match lane_mask(s) {
-        Some(m) => m,
-        None => {
-            panic!("A7A_RD_LANES is a hex lane mask (lane 8 = DMI), up to 1ff, with lanes 0-7 set")
+#[allow(non_snake_case)]
+pub fn PASS_LANES() -> u16 {
+    match crate::knobs::env("A7A_RD_LANES", option_env!("A7A_RD_LANES")) {
+        Some(s) => {
+            match lane_mask(s) {
+                Some(m) => m,
+                None => {
+                    panic!("A7A_RD_LANES is a hex lane mask (lane 8 = DMI), up to 1ff, with lanes 0-7 set")
+                }
+            }
         }
-    },
-    None => FULL,
-};
+        None => FULL,
+    }
+}
 
 /// A hex lane mask of up to three digits that keeps lanes 0-7 (the DQs):
 /// only the DMI lane may be left out.
@@ -158,17 +163,20 @@ pub const MRR_MAS: [u8; 4] = [5, 8, 16, 2];
 /// `A7A_RD_EXIT=<mr18>,<mr10>` (hex; MR46 0) replaces the message block's
 /// MR18 0x0c / MR10 0x54, e.g. `00,00`, the training firmware's operating
 /// values at pstate 1 (read on the board). Unset: the reference's.
-pub const EXIT_MRS: ModeMrs = match option_env!("A7A_RD_EXIT") {
-    Some(s) => match crate::blobless::hex_pair(s) {
-        Some((mr18, mr10)) => ModeMrs {
-            mr18,
-            mr10,
-            mr46: 0,
+#[allow(non_snake_case)]
+pub fn EXIT_MRS() -> ModeMrs {
+    match crate::knobs::env("A7A_RD_EXIT", option_env!("A7A_RD_EXIT")) {
+        Some(s) => match crate::blobless::hex_pair(s) {
+            Some((mr18, mr10)) => ModeMrs {
+                mr18,
+                mr10,
+                mr46: 0,
+            },
+            None => panic!("A7A_RD_EXIT is two hex bytes: mr18,mr10"),
         },
-        None => panic!("A7A_RD_EXIT is two hex bytes: mr18,mr10"),
-    },
-    None => ModeMrs::EXIT_PSTATE1,
-};
+        None => ModeMrs::EXIT_PSTATE1,
+    }
+}
 
 /// RxFifoVisibility for the MRR read-out: ObsSel 1, then ObsSel 1 with
 /// RdEnDfe0/1 and pointer 0x3c (the reference's value). FEL lab knob
@@ -251,7 +259,8 @@ impl TrainConfig {
     /// launches, read latency 4 (as the `rd` searches).
     pub const PSTATE1: TrainConfig = TrainConfig {
         next: ModeMrs::NEXT_PSTATE1,
-        exit: EXIT_MRS,
+        // The reference's; the bt0 read training sets EXIT_MRS() (A7A_RD_EXIT).
+        exit: ModeMrs::EXIT_PSTATE1,
         gate_step: 0x40,
         gate_n: 32,
         clk_step: 16,
@@ -626,7 +635,7 @@ pub(crate) fn point_counts<H: Hw>(
     let mut n = [0u32; 2];
     for (i, oi) in o.iter().enumerate() {
         for lane in 0..LANES {
-            if PASS_LANES != FULL && PASS_LANES >> lane & 1 == 0 {
+            if PASS_LANES() != FULL && PASS_LANES() >> lane & 1 == 0 {
                 // A lane left out of the pass tests (`A7A_RD_LANES`).
                 m[i] |= 1 << lane;
                 continue;
@@ -1378,7 +1387,7 @@ pub(crate) fn data_check<H: Hw>(
             measure_prog(ex, dbs, prog, rxen::CENTRING_OUTER, &mut o);
             for (i, oi) in o.iter().enumerate() {
                 for lane in 0..LANES {
-                    if PASS_LANES != FULL && PASS_LANES >> lane & 1 == 0 {
+                    if PASS_LANES() != FULL && PASS_LANES() >> lane & 1 == 0 {
                         continue;
                     }
                     out.compares[p][i] += oi.cmp[lane] as u32;
@@ -1390,7 +1399,7 @@ pub(crate) fn data_check<H: Hw>(
             }
         }
         for (c, d) in out.clean_lanes[p].iter_mut().zip(dirty) {
-            *c = (PASS_LANES.count_ones() - d.count_ones()) as u8;
+            *c = (PASS_LANES().count_ones() - d.count_ones()) as u8;
         }
     }
     data_setup(
@@ -1475,7 +1484,7 @@ mod lane_mask_tests {
 
     #[test]
     fn default_is_all_nine_lanes() {
-        assert_eq!(PASS_LANES, FULL);
+        assert_eq!(PASS_LANES(), FULL);
         assert_eq!(FULL, 0x1ff);
     }
 

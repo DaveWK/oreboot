@@ -41,16 +41,28 @@
 use cubie_a7a_common::uart::{Uart, UART0_BASE};
 use util::mmio::{read16, read32, write16, write32};
 
-pub const FETCH_PROBE: bool = option_env!("A7A_FETCH_PROBE").is_some();
-pub const SYS_SNAP: bool = option_env!("A7A_SYS_SNAP").is_some();
-pub const NO_BOOST: bool = option_env!("A7A_NO_BOOST").is_some();
-const RD_GAPS: Option<u32> = match option_env!("A7A_RD_GAPS") {
-    Some(s) => match u32::from_str_radix(s, 16) {
-        Ok(v) if v >= 1 && v <= 0x3f => Some(v),
-        _ => panic!("A7A_RD_GAPS is a hex value 1..3f"),
-    },
-    None => None,
-};
+#[allow(non_snake_case)]
+pub fn FETCH_PROBE() -> bool {
+    cubie_a7a_dram::knobs::env("A7A_FETCH_PROBE", option_env!("A7A_FETCH_PROBE")).is_some()
+}
+#[allow(non_snake_case)]
+pub fn SYS_SNAP() -> bool {
+    cubie_a7a_dram::knobs::env("A7A_SYS_SNAP", option_env!("A7A_SYS_SNAP")).is_some()
+}
+#[allow(non_snake_case)]
+pub fn NO_BOOST() -> bool {
+    cubie_a7a_dram::knobs::env("A7A_NO_BOOST", option_env!("A7A_NO_BOOST")).is_some()
+}
+#[allow(non_snake_case)]
+fn RD_GAPS() -> Option<u32> {
+    match cubie_a7a_dram::knobs::env("A7A_RD_GAPS", option_env!("A7A_RD_GAPS")) {
+        Some(s) => match u32::from_str_radix(s, 16) {
+            Ok(v) if v >= 1 && v <= 0x3f => Some(v),
+            _ => panic!("A7A_RD_GAPS is a hex value 1..3f"),
+        },
+        None => None,
+    }
+}
 
 /// Sled bases: away from main (0x40000000), the EL3 area and fwlog
 /// (0x40000000-0x401fffff), the EDK2 FD (0x41000000, 4 MiB), the write
@@ -135,7 +147,7 @@ fn call_sled(base: usize) -> u32 {
 
 /// The instruction-fetch probe (`A7A_FETCH_PROBE`).
 pub fn fetch(tag: &str) {
-    if !FETCH_PROBE {
+    if !FETCH_PROBE() {
         return;
     }
     let s0 = sctlr();
@@ -331,7 +343,7 @@ const PHY_CSRS: [(usize, &str); 26] = [
 
 /// The register snapshot (`A7A_SYS_SNAP`).
 pub fn snap(tag: &str) {
-    if !SYS_SNAP {
+    if !SYS_SNAP() {
         return;
     }
     for ch in 0..2 {
@@ -385,9 +397,9 @@ fn poll(addr: usize, n: u32, f: impl Fn(u32) -> bool) -> bool {
     false
 }
 
-/// `A7A_RD_GAPS` ([`RD_GAPS`]): wider command spacing in the active set.
+/// `A7A_RD_GAPS` ([`RD_GAPS()`]): wider command spacing in the active set.
 pub fn gaps(tag: &str) {
-    let Some(g) = RD_GAPS else {
+    let Some(g) = RD_GAPS() else {
         return;
     };
     const N: u32 = 10_000_000;
@@ -419,7 +431,7 @@ pub fn gaps(tag: &str) {
         write32(d + 0x180, read32(d + 0x180) & !0x800);
         let srx = poll(d + 0x014, N, |v| v & 0x30 == 0 && v & 3 == 1);
         println!(
-            "[probe {tag}] RD_GAPS {g:#x} ch{ch} set{set}: TMG4/TMG2/RANKTMG0/RANKTMG1 {before:08x?} -> {:08x?}; SRE {sre} sw_done {done} SRX {srx}",
+            "[probe {tag}] RD_GAPS() {g:#x} ch{ch} set{set}: TMG4/TMG2/RANKTMG0/RANKTMG1 {before:08x?} -> {:08x?}; SRE {sre} sw_done {done} SRX {srx}",
             [read32(f + 0x010), read32(f + 0x008), read32(f + 0xd04), read32(f + 0xd08)]
         );
     }

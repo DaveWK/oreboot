@@ -576,7 +576,7 @@ fn bring_up_dram(pre: Pre) -> Bringup {
     // Raise the CPU clocks only now: libdram trained at the boot clocks
     // (as SyterKit and the vendor SPL do). FEL lab `A7A_NO_BOOST`: not at
     // all (the lab states' clocks).
-    if let Some(p) = dram::pmic().filter(|_| !probe::NO_BOOST) {
+    if let Some(p) = dram::pmic().filter(|_| !probe::NO_BOOST()) {
         if let Err(error) = dvfs::boost(p) {
             clock_failure(error);
         }

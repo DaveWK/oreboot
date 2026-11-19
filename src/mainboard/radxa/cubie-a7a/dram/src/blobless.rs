@@ -268,13 +268,16 @@ pub const fn hex_pair(s: &str) -> Option<(u8, u8)> {
 /// to all ranks before the read training and another after it, so that its
 /// mode MRWs (MR20, MR18, MR10, MR46) reach the operating set-point; e.g.
 /// `05,04` after the FSP-WR 0 end of initialization. Unset: none.
-pub const RD_FSPWR: Option<(u8, u8)> = match option_env!("A7A_RD_FSPWR") {
-    Some(s) => match hex_pair(s) {
-        Some(p) => Some(p),
-        None => panic!("A7A_RD_FSPWR is two hex bytes: before,after"),
-    },
-    None => None,
-};
+#[allow(non_snake_case)]
+pub fn RD_FSPWR() -> Option<(u8, u8)> {
+    match crate::knobs::env("A7A_RD_FSPWR", option_env!("A7A_RD_FSPWR")) {
+        Some(s) => match hex_pair(s) {
+            Some(p) => Some(p),
+            None => panic!("A7A_RD_FSPWR is two hex bytes: before,after"),
+        },
+        None => None,
+    }
+}
 
 /// The end-of-initialization stage's run ([`end_of_init`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -831,15 +834,21 @@ impl<H: Hw> Executor<'_, H> {
 }
 
 /// FEL lab `A7A_CBT_CA_ADD` (hex): added to every CA lane's trained delay.
-pub const CBT_CA_ADD: u16 = hex_knob(option_env!("A7A_CBT_CA_ADD"));
+#[allow(non_snake_case)]
+pub fn CBT_CA_ADD() -> u16 {
+    hex_knob(crate::knobs::env(
+        "A7A_CBT_CA_ADD",
+        option_env!("A7A_CBT_CA_ADD"),
+    ))
+}
 
-/// The ACTxDly values CBT applies: its centres plus [`CBT_CA_ADD`], wrapped
+/// The ACTxDly values CBT applies: its centres plus [`CBT_CA_ADD()`], wrapped
 /// into the 8-bit register (ACTxDly [7:6] coarse UI 0-3, [5:0] fine UI/64,
 /// EIC7700X TRM Part 2). The sweep runs 0..511 and the delay passes once per
 /// 256 units, so a centre found in the second period (288 on this board)
 /// was written past the register's width and truncated by the hardware.
 pub fn ca_applied(delay: &[u16; 7]) -> [u16; 7] {
-    delay.map(|d| d.wrapping_add(CBT_CA_ADD) & 0xff)
+    delay.map(|d| d.wrapping_add(CBT_CA_ADD()) & 0xff)
 }
 
 /// FEL lab `A7A_WL_TXWCK_ADD` (hex): added to every DBYTE's TxWckDlyTg0/1
@@ -847,9 +856,15 @@ pub fn ca_applied(delay: &[u16; 7]) -> [u16; 7] {
 /// still offline). Blobless leveling lands exactly one WCK cycle (0x80)
 /// before the PMU's TxWckDly; with this the read training runs on the PMU's
 /// WCK cycle.
-pub const WL_TXWCK_ADD: u16 = hex_knob(option_env!("A7A_WL_TXWCK_ADD"));
+#[allow(non_snake_case)]
+pub fn WL_TXWCK_ADD() -> u16 {
+    hex_knob(crate::knobs::env(
+        "A7A_WL_TXWCK_ADD",
+        option_env!("A7A_WL_TXWCK_ADD"),
+    ))
+}
 
-/// Apply [`WL_TXWCK_ADD`]; returns the TxWckDlyTg0 of each DBYTE after.
+/// Apply [`WL_TXWCK_ADD()`]; returns the TxWckDlyTg0 of each DBYTE after.
 pub fn wl_txwck_add<H: Hw>(hw: &mut H) -> [u16; 4] {
     let mut out = [0u16; 4];
     csr_access(hw, true);
@@ -857,7 +872,7 @@ pub fn wl_txwck_add<H: Hw>(hw: &mut H) -> [u16; 4] {
         for tg in 0..2u32 {
             let c = csr(0x1002a + 0x1000 * db as u32 + tg);
             let v = hw.read16(c);
-            hw.write16(c, v.wrapping_add(WL_TXWCK_ADD));
+            hw.write16(c, v.wrapping_add(WL_TXWCK_ADD()));
         }
         *o = hw.read16(csr(0x1002a + 0x1000 * db as u32));
     }
@@ -1057,7 +1072,7 @@ pub fn cold_init_ca_train<H: Hw>(
 pub fn fsp0_mrs<H: Hw>(hw: &mut H, p: &mut Para, pstate: u32) -> Option<crate::wl::WlFailure> {
     use crate::phy::endinit::{self, skip, FspMrs, Variant, ORDER};
     use crate::phy::wcklevel::Channel;
-    let spec = option_env!("A7A_FSP0_MRS")?;
+    let spec = crate::knobs::env("A7A_FSP0_MRS", option_env!("A7A_FSP0_MRS"))?;
     let all = ORDER.iter().fold(0u64, |a, &ma| a | 1 << ma);
     let only = if spec == "all" {
         all
@@ -1195,7 +1210,7 @@ pub fn mission_handover_relock<H: Hw>(
     // mission CSRs and the DFI init (delay CSR writes after the DFI init do
     // not take effect: measured). TxWckDlyTg0/1 0x1n02a/0x1n02b and
     // RxEnDlyTg0/1 0x1n020/0x1n021 of every DBYTE.
-    for (add, base) in [(HO_TXWCK_ADD, 0x1002a), (HO_RXEN_ADD, 0x10020)] {
+    for (add, base) in [(HO_TXWCK_ADD(), 0x1002a), (HO_RXEN_ADD(), 0x10020)] {
         if add == 0 {
             continue;
         }
@@ -1207,7 +1222,7 @@ pub fn mission_handover_relock<H: Hw>(
             }
         }
     }
-    if let Some(spec) = option_env!("A7A_HO_CSRS") {
+    if let Some(spec) = crate::knobs::env("A7A_HO_CSRS", option_env!("A7A_HO_CSRS")) {
         // FEL lab A7A_HO_CSRS="csr=hex,...": PHY CSR writes before the
         // mission CSRs and the DFI init (measurement: transplant of a
         // working state's values while CSR writes still take effect).
@@ -1220,7 +1235,7 @@ pub fn mission_handover_relock<H: Hw>(
             }
         }
     }
-    if option_env!("A7A_HO_FIU").is_some() {
+    if crate::knobs::env("A7A_HO_FIU", option_env!("A7A_HO_FIU")).is_some() {
         // FEL lab: ForceInternalUpdate with the DFI still offline, held
         // well over 32 DFICLKs (TRM), so every delay CSR is applied.
         hw.write16(csr(0x200a3), 1);
@@ -1228,13 +1243,13 @@ pub fn mission_handover_relock<H: Hw>(
         hw.write16(csr(0x200a3), 0);
         hw.udelay(5);
     }
-    if crate::obs::OBS_ARM & crate::obs::ARM_CHECK != 0 {
+    if crate::obs::OBS_ARM() & crate::obs::ARM_CHECK != 0 {
         // FEL lab A7A_OBS_ARM bit 0: the PHY's RX FIFO pointer check,
         // armed (masked off the interrupt pin) before the DFI init, so the
         // dfi_init_start check and every later read are covered.
         crate::obs::arm(hw);
     }
-    if HO_PULSE_RESTORE {
+    if HO_PULSE_RESTORE() {
         for c in ACSM_READ_PULSES {
             let v = hw.read16(csr(c));
             hw.write16(csr(c), v.wrapping_sub(ACSM_PULSE_ADJUST));
@@ -1257,14 +1272,14 @@ pub fn mission_handover_relock<H: Hw>(
         })?;
         for set in [0, pstate as usize] {
             hw.modify32(freq(ch, set, 0x588), |v| (v & !0x3f_0000) | (rden << 16));
-            if let Some(en) = HO_RDDATA_EN {
+            if let Some(en) = HO_RDDATA_EN() {
                 // FEL lab: dfi_t_rddata_en (+0x580 [22:16]) of the set.
                 hw.modify32(freq(ch, set, crate::handover::DFITMG0), |v| {
                     (v & !crate::handover::RDDATA_EN_MASK)
                         | (en << crate::handover::RDDATA_EN_SHIFT)
                 });
             }
-            if let Some(cs) = crate::obs::HO_RDCSLAT {
+            if let Some(cs) = crate::obs::HO_RDCSLAT() {
                 // FEL lab: dfi_tphy_rdcslat (+0x588 [14:8]) of the set.
                 hw.modify32(freq(ch, set, 0x588), |v| {
                     (v & !crate::obs::RDCSLAT_MASK) | (cs << crate::obs::RDCSLAT_SHIFT)
@@ -1272,7 +1287,7 @@ pub fn mission_handover_relock<H: Hw>(
             }
         }
         hw.clrset32(ddrc(ch, 0x008), 0x1f, pstate);
-        if let Some(n) = HO_CDD {
+        if let Some(n) = HO_CDD() {
             crate::post::fold_cdd_set(
                 hw,
                 ch,
@@ -1287,13 +1302,13 @@ pub fn mission_handover_relock<H: Hw>(
                 },
             );
         }
-        if let Some(on) = HO_WCKON {
+        if let Some(on) = HO_WCKON() {
             // FEL lab: MSTR4.wck_on [0] (quasi-dynamic, written with
             // sw_done clear while the controller still holds the DRAM in
             // its start-up self-refresh state).
             hw.clrset32(ddrc(ch, crate::ctrl::MSTR4), 1, on);
         }
-        if let Some(v) = HO_DBICTL {
+        if let Some(v) = HO_DBICTL() {
             // FEL lab: DBICTL rd_dbi_en [2], wr_dbi_en [1], dm_en [0].
             hw.write32(ddrc(ch, DBICTL), v);
         }
@@ -1319,17 +1334,17 @@ pub fn mission_handover_relock<H: Hw>(
         csr_access(hw, false);
         crate::phy::devinit::mission_bringup(hw, 3);
     }
-    if crate::obs::OBS_ARM & crate::obs::ARM_SNAP != 0 {
+    if crate::obs::OBS_ARM() & crate::obs::ARM_SNAP != 0 {
         let s = crate::obs::snap(hw);
         crate::obs::print(hw, "before the DFI init", &s);
     }
     crate::post::dfi_init_cpu(hw, channels)?;
     crate::post::controller_after_phy(hw, p)?;
-    if crate::obs::OBS_ARM & crate::obs::ARM_SNAP != 0 {
+    if crate::obs::OBS_ARM() & crate::obs::ARM_SNAP != 0 {
         let s = crate::obs::snap(hw);
         crate::obs::print(hw, "after the DFI init", &s);
     }
-    if let Some(spec) = option_env!("A7A_HO_MRS") {
+    if let Some(spec) = crate::knobs::env("A7A_HO_MRS", option_env!("A7A_HO_MRS")) {
         // FEL lab A7A_HO_MRS="ma=hex,...": operating-set MRWs through the
         // controller after the hand-over, before any read (FSP window
         // MR16 0x05 .. 0x04), e.g. "3=06,18=00": the PMU's operating MR3
@@ -1349,7 +1364,7 @@ pub fn mission_handover_relock<H: Hw>(
             }
         }
     }
-    if let Some(mr2) = HO_MR2 {
+    if let Some(mr2) = HO_MR2() {
         // FEL lab: MR2 of the operating set-point through the controller,
         // inside an FSP-WR = FSP-OP window (MR16 0x05 .. 0x04: the state
         // after the PMU and after the FSP-WR 0 end of initialization).
@@ -1361,12 +1376,12 @@ pub fn mission_handover_relock<H: Hw>(
             }
         }
     }
-    if let Some(mr16_open) = HO_EPILOGUE {
+    if let Some(mr16_open) = HO_EPILOGUE() {
         epilogue(hw, channels, mr16_open)?;
-    } else if HO_SRCYCLE {
+    } else if HO_SRCYCLE() {
         sr_cycle(hw, channels)?;
     }
-    if HO_FIFOINIT {
+    if HO_FIFOINIT() {
         fifo_init(hw, channels)?;
     }
     Ok(rden)
@@ -1379,13 +1394,16 @@ pub fn mission_handover_relock<H: Hw>(
 /// CDDs into set 0 only, so set 1 runs with none; our own trained rank 0
 /// against rank 1 differences are below one clock (RxEnDly Tg0/Tg1 within
 /// 0x10 of 1/64 UI, TxDqDly equal), so 1 covers them. Unset: no fold.
-pub const HO_CDD: Option<u32> = match option_env!("A7A_HO_CDD") {
-    Some(s) => match u32::from_str_radix(s, 16) {
-        Ok(v) if v <= 0x1f => Some(v),
-        _ => panic!("A7A_HO_CDD is a hex value up to 0x1f"),
-    },
-    None => None,
-};
+#[allow(non_snake_case)]
+pub fn HO_CDD() -> Option<u32> {
+    match crate::knobs::env("A7A_HO_CDD", option_env!("A7A_HO_CDD")) {
+        Some(s) => match u32::from_str_radix(s, 16) {
+            Ok(v) if v <= 0x1f => Some(v),
+            _ => panic!("A7A_HO_CDD is a hex value up to 0x1f"),
+        },
+        None => None,
+    }
+}
 
 /// DDRCTL DBICTL (DM/DBI control), main block +0xc94.
 pub const DBICTL: usize = 0xc94;
@@ -1396,33 +1414,42 @@ pub const DBICTL: usize = 0xc94;
 /// (CAS-WS_FS to all ranks) and expects the DRAM's MR18 OP[4] (WCK always
 /// on) = 1 (public: DDRCTL MSTR4); our end of initialization and read
 /// training leave MR18 OP[4] = 0 (0x0c). Unset: unchanged.
-pub const HO_WCKON: Option<u32> = match option_env!("A7A_HO_WCKON") {
-    Some(s) => match s.as_bytes() {
-        [b'0'] => Some(0),
-        [b'1'] => Some(1),
-        _ => panic!("A7A_HO_WCKON is 0 or 1"),
-    },
-    None => None,
-};
+#[allow(non_snake_case)]
+pub fn HO_WCKON() -> Option<u32> {
+    match crate::knobs::env("A7A_HO_WCKON", option_env!("A7A_HO_WCKON")) {
+        Some(s) => match s.as_bytes() {
+            [b'0'] => Some(0),
+            [b'1'] => Some(1),
+            _ => panic!("A7A_HO_WCKON is 0 or 1"),
+        },
+        None => None,
+    }
+}
 
 /// FEL lab `A7A_HO_DBICTL=<hex>`: DBICTL of both controllers, written with
-/// [`HO_WCKON`] before the DFI init (rd_dbi_en must equal MR3 OP[6],
+/// [`HO_WCKON()`] before the DFI init (rd_dbi_en must equal MR3 OP[6],
 /// wr_dbi_en MR3 OP[7], dm_en the inverse of MR13 OP[5]; public: DDRCTL
 /// DBICTL). Our code never writes it (reset 0x1). Unset: unchanged.
-pub const HO_DBICTL: Option<u32> = match option_env!("A7A_HO_DBICTL") {
-    Some(s) => match u32::from_str_radix(s, 16) {
-        Ok(v) if v <= 7 => Some(v),
-        _ => panic!("A7A_HO_DBICTL is a hex value up to 7"),
-    },
-    None => None,
-};
+#[allow(non_snake_case)]
+pub fn HO_DBICTL() -> Option<u32> {
+    match crate::knobs::env("A7A_HO_DBICTL", option_env!("A7A_HO_DBICTL")) {
+        Some(s) => match u32::from_str_radix(s, 16) {
+            Ok(v) if v <= 7 => Some(v),
+            _ => panic!("A7A_HO_DBICTL is a hex value up to 7"),
+        },
+        None => None,
+    }
+}
 
 /// FEL lab `A7A_HO_SRCYCLE=1`: at the end of the lean hand-over (after
 /// `A7A_HO_MRS`/`A7A_HO_MR2`), one software self-refresh entry and exit per
 /// controller ([`sr_cycle`]): the controller's own SRE, then SRX followed by
 /// its WCK re-sync (with wck_on: CAS-WS_FS to all ranks), so MR18 changes
 /// made through `A7A_HO_MRS` start from a fresh WCK2CK sync. Unset: none.
-pub const HO_SRCYCLE: bool = option_env!("A7A_HO_SRCYCLE").is_some();
+#[allow(non_snake_case)]
+pub fn HO_SRCYCLE() -> bool {
+    crate::knobs::env("A7A_HO_SRCYCLE", option_env!("A7A_HO_SRCYCLE")).is_some()
+}
 
 /// One software self-refresh cycle per channel (public DDRCTL procedure,
 /// "Clock Removal and Recovery"): PWRCTL.selfref_sw = 1, STAT.selfref_type
@@ -1478,14 +1505,17 @@ pub fn sr_exit<H: Hw>(hw: &mut H, channels: usize) -> Result<(), Error> {
 /// the window `A7A_HO_MRS` used on the board): the training
 /// firmware's final-stage DRAM state, made by the controller after the
 /// lean hand-over ([`epilogue`]). Unset: nothing (defaults unchanged).
-pub const HO_EPILOGUE: Option<u32> = match option_env!("A7A_HO_EPILOGUE") {
-    Some(s) => match s.as_bytes() {
-        [b'1'] => Some(0x45),
-        [b'0', b'5'] => Some(0x05),
-        _ => panic!("A7A_HO_EPILOGUE is 1 (MR16 0x45) or 05 (MR16 0x05)"),
-    },
-    None => None,
-};
+#[allow(non_snake_case)]
+pub fn HO_EPILOGUE() -> Option<u32> {
+    match crate::knobs::env("A7A_HO_EPILOGUE", option_env!("A7A_HO_EPILOGUE")) {
+        Some(s) => match s.as_bytes() {
+            [b'1'] => Some(0x45),
+            [b'0', b'5'] => Some(0x05),
+            _ => panic!("A7A_HO_EPILOGUE is 1 (MR16 0x45) or 05 (MR16 0x05)"),
+        },
+        None => None,
+    }
+}
 
 /// The operating-set MRs where the PMU's final stage differs from our end
 /// of initialization (MA, OP). Measured: MR18 OP[4] (WCK always on) is
@@ -1555,9 +1585,12 @@ pub fn epilogue<H: Hw>(hw: &mut H, channels: usize, mr16_open: u32) -> Result<()
 /// self-refresh (DFI idle). Measured: without it DBYTE 2's write pointers
 /// start misaligned (the PHY's own FIFO check fires
 /// on DBYTE 2). Unset: nothing.
-pub const HO_FIFOINIT: bool = option_env!("A7A_HO_FIFOINIT").is_some();
+#[allow(non_snake_case)]
+pub fn HO_FIFOINIT() -> bool {
+    crate::knobs::env("A7A_HO_FIFOINIT", option_env!("A7A_HO_FIFOINIT")).is_some()
+}
 
-/// RX FIFO pointer reset inside a controller self-refresh ([`HO_FIFOINIT`]).
+/// RX FIFO pointer reset inside a controller self-refresh ([`HO_FIFOINIT()`]).
 pub fn fifo_init<H: Hw>(hw: &mut H, channels: usize) -> Result<(), Error> {
     sr_enter(hw, channels)?;
     csr_access(hw, true);
@@ -1575,7 +1608,10 @@ pub fn fifo_init<H: Hw>(hw: &mut H, channels: usize) -> Result<(), Error> {
 /// WckReadFastToggle) put back by 4, as the training firmware does at the
 /// end of its read latency stage (PMU state 0x82f/0xc10/0x41c/0x2920 against
 /// our 0x833/0xc14/0x420/0x2924). Unset: unchanged.
-pub const HO_PULSE_RESTORE: bool = option_env!("A7A_HO_PULSE_RESTORE").is_some();
+#[allow(non_snake_case)]
+pub fn HO_PULSE_RESTORE() -> bool {
+    crate::knobs::env("A7A_HO_PULSE_RESTORE", option_env!("A7A_HO_PULSE_RESTORE")).is_some()
+}
 pub const ACSM_READ_PULSES: [u32; 7] = [
     0x2002c, 0x2002d, 0x20030, 0x20039, 0x2003a, 0x2003b, 0x2003c,
 ];
@@ -1588,7 +1624,10 @@ pub const ACSM_PULSE_ADJUST: u16 = 4;
 /// (0x170-0x174) than with the training firmware's values
 /// (0x36c-0x374, the PMU's own 0x36d), and the mission reads
 /// then fail; the mission path does not use the ACSM pulses.
-pub const RD_PULSE_RESTORE: bool = option_env!("A7A_RD_PULSE_RESTORE").is_some();
+#[allow(non_snake_case)]
+pub fn RD_PULSE_RESTORE() -> bool {
+    crate::knobs::env("A7A_RD_PULSE_RESTORE", option_env!("A7A_RD_PULSE_RESTORE")).is_some()
+}
 
 /// The ACSM read pulse timings ([`ACSM_READ_PULSES`]) lowered by
 /// [`ACSM_PULSE_ADJUST`]; returns the values written.
@@ -1626,21 +1665,36 @@ pub fn apply_delays<H: Hw>(hw: &mut H, channels: usize) -> Result<(), Error> {
 /// correctly on the PMU-trained state (MR2 0x00, RL 3); MR2 0x88 (RL 13,
 /// what our read training needs) is expected to need about 0x2f + 10.
 /// Unset: unchanged.
-pub const HO_RDDATA_EN: Option<u32> = match option_env!("A7A_HO_RDDATA_EN") {
-    Some(s) => match u32::from_str_radix(s, 16) {
-        Ok(v) if v <= 0x7f => Some(v),
-        _ => panic!("A7A_HO_RDDATA_EN is a hex value up to 0x7f"),
-    },
-    None => None,
-};
+#[allow(non_snake_case)]
+pub fn HO_RDDATA_EN() -> Option<u32> {
+    match crate::knobs::env("A7A_HO_RDDATA_EN", option_env!("A7A_HO_RDDATA_EN")) {
+        Some(s) => match u32::from_str_radix(s, 16) {
+            Ok(v) if v <= 0x7f => Some(v),
+            _ => panic!("A7A_HO_RDDATA_EN is a hex value up to 0x7f"),
+        },
+        None => None,
+    }
+}
 
 /// FEL lab `A7A_HO_TXWCK_ADD=<hex>` and `A7A_HO_RXEN_ADD=<hex>`: added to
 /// every DBYTE's TxWckDlyTg0/1 and RxEnDlyTg0/1 by the lean hand-over before
 /// anything else. Blobless WL lands exactly one WCK cycle (0x80) before the
 /// PMU's TxWckDly; the read training (WCK always on) follows with RxEnDly
 /// about 0x75 earlier. Unset: 0.
-pub const HO_TXWCK_ADD: u16 = hex_knob(option_env!("A7A_HO_TXWCK_ADD"));
-pub const HO_RXEN_ADD: u16 = hex_knob(option_env!("A7A_HO_RXEN_ADD"));
+#[allow(non_snake_case)]
+pub fn HO_TXWCK_ADD() -> u16 {
+    hex_knob(crate::knobs::env(
+        "A7A_HO_TXWCK_ADD",
+        option_env!("A7A_HO_TXWCK_ADD"),
+    ))
+}
+#[allow(non_snake_case)]
+pub fn HO_RXEN_ADD() -> u16 {
+    hex_knob(crate::knobs::env(
+        "A7A_HO_RXEN_ADD",
+        option_env!("A7A_HO_RXEN_ADD"),
+    ))
+}
 
 const fn hex_knob(s: Option<&str>) -> u16 {
     let Some(s) = s else {
@@ -1667,13 +1721,16 @@ const fn hex_knob(s: Option<&str>) -> u16 {
 /// channel and rank's operating set through the controller (MR16 0x05,
 /// MR2, MR16 0x04), before any read: the hybrid test of the read latency
 /// (the PMU leaves MR2 0x00). Unset: nothing.
-pub const HO_MR2: Option<u8> = match option_env!("A7A_HO_MR2") {
-    Some(s) => match u8::from_str_radix(s, 16) {
-        Ok(v) => Some(v),
-        Err(_) => panic!("A7A_HO_MR2 is a hex byte"),
-    },
-    None => None,
-};
+#[allow(non_snake_case)]
+pub fn HO_MR2() -> Option<u8> {
+    match crate::knobs::env("A7A_HO_MR2", option_env!("A7A_HO_MR2")) {
+        Some(s) => match u8::from_str_radix(s, 16) {
+            Ok(v) => Some(v),
+            Err(_) => panic!("A7A_HO_MR2 is a hex byte"),
+        },
+        None => None,
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -1685,18 +1742,18 @@ mod tests {
         assert_eq!(hex_pair("5,4"), None);
         assert_eq!(hex_pair("05;04"), None);
         assert_eq!(hex_pair("0g,04"), None);
-        assert_eq!(super::RD_FSPWR, None);
+        assert_eq!(super::RD_FSPWR(), None);
         assert_eq!(
-            crate::rdtrain::EXIT_MRS,
+            crate::rdtrain::EXIT_MRS(),
             crate::phy::rxen::ModeMrs::EXIT_PSTATE1
         );
     }
 
     #[test]
     fn mission_switch_knobs_default_off() {
-        assert_eq!(super::HO_WCKON, None);
-        assert_eq!(super::HO_DBICTL, None);
-        assert!(!super::HO_SRCYCLE);
+        assert_eq!(super::HO_WCKON(), None);
+        assert_eq!(super::HO_DBICTL(), None);
+        assert!(!super::HO_SRCYCLE());
         assert_eq!(super::DBICTL, 0xc94);
     }
 

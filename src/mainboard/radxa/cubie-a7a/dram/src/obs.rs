@@ -31,7 +31,10 @@ use crate::phy::{csr, csr_access};
 /// `A7A_OBS_ARM=<hex>`: bit 0 arms the RX FIFO pointer check before the
 /// DFI init of the lean hand-over; bit 1 prints a snapshot of the read-path
 /// observation CSRs before the DFI init and after the hand-over. Unset: 0.
-pub const OBS_ARM: u16 = obs_knob(option_env!("A7A_OBS_ARM"));
+#[allow(non_snake_case)]
+pub fn OBS_ARM() -> u16 {
+    obs_knob(crate::knobs::env("A7A_OBS_ARM", option_env!("A7A_OBS_ARM")))
+}
 /// Arm the RX FIFO pointer check.
 pub const ARM_CHECK: u16 = 1;
 /// Print the snapshots.
@@ -42,13 +45,16 @@ pub const ARM_SNAP: u16 = 2;
 /// hand-over before the DFI init (the rank-select partner of
 /// `A7A_HO_RDDATA_EN`; the timing code and the vendor leave 0x2f, equal to
 /// dfi_t_rddata_en). Unset: unchanged.
-pub const HO_RDCSLAT: Option<u32> = match option_env!("A7A_HO_RDCSLAT") {
-    Some(s) => match u32::from_str_radix(s, 16) {
-        Ok(v) if v <= 0x7f => Some(v),
-        _ => panic!("A7A_HO_RDCSLAT is a hex value up to 0x7f"),
-    },
-    None => None,
-};
+#[allow(non_snake_case)]
+pub fn HO_RDCSLAT() -> Option<u32> {
+    match crate::knobs::env("A7A_HO_RDCSLAT", option_env!("A7A_HO_RDCSLAT")) {
+        Some(s) => match u32::from_str_radix(s, 16) {
+            Ok(v) if v <= 0x7f => Some(v),
+            _ => panic!("A7A_HO_RDCSLAT is a hex value up to 0x7f"),
+        },
+        None => None,
+    }
+}
 /// DFITMG2 dfi_tphy_rdcslat field.
 pub const RDCSLAT_SHIFT: u32 = 8;
 pub const RDCSLAT_MASK: u32 = 0x7f << RDCSLAT_SHIFT;
@@ -178,11 +184,11 @@ mod tests {
 
     #[test]
     fn defaults_off() {
-        if option_env!("A7A_OBS_ARM").is_none() {
-            assert_eq!(OBS_ARM, 0);
+        if crate::knobs::env("A7A_OBS_ARM", option_env!("A7A_OBS_ARM")).is_none() {
+            assert_eq!(OBS_ARM(), 0);
         }
-        if option_env!("A7A_HO_RDCSLAT").is_none() {
-            assert_eq!(HO_RDCSLAT, None);
+        if crate::knobs::env("A7A_HO_RDCSLAT", option_env!("A7A_HO_RDCSLAT")).is_none() {
+            assert_eq!(HO_RDCSLAT(), None);
         }
     }
 }
