@@ -8,11 +8,16 @@
 //!
 //! With feature `fel` the same bring-up runs from the mask ROM's USB FEL
 //! mode instead, and the host supplies what the SD card would (fel.rs).
+//! With feature `spinor` the mask ROM loads it from the SPI NOR, and bt0
+//! reads the layout table and the images from there (spinor.rs).
 #![no_std]
 #![no_main]
 #![cfg_attr(feature = "dramlib", feature(c_variadic))]
-// The FEL build has no SD boot path; its helpers stay compiled.
-#![cfg_attr(feature = "fel", allow(dead_code))]
+// The FEL and SPI NOR builds have no SD boot path; its helpers stay compiled.
+#![cfg_attr(any(feature = "fel", feature = "spinor"), allow(dead_code))]
+
+#[cfg(all(feature = "fel", feature = "spinor"))]
+compile_error!("features `fel` and `spinor` exclude each other");
 
 #[macro_use]
 extern crate log;
@@ -45,6 +50,8 @@ mod lab;
 mod recovery;
 mod smhc;
 mod soc;
+#[cfg(feature = "spinor")]
+mod spinor;
 
 use gpio::{Port, Pull};
 
@@ -439,7 +446,7 @@ fn bring_up() -> Bringup {
     dram::report_previous_trace();
     // The vendor recovery reads the SD card and replaces bt0 at 0x47000,
     // the FEL code's memory; the FEL boot starts its attempt in entry 2.
-    #[cfg(not(feature = "fel"))]
+    #[cfg(not(any(feature = "fel", feature = "spinor")))]
     {
         if recovery::previous_boot_failed() {
             println!("[bt0] the previous boot never reached EDK2's boot manager");
@@ -451,6 +458,15 @@ fn bring_up() -> Bringup {
                 }
             }
             println!("[bt0] recovery not possible; trying oreboot again");
+        }
+        recovery::begin_attempt();
+    }
+    // No vendor SPL on the NOR (and the SD slot of the board under test is
+    // dead): report the failed attempt and try oreboot again.
+    #[cfg(feature = "spinor")]
+    {
+        if recovery::previous_boot_failed() {
+            println!("[bt0] the previous boot never reached EDK2's boot manager; trying again");
         }
         recovery::begin_attempt();
     }
@@ -569,7 +585,7 @@ fn enter_main(b: &Bringup, mut handoff: Handoff, main_entry: u32) -> ! {
     rmr_switch(main_entry)
 }
 
-#[cfg(not(feature = "fel"))]
+#[cfg(not(any(feature = "fel", feature = "spinor")))]
 #[unsafe(no_mangle)]
 extern "C" fn main() -> ! {
     let b = bring_up();
@@ -586,6 +602,82 @@ extern "C" fn main() -> ! {
     let mut main_entry = None;
     if let Err(error) = layout::load_entries(&table, b.dram_end as u64, |e, addr, padded| {
         load_entry(&sd, e, addr, padded);
+        if let Some(entry) = place(&mut handoff, e, addr) {
+            main_entry = Some(entry);
+        }
+    }) {
+        println!("[bt0] invalid boot layout: {error:?}");
+        halt();
+    }
+    let Some(main_entry) = main_entry else {
+        println!("[bt0] layout: no oreboot main image");
+        halt();
+    };
+    enter_main(&b, handoff, main_entry)
+}
+
+/// SPI NOR boot: the SD path with the NOR as the medium (spinor.rs).
+#[cfg(feature = "spinor")]
+#[unsafe(no_mangle)]
+extern "C" fn main() -> ! {
+    // eGON boot_media byte, written by the mask ROM into the copy it ran.
+    let media = unsafe { core::ptr::read_volatile((SRAM_BASE as usize + 0x28) as *const u8) };
+    let b = bring_up();
+    println!("[bt0] boot media byte from the mask ROM: {media:#04x}");
+
+    let nor = match spinor::SpiNor::new() {
+        Ok(nor) => nor,
+        Err(e) => {
+            println!("[bt0] SPI NOR: controller init failed: {e:?}");
+            halt();
+        }
+    };
+    match nor.id() {
+        Ok(id) => {
+            println!("[bt0] SPI NOR: JEDEC ID {:02x} {:02x} {:02x}", id[0], id[1], id[2]);
+        }
+        Err(e) => {
+            println!("[bt0] SPI NOR: RDID failed: {e:?}");
+            halt();
+        }
+    }
+    soc::stage(8);
+
+    let mut frame = [0u8; smhc::BLOCK_SIZE];
+    if let Err(e) = nor.read(layout::TABLE_OFFSET, &mut frame) {
+        println!("[bt0] SPI NOR: reading layout table failed: {e:?}");
+        halt();
+    }
+    let table = match layout::decode(&frame) {
+        Ok(table) => table,
+        Err(error) => {
+            println!("[bt0] invalid boot layout frame: {error:?}");
+            halt();
+        }
+    };
+
+    let mut handoff = handoff(&b);
+    let mut main_entry = None;
+    if let Err(error) = layout::load_entries(&table, b.dram_end as u64, |e, addr, padded| {
+        let t0 = soc::time_us();
+        // SAFETY: whole-table preflight checked bounds, alignment and disjoint loads.
+        let dst = unsafe { core::slice::from_raw_parts_mut(addr as *mut u8, padded) };
+        if let Err(err) = nor.read(e.offset, dst) {
+            println!("[bt0] SPI NOR: read of kind {} failed: {err:?}", e.kind);
+            halt();
+        }
+        let ms = (soc::time_us() - t0) / 1000;
+        let data = &dst[..e.size as usize];
+        if e.crc32 != 0 && crc32(data) != e.crc32 {
+            println!("[bt0] kind {}: CRC mismatch", e.kind);
+            halt();
+        }
+        println!(
+            "[bt0] loaded kind {} ({} KiB) from SPI NOR to 0x{addr:08x} in {ms} ms{}",
+            e.kind,
+            e.size / 1024,
+            if e.crc32 != 0 { ", CRC ok" } else { "" }
+        );
         if let Some(entry) = place(&mut handoff, e, addr) {
             main_entry = Some(entry);
         }
