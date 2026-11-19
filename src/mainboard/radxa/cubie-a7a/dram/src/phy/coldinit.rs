@@ -336,12 +336,12 @@ const fn settle_rows() -> &'static [Row] {
         &SETTLE
     }
 }
-/// The CS initialization launch: three rows holding CS on both ranks and an
-/// empty fourth at pstate 1; four rows at pstate 0. REFERENCE-DERIVED
-/// (at each pstate).
-const CS_INIT: [Row; 4] = [Row::cmd(3, 0), Row::cmd(3, 0), Row::cmd(3, 0), Row::EMPTY];
-const CS_INIT_PS0: [Row; 4] = [Row::cmd(3, 0); 4];
-const fn cs_init_rows() -> &'static [Row; 4] {
+use super::lowrate::{cs_init, CS_INIT_ROWS as CS_N};
+/// The CS initialization launch, REFERENCE-DERIVED at each pstate: three rows holding CS on both
+/// ranks and an empty fourth at pstate 1; four rows at pstate 0; the first two at pstates 2 and 3.
+const CS_INIT: [Row; CS_N] = cs_init([Row::cmd(3, 0), Row::cmd(3, 0), Row::cmd(3, 0), Row::EMPTY]);
+const CS_INIT_PS0: [Row; CS_N] = [Row::cmd(3, 0); CS_N];
+const fn cs_init_rows() -> &'static [Row; CS_N] {
     if crate::pstate::ACTIVE == 0 {
         &CS_INIT_PS0
     } else {

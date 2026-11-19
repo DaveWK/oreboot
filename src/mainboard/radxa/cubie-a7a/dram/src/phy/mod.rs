@@ -22,6 +22,7 @@ pub mod endinit;
 pub mod freq;
 pub mod fw;
 pub mod init;
+pub mod lowrate;
 pub mod msgblock;
 pub mod prefix;
 pub mod prog;

@@ -470,14 +470,14 @@ pub fn measurement_once_no_clear(rank: Rank, out: &mut impl FnMut(Step<'_>)) {
 }
 
 /// One launch of the measurement program of the build's pstate
-/// ([`crate::pstate::ACTIVE`]): [`measurement_program`] at pstate 1,
-/// [`measurement_program_ps0`] at pstate 0.
+/// ([`crate::pstate::ACTIVE`]): [`measurement_program`] at pstate 1, else
+/// `lowrate::alt_program` ([`measurement_program_ps0`] at pstate 0).
 fn launch_measurement(rank: Rank, out: &mut impl FnMut(Step<'_>)) {
-    const PS0: [[Row; MEASUREMENT_ROWS_PS0]; 2] = [
-        measurement_program_ps0(Rank::R0),
-        measurement_program_ps0(Rank::R1),
+    const PS0: [[Row; super::lowrate::ALT_ROWS]; 2] = [
+        super::lowrate::alt_program(measurement_program_ps0(Rank::R0), Rank::R0),
+        super::lowrate::alt_program(measurement_program_ps0(Rank::R1), Rank::R1),
     ];
-    if crate::pstate::ACTIVE == 0 {
+    if crate::pstate::ACTIVE != 1 {
         out(Step::Launch {
             rows: &PS0[matches!(rank, Rank::R1) as usize],
             outer: 0,
@@ -747,7 +747,7 @@ pub const fn calibration_program(rank: Rank) -> [Row; 26] {
 /// pstate 0: the slow CK stays 40 ns while the row rate doubles). Every row
 /// repeats CA/CS; control bit 10 is set on the even rows. Chip selects and
 /// rank control use the existing original cold-init encoder.
-const fn held_edge(rows: &mut [Row], start: usize, n: usize, rank: Rank, ca: u8, cs: bool) {
+pub(super) const fn held_edge(rows: &mut [Row], start: usize, n: usize, rank: Rank, ca: u8, cs: bool) {
     let edge = Row::cmd(if cs { rank.cs() } else { 0 }, ca);
     let mut i = 0;
     while i < n {
