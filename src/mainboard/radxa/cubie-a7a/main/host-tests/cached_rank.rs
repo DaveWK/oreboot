@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-only
-//! Host test harness for the cached memtest; the firmware uses its own entry.
+//! Run with `cargo test --example cached-rank --target <host>`.
 #![no_std]
 
 #[cfg(test)]
 use cubie_a7a_common::{mem, sha256, Handoff, HANDOFF_MAGIC, HANDOFF_VERSION};
 #[cfg(test)]
+#[path = "../src/memtest_cached_core.rs"]
 mod memtest_cached_core;
 
 #[cfg(test)]

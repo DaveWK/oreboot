@@ -19,6 +19,15 @@ regio = { path = "../../../../lib/regio" }
 [dev-dependencies]
 cubie-a7a-dram = { path = "../dram", features = ["rank-map"] }
 
+# A harnessed example can run on the host without Cargo also building the EL3
+# binary (integration tests), or adding a library target to every image build.
+[[example]]
+name = "cached-rank"
+path = "host-tests/cached_rank.rs"
+crate-type = ["lib"]
+test = true
+harness = true
+
 # Peripheral bring-up in main, each one a build option so a first boot on new
 # hardware can leave out what has not run yet (Makefile BRINGUP=...). The
 # modules are always compiled; a disabled one never touches its hardware and
