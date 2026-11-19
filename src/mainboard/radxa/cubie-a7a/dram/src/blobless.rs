@@ -1349,20 +1349,22 @@ fn mission_handover_relock_with<H: Hw>(
             }
         }
     }
-    // Always validate APPLIED_MRL and write the mission read latency
-    // (`trained + mrl_add`, including `mrl_add = 0` or unset) to every DBYTE
-    // so the post-training select's 8 cannot remain in mission mode. An
-    // explicit full-DBYTE `A7A_HO_CSRS` lab override stays separate and runs
-    // after this write so it is never clobbered.
+    // Validate APPLIED_MRL on every handover regardless of `A7A_HO_CSRS`,
+    // failing closed on any missing or out-of-range value. Without a full
+    // four-DBYTE `A7A_HO_CSRS` override, write `trained + mrl_add` (including
+    // `mrl_add = 0` or unset) to every DBYTE so the post-training select's 8
+    // cannot remain in mission mode; with a full override, skip only that
+    // write so the explicit absolute writes below are the sole DFIMRL writes
+    // before the latch pulse.
+    let trained = crate::rdtrain::APPLIED_MRL.load(core::sync::atomic::Ordering::Relaxed);
+    let mission = match handover_mrl(trained, mrl_add) {
+        Ok(v) => v,
+        Err(e) => {
+            csr_access(hw, false);
+            return Err(e);
+        }
+    };
     if !ho_csrs.is_some_and(ho_csrs_overrides_all_dfimrl) {
-        let trained = crate::rdtrain::APPLIED_MRL.load(core::sync::atomic::Ordering::Relaxed);
-        let mission = match handover_mrl(trained, mrl_add) {
-            Ok(v) => v,
-            Err(e) => {
-                csr_access(hw, false);
-                return Err(e);
-            }
-        };
         for db in 0..4u32 {
             hw.write16(csr(0x10000 + 0x1000 * db), mission);
         }
@@ -2236,8 +2238,9 @@ mod tests {
             [(0, None), (1, None), (2, None), (3, None)]
         );
 
-        // Explicit full-DBYTE A7A_HO_CSRS override stays separate from add
-        // and works even when APPLIED_MRL is 0; partial override still fails
+        // Explicit full-DBYTE A7A_HO_CSRS override still validates APPLIED_MRL
+        // (0 is refused), and with a valid APPLIED_MRL writes only the
+        // explicit values and pulses the latch. Partial override also fails
         // closed without APPLIED_MRL.
         crate::rdtrain::APPLIED_MRL.store(0, core::sync::atomic::Ordering::Relaxed);
         let mut hw = HandoverHw::new();
@@ -2249,13 +2252,38 @@ mod tests {
             0,
             Some("10000=5,11000=5,12000=5,13000=5"),
         )
+        .is_err());
+        assert_eq!(
+            hw.dfimrl_writes(),
+            [(0, None), (1, None), (2, None), (3, None)]
+        );
+        assert!(!hw.fiu_pulsed_after_last_dfimrl());
+
+        crate::rdtrain::APPLIED_MRL.store(4, core::sync::atomic::Ordering::Relaxed);
+        let mut hw = HandoverHw::new();
+        assert!(super::mission_handover_relock_with(
+            &mut hw,
+            &p,
+            0,
+            false,
+            0,
+            Some("10000=5,11000=6,12000=5,13000=6"),
+        )
         .is_ok());
         assert_eq!(
             hw.dfimrl_writes(),
-            [(0, Some(5)), (1, Some(5)), (2, Some(5)), (3, Some(5))]
+            [(0, Some(5)), (1, Some(6)), (2, Some(5)), (3, Some(6))]
         );
+        // Full override skips the mission write so only the 4 explicit writes occur.
+        let dfimrl_write_count = hw
+            .recorded()
+            .iter()
+            .filter(|(a, _)| (0..4u32).any(|db| *a == crate::phy::csr(0x10000 + 0x1000 * db)))
+            .count();
+        assert_eq!(dfimrl_write_count, 4);
         assert!(hw.fiu_pulsed_after_last_dfimrl());
 
+        crate::rdtrain::APPLIED_MRL.store(0, core::sync::atomic::Ordering::Relaxed);
         let mut hw = HandoverHw::new();
         assert!(super::mission_handover_relock_with(
             &mut hw,
@@ -2270,6 +2298,78 @@ mod tests {
             hw.dfimrl_writes(),
             [(0, None), (1, None), (2, None), (3, None)]
         );
+    }
+
+    #[test]
+    fn handover_mrl_full_ho_csrs_override_fails_closed_without_valid_applied_mrl() {
+        let _g = HandoverGuard::acquire();
+        let p = cxmt_4g();
+        for bad in [0u16, crate::rdtrain::MRL_CSR_MAX + 1, crate::rdtrain::NONE] {
+            crate::rdtrain::APPLIED_MRL.store(bad, core::sync::atomic::Ordering::Relaxed);
+            let mut hw = HandoverHw::new();
+            let r = super::mission_handover_relock_with(
+                &mut hw,
+                &p,
+                0,
+                false,
+                0,
+                Some("10000=5,11000=5,12000=5,13000=5"),
+            );
+            assert!(
+                r.is_err(),
+                "full A7A_HO_CSRS override must fail closed for APPLIED_MRL={bad:#x}, got {r:?}"
+            );
+            assert_eq!(
+                hw.dfimrl_writes(),
+                [(0, None), (1, None), (2, None), (3, None)]
+            );
+            assert!(!hw.fiu_pulsed_after_last_dfimrl());
+        }
+    }
+
+    #[cfg(feature = "lab-knobs")]
+    #[test]
+    fn handover_mrl_lab_knobs_full_ho_csrs_override_requires_valid_mrl() {
+        let _g = HandoverGuard::acquire();
+        let p = cxmt_4g();
+        let mut k = crate::knobs::BUILD;
+        k.apply("A7A_HO_CSRS=10000=5,11000=6,12000=5,13000=6")
+            .unwrap();
+        crate::knobs::set(k);
+
+        for bad in [0u16, crate::rdtrain::MRL_CSR_MAX + 1, crate::rdtrain::NONE] {
+            crate::rdtrain::APPLIED_MRL.store(bad, core::sync::atomic::Ordering::Relaxed);
+            let mut hw = HandoverHw::new();
+            let r = super::mission_handover_relock(&mut hw, &p, 0, false);
+            assert!(
+                r.is_err(),
+                "lab-knobs full override must fail closed for APPLIED_MRL={bad:#x}, got {r:?}"
+            );
+            assert_eq!(
+                hw.dfimrl_writes(),
+                [(0, None), (1, None), (2, None), (3, None)]
+            );
+            assert!(!hw.fiu_pulsed_after_last_dfimrl());
+        }
+
+        crate::rdtrain::APPLIED_MRL.store(4, core::sync::atomic::Ordering::Relaxed);
+        let mut hw = HandoverHw::new();
+        let r = super::mission_handover_relock(&mut hw, &p, 0, false);
+        assert!(
+            r.is_ok(),
+            "valid APPLIED_MRL with full override failed: {r:?}"
+        );
+        assert_eq!(
+            hw.dfimrl_writes(),
+            [(0, Some(5)), (1, Some(6)), (2, Some(5)), (3, Some(6))]
+        );
+        let dfimrl_write_count = hw
+            .recorded()
+            .iter()
+            .filter(|(a, _)| (0..4u32).any(|db| *a == crate::phy::csr(0x10000 + 0x1000 * db)))
+            .count();
+        assert_eq!(dfimrl_write_count, 4);
+        assert!(hw.fiu_pulsed_after_last_dfimrl());
     }
 
     #[cfg(feature = "lab-knobs")]
