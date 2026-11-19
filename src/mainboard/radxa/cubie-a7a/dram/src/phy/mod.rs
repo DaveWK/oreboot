@@ -14,6 +14,7 @@
 //! drivers/st/ddr/phy/phyinit, BSD-3-Clause).
 
 pub mod acsm;
+pub mod acsm_row;
 pub mod coldinit;
 pub mod csrlist;
 pub mod devinit;

@@ -1060,6 +1060,10 @@ pub fn init_one(para: &[u32; 32]) -> Option<u32> {
             #[cfg(feature = "wck-alias-probe")]
             wck_alias_probe(id.phy_config, id.pub_rev);
             #[cfg(not(feature = "wck-alias-probe"))]
+            if ACSM_PROBE {
+                acsm_reset_probe();
+            }
+            #[cfg(not(feature = "wck-alias-probe"))]
             {
                 let mut samples = [None; 8];
                 blobless::acsm_delay_probe(&mut Bt0Hw, &mut samples);
@@ -1163,6 +1167,47 @@ pub fn init_one(para: &[u32; 32]) -> Option<u32> {
         );
     }
     println!("[dram] blobless: read training is the last stage so far; stopping");
+    crate::halt()
+}
+
+/// `A7A_ACSM_PROBE=reset` (FEL lab, phase A): right after pre-training,
+/// with the DRAM
+/// still held in reset (MemResetL 2), the ACSM row-field cases of crate
+/// module `acsm_probe` (`ACSMP` lines), then the halt. Nothing reaches the
+/// DRAM. Unset: the normal blobless flow.
+#[cfg(not(feature = "wck-alias-probe"))]
+const ACSM_PROBE: bool = match option_env!("A7A_ACSM_PROBE") {
+    None => false,
+    Some(s) if s.len() == 5 && s.as_bytes()[0] == b'r' => true,
+    Some(_) => panic!("A7A_ACSM_PROBE must be reset"),
+};
+
+/// The phase-A cases, printed, then the halt.
+#[cfg(not(feature = "wck-alias-probe"))]
+#[inline(never)]
+fn acsm_reset_probe() -> ! {
+    use cubie_a7a_dram::acsm_probe;
+    println!(
+        "[dram] ACSMP: pstate {PROBE_PSTATE}, DRAM in reset, {} cases, outer 255 x {} launches each (T)",
+        acsm_probe::CASES.len(),
+        acsm_probe::REPS
+    );
+    acsm_probe::reset_probe(&mut Bt0Hw, 2, &mut |c, s| {
+        crate::recovery::kick();
+        println!(
+            "[dram] ACSMP {} rows {:04x?} outer {} pre {:05x?}: us {:?} polls {} obs {:04x?} -> {:04x?} failure {:?}",
+            c.id,
+            &c.rows[..c.len as usize],
+            c.outer,
+            &c.pre[..c.npre as usize],
+            s.us,
+            s.polls,
+            s.before,
+            s.after,
+            s.failure
+        );
+    });
+    println!("[dram] ACSMP: done; stopping");
     crate::halt()
 }
 
@@ -1288,6 +1333,48 @@ fn dca_stage() {
     }
 }
 
+/// `A7A_ACSM_FIELD=<variant>` (FEL lab, phase B; feature `hybrid`): right
+/// after the PMU,
+/// before anything else of ours, one MRR of channel A with one ACSM row
+/// field changed (crate `acsm_probe::Variant`: ref, ma8, r1, r1-notg,
+/// r0-tg, rx-a, rx-b, rx-none, pre-nolo, pre-notg, pre-noft, pre-none,
+/// wait0, wait8), then the reference MRRs of MR5 and MR8. MRR only.
+#[cfg(feature = "hybrid")]
+const ACSM_FIELD: Option<cubie_a7a_dram::acsm_probe::Variant> = match option_env!("A7A_ACSM_FIELD")
+{
+    None => None,
+    Some(s) => match cubie_a7a_dram::acsm_probe::Variant::parse(s) {
+        Some(v) => Some(v),
+        None => panic!("A7A_ACSM_FIELD: unknown variant"),
+    },
+};
+
+#[cfg(feature = "hybrid")]
+#[inline(never)]
+fn acsm_field_probe(v: cubie_a7a_dram::acsm_probe::Variant) {
+    use cubie_a7a_dram::acsm_probe;
+    let r = acsm_probe::field_probe(
+        &mut Bt0Hw,
+        v,
+        hybrid_pstate(),
+        cubie_a7a_dram::dca::VIS_TRACE,
+    );
+    println!(
+        "[dram] ACSMF {:?}: rows {:04x?}; failure {:?} restored {} launches {}",
+        v,
+        v.rows(),
+        r.failure,
+        r.restored,
+        r.launches
+    );
+    for (what, m) in ["variant", "ref MR5", "ref MR8"].iter().zip(r.mrr.iter()) {
+        println!(
+            "[dram] ACSMF {:?} {what} MR{}: {:02x?} raw {:04x?} | {:04x?} info {:04x?} | {:04x?}",
+            v, m.ma, m.value, m.raw[0], m.raw[1], m.info[0], m.info[1]
+        );
+    }
+}
+
 /// The pstate the hybrid trained and hands over (A7A_OPEN_OPTS bits 3-5;
 /// our WL and read training run at pstate 1 only).
 #[cfg(feature = "hybrid")]
@@ -1325,6 +1412,9 @@ pub fn hybrid_after_pmu(p: &mut Para) -> ! {
             "[dram] HYBRID: our end of initialization: failure {:?}",
             e.failure
         );
+    }
+    if let Some(v) = ACSM_FIELD {
+        acsm_field_probe(v);
     }
     if DCA_MODE.is_some() {
         dca_stage();

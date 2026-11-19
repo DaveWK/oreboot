@@ -5,6 +5,7 @@
 //! training firmware is loaded as data (see [`phy`]).
 #![no_std]
 
+pub mod acsm_probe;
 pub mod blobless;
 pub mod ccu;
 pub mod ctrl;

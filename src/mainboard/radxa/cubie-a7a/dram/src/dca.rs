@@ -652,7 +652,7 @@ pub const BLOCKS: [(Channel, Rank); 4] = [
 
 /// CSRs the stage changes and puts back: channel selects, the read
 /// latency group, ACSMWckEnControl, the free-running WCK, `0x20007`.
-const SAVED: [u32; 13] = [
+pub(crate) const SAVED: [u32; 13] = [
     0x20072, 0x20073, 0x2007e, 0x2007a, 0x2000d, 0x10000, 0x11000, 0x12000, 0x13000, 0x14000,
     0x2002a, 0x20041, 0x20007,
 ];
@@ -669,11 +669,23 @@ pub(crate) fn mrr<H: Hw>(
     ma: u8,
     vis: u16,
 ) -> Mrr {
+    mrr_rows(ex, dbs, &rxen::mrr_program(rank, ma), ma, vis)
+}
+
+/// [`mrr`] with the launch's rows given (ACSM field probes,
+/// `acsm_probe`): the same bracket and RX FIFO read-out around `rows`.
+pub(crate) fn mrr_rows<H: Hw>(
+    ex: &mut WlExec<'_, H>,
+    dbs: [u32; 2],
+    rows: &[Row],
+    ma: u8,
+    vis: u16,
+) -> Mrr {
     let mut m = Mrr { ma, ..Mrr::EMPTY };
     let standby = ex.read(0x1000a + 0x1000 * dbs[0]);
     ex.write(RX_STANDBY, 0);
     fire(ex, dbs, EV_FIFO);
-    launch(ex, &rxen::mrr_program(rank, ma));
+    launch(ex, rows);
     ex.write(RX_STANDBY, standby);
     for (i, &db) in dbs.iter().enumerate() {
         let vis_found = ex.read(fifo_vis(db));
@@ -695,7 +707,7 @@ pub(crate) fn mrr<H: Hw>(
     m
 }
 
-fn select<H: Hw>(ex: &mut WlExec<'_, H>, ch: Channel, cfg: &Config) {
+pub(crate) fn select<H: Hw>(ex: &mut WlExec<'_, H>, ch: Channel, cfg: &Config) {
     let (a, b) = ch.enables();
     let mask = match ch {
         Channel::A => 0xf0,
