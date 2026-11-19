@@ -1765,6 +1765,12 @@ pub fn HO_MR2() -> Option<u8> {
     }
 }
 
+/// The command-bus reference step of command bus training (feature
+/// `full-speed`; declared here, below the code, so that no line of it
+/// moves).
+#[cfg(any(test, feature = "full-speed"))]
+pub mod cavref;
+
 #[cfg(test)]
 mod tests {
     #[test]
