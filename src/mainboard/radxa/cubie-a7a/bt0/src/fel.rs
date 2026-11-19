@@ -526,7 +526,7 @@ const GICD_CTLR_RWP: u32 = 1 << 31;
 /// watchdog reset the board back into FEL). Turn the distributor off, every
 /// SPI, SGI and PPI enable and pending bit with it, and the generic timers;
 /// main programs the GIC from scratch (gic::init_distributor).
-fn quiesce_rom_interrupts() {
+pub(crate) fn quiesce_rom_interrupts() {
     let ctlr = read32(GICD);
     write32(GICD, 0);
     let mut reads = 0;

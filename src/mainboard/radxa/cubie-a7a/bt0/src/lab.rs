@@ -24,6 +24,8 @@
 //! | 11 MRW | channel, rank, mr, value | 0, or 0xdead_0000 \| error |
 //! | 12 PTEST | base, bytes, mode | errors, first address, wanted, got, OR of all xors, bit-28 0->1 count, bit-28 1->0 count, first bit-28 address, ms |
 //!
+//! | 13 WARM | entry | - (does not return: the ROM's interrupts quiesced, then the RMR warm reset into AArch64 at `entry`, as entry 2 does for main; the watchdog the lab armed keeps running) |
+//!
 //! PTEST modes (fill the whole range, then check it): 0 address in
 //! address, 1 its inverse, 2 checkerboard 0x5555_5555/0xaaaa_aaaa by word,
 //! 3 its inverse, 4 walking one (bit = word index mod 32), 5 walking zero,
@@ -56,6 +58,7 @@ pub mod op {
     pub const CHECK: u32 = 10;
     pub const MRW: u32 = 11;
     pub const PTEST: u32 = 12;
+    pub const WARM: u32 = 13;
 }
 
 const PHY_BASE: usize = 0x0a90_0000;
@@ -256,7 +259,7 @@ pub fn run() -> (u32, u32, u32) {
         let need = match opc {
             op::END => return (ops, out.n as u32, 0),
             op::W16 | op::W32 | op::R16N => 2,
-            op::R16 | op::R32 | op::DELAY => 1,
+            op::R16 | op::R32 | op::DELAY | op::WARM => 1,
             op::MEMTEST | op::MRR | op::FILL | op::CHECK | op::PTEST => 3,
             op::MRW => 4,
             _ => return (ops, out.n as u32, 0x100 | opc),
@@ -290,6 +293,12 @@ pub fn run() -> (u32, u32, u32) {
                     out.push(v);
                 }
                 out.push(ms_since(t0));
+            }
+            op::WARM => {
+                // Warm-reset probe: everything as entry 2 before
+                // main, then the warm reset into the host's stub.
+                crate::fel::quiesce_rom_interrupts();
+                crate::rmr_switch(a(0));
             }
             op::PTEST => {
                 let t0 = soc::ticks();

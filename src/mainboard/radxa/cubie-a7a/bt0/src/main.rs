@@ -357,7 +357,7 @@ fn load_entry(sd: &smhc::Smhc, e: &layout::Entry, addr: usize, padded: usize) {
 /// FEL the mask ROM's USB interrupt does this unless fel.rs quiesces the
 /// GIC first. If bt0 is still running 1 s after the request, it says so,
 /// with the pending-interrupt state; the watchdog then resets the board.
-fn rmr_switch(entry: u32) -> ! {
+pub(crate) fn rmr_switch(entry: u32) -> ! {
     write32(soc::RVBAR_LO_CPU0, entry);
     write32(soc::RVBAR_HI_CPU0, 0);
     // Also select AArch64 in CPU0's reset configuration, as TF-A does for
