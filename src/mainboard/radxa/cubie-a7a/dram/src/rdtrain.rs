@@ -101,6 +101,51 @@ pub const NONE: u16 = 0xffff;
 /// All nine lanes.
 pub const FULL: u16 = (1 << LANES) - 1;
 
+/// FEL lab `A7A_RD_LANES=<hex>` (rx-capture probes): the lanes that must
+/// pass the PHY compare, a bit per lane, lane 8 being the DMI lane. Unset:
+/// all nine ([`FULL`], the reference). With DRAM read DBI off (MR3 OP[6] =
+/// 0, the operating value the PMU state reads with) the DMI lane carries
+/// no RDC pattern: the board runs with MR3 0x06 show
+/// eight lanes passing at the gate ("58881"/"68881") and only the DMI lane
+/// failing, so the all-nine rule reported NoGate. `ff` leaves the DMI lane
+/// out of every pass test of this stage (gate, RxEnDly, per-lane receive
+/// clock, read latency, data check): it then counts as passing and its
+/// receive clock goes to the centre of its sweep, the byte's `clk0`.
+pub const PASS_LANES: u16 = match option_env!("A7A_RD_LANES") {
+    Some(s) => match lane_mask(s) {
+        Some(m) => m,
+        None => {
+            panic!("A7A_RD_LANES is a hex lane mask (lane 8 = DMI), up to 1ff, with lanes 0-7 set")
+        }
+    },
+    None => FULL,
+};
+
+/// A hex lane mask of up to three digits that keeps lanes 0-7 (the DQs):
+/// only the DMI lane may be left out.
+const fn lane_mask(s: &str) -> Option<u16> {
+    let b = s.as_bytes();
+    if b.is_empty() || b.len() > 3 {
+        return None;
+    }
+    let mut v: u16 = 0;
+    let mut i = 0;
+    while i < b.len() {
+        let d = match b[i] {
+            b'0'..=b'9' => b[i] - b'0',
+            b'a'..=b'f' => b[i] - b'a' + 10,
+            b'A'..=b'F' => b[i] - b'A' + 10,
+            _ => return None,
+        };
+        v = v * 16 + d as u16;
+        i += 1;
+    }
+    if v & !FULL != 0 || v & 0xff != 0xff {
+        return None;
+    }
+    Some(v)
+}
+
 /// Data check: RDC patterns (MR33, MR34); the PHY's expected word is
 /// MR34 << 8 | MR33 (the reference's 0x36/0xa5 = `rd::PATTERN`).
 pub const CHECK_PATTERNS: [(u8, u8); 4] = [(0x36, 0xa5), (0x55, 0xaa), (0x0f, 0xf0), (0xff, 0x00)];
@@ -576,6 +621,11 @@ pub(crate) fn point_counts<H: Hw>(
     let mut n = [0u32; 2];
     for (i, oi) in o.iter().enumerate() {
         for lane in 0..LANES {
+            if PASS_LANES != FULL && PASS_LANES >> lane & 1 == 0 {
+                // A lane left out of the pass tests (`A7A_RD_LANES`).
+                m[i] |= 1 << lane;
+                continue;
+            }
             if oi.cmp[lane] != 0 && oi.err[lane] == 0 {
                 m[i] |= 1 << lane;
             }
@@ -1323,6 +1373,9 @@ pub(crate) fn data_check<H: Hw>(
             measure_prog(ex, dbs, prog, rxen::CENTRING_OUTER, &mut o);
             for (i, oi) in o.iter().enumerate() {
                 for lane in 0..LANES {
+                    if PASS_LANES != FULL && PASS_LANES >> lane & 1 == 0 {
+                        continue;
+                    }
                     out.compares[p][i] += oi.cmp[lane] as u32;
                     out.errors[p][i] += oi.err[lane] as u32;
                     if oi.err[lane] != 0 || oi.cmp[lane] == 0 {
@@ -1332,7 +1385,7 @@ pub(crate) fn data_check<H: Hw>(
             }
         }
         for (c, d) in out.clean_lanes[p].iter_mut().zip(dirty) {
-            *c = (LANES as u32 - d.count_ones()) as u8;
+            *c = (PASS_LANES.count_ones() - d.count_ones()) as u8;
         }
     }
     data_setup(
@@ -1409,4 +1462,28 @@ pub fn live_summary<H: Hw>(hw: &mut H, lane: u16) -> [[u16; 3]; 4] {
     let v = core::array::from_fn(|db| live_lane(&mut ex, db as u32, lane));
     csr_access(hw, false);
     v
+}
+
+#[cfg(test)]
+mod lane_mask_tests {
+    use super::{lane_mask, FULL, PASS_LANES};
+
+    #[test]
+    fn default_is_all_nine_lanes() {
+        assert_eq!(PASS_LANES, FULL);
+        assert_eq!(FULL, 0x1ff);
+    }
+
+    #[test]
+    fn mask_text() {
+        assert_eq!(lane_mask("ff"), Some(0xff));
+        assert_eq!(lane_mask("1ff"), Some(0x1ff));
+        assert_eq!(lane_mask("1FF"), Some(0x1ff));
+        // a DQ lane left out, too wide, not hex, empty
+        assert_eq!(lane_mask("fe"), None);
+        assert_eq!(lane_mask("3ff"), None);
+        assert_eq!(lane_mask("1fff"), None);
+        assert_eq!(lane_mask("0xff"), None);
+        assert_eq!(lane_mask(""), None);
+    }
 }

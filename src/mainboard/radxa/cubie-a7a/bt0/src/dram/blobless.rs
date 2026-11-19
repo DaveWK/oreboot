@@ -735,6 +735,12 @@ fn read_training(bases: [Option<cubie_a7a_dram::phy::wcklevel::Mr18Base>; 4]) ->
         rdtrain::MRL_FALLBACK,
         rd::VENDOR_RX_EN,
     );
+    if rdtrain::PASS_LANES != rdtrain::FULL {
+        println!(
+            "[dram] RDT: A7A_RD_LANES {:03x}: lanes outside the mask (DMI = lane 8) left out of the pass tests",
+            rdtrain::PASS_LANES
+        );
+    }
     // SAFETY: bt0 is single-threaded and nothing else refers to it.
     let t = unsafe { &mut *core::ptr::addr_of_mut!(RD_TRAIN) };
     let mut prev = None;
