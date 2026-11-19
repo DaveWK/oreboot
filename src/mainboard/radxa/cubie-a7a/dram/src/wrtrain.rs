@@ -681,6 +681,21 @@ pub fn vref_codes(first: u8, step: u8, n: usize) -> ([u8; VREF_POINTS], usize) {
     (c, n)
 }
 
+/// How many of `n` codes from `first` by `step` stay at or below `max` (the
+/// JEDEC DQ Vref limit of the pstate, `pstate::dq_vref_code_max`): the
+/// sweep of [`vref_codes`] is cut there, never extended.
+pub const fn vref_n_capped(first: u8, step: u8, n: usize, max: u8) -> usize {
+    if first > max || step == 0 {
+        return 0;
+    }
+    let fit = ((max - first) / step) as usize + 1;
+    if fit < n {
+        fit
+    } else {
+        n
+    }
+}
+
 /// The per-DBYTE choice from a width profile.
 pub fn choose(widths: &[Option<u8>], codes: &[u8]) -> (Option<u8>, Option<u8>) {
     let chosen = dram_train::eye::center(widths)
@@ -1250,5 +1265,27 @@ mod tests {
             self.0.borrow_mut().mrr(ch, rank, ma)
         }
         fn settle(&mut self) {}
+    }
+}
+
+#[cfg(test)]
+mod vref_cap_tests {
+    use super::*;
+    use crate::pstate::{dq_vref_code_max, Point, BOARD_VDDQ_MV};
+
+    #[test]
+    fn the_write_vref_sweep_stays_inside_jedec_per_pstate() {
+        // The stage's sweep: 0x20 by 1, 31 codes (to 0x3e).
+        let m1 = dq_vref_code_max(Point::board(1).wck_mhz(), BOARD_VDDQ_MV);
+        let m0 = dq_vref_code_max(Point::board(0).wck_mhz(), BOARD_VDDQ_MV);
+        assert_eq!(vref_n_capped(0x20, 1, 31, m1), 31);
+        assert_eq!(vref_n_capped(0x20, 1, 31, m0), 29);
+        let (c, n) = vref_codes(0x20, 1, vref_n_capped(0x20, 1, 31, m0));
+        assert_eq!(c[n - 1], 0x3c);
+        // The byte-identification code 0x0a (84 mV) is above JEDEC's 75 mV
+        // minimum at VDDQ 560 mV.
+        assert!(BOARD_VDDQ_MV * (100 + 5 * 0x0a) / 1000 >= 75);
+        assert_eq!(vref_n_capped(0x40, 1, 5, 0x3c), 0);
+        assert_eq!(vref_n_capped(0x20, 2, 31, 0x3c), 15);
     }
 }

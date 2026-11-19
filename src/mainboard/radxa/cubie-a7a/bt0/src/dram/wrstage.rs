@@ -65,6 +65,14 @@ const BLOCK_BYTES: usize = 128;
 const VREF_FIRST: u8 = 0x20;
 const VREF_N: usize = 31;
 const VREF_BAD: u8 = 0x0a;
+/// The sweep's highest code at the stage's pstate: JEDEC's DQ Vref maximum
+/// is 225 mV above a WCK of 1600 MHz (pstate 0: 2400 MHz), so at VDDQ
+/// 560 mV the sweep stops at 0x3c there; at pstate 1 it is unchanged.
+const VREF_MAX: u8 = cubie_a7a_dram::pstate::dq_vref_code_max(
+    cubie_a7a_dram::pstate::Point::board(super::blobless::stage_pstate_build()).wck_mhz(),
+    cubie_a7a_dram::pstate::BOARD_VDDQ_MV,
+);
+const VREF_N_CAPPED: usize = wrtrain::vref_n_capped(VREF_FIRST, 1, VREF_N, VREF_MAX);
 
 fn pattern(addr: usize, seed: u32) -> u32 {
     let x = (addr as u32).wrapping_mul(0x9e37_79b1) ^ seed;
@@ -298,7 +306,7 @@ pub fn run() -> bool {
                 }
             };
             println!("[dram] WR: tg {tg} MR14/MR15 drive DBYTEs {bytes:?}");
-            let (codes, n) = wrtrain::vref_codes(VREF_FIRST, 1, VREF_N);
+            let (codes, n) = wrtrain::vref_codes(VREF_FIRST, 1, VREF_N_CAPPED);
             match wrtrain::vref_sweep(
                 &mut p,
                 &mut mp,

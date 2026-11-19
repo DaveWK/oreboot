@@ -252,7 +252,24 @@ pub struct TrainConfig {
     pub check_n: u16,
     /// The data UI in ps (only for the printed table).
     pub ui_ps: u16,
+    /// The vendor's trained point the formula is cross-checked against at
+    /// this pstate: (RxEnDly, the read latency it must give), and the read
+    /// latency applied when the check fails and no override is given.
+    pub mrl_check: (u16, u16),
+    pub mrl_fallback: u16,
 }
+
+/// FEL lab `A7A_RD_MRL_SEARCH` (hex): the read latency during the searches
+/// instead of the pstate's default (e.g. `82`, the reference's value during
+/// the pstate-0 read enable stage; it uses 3 at pstate 1). Unset: the
+/// pstate's [`TrainConfig`].
+pub const MRL_SEARCH: Option<u16> = match option_env!("A7A_RD_MRL_SEARCH") {
+    Some(s) => match u16::from_str_radix(s, 16) {
+        Ok(v) => Some(v),
+        Err(_) => panic!("A7A_RD_MRL_SEARCH is not a hex number"),
+    },
+    None => None,
+};
 
 impl TrainConfig {
     /// pstate 1 (WCK 1200 MHz, 2400 MT/s, UI 417 ps): the reference's mode
@@ -281,7 +298,39 @@ impl TrainConfig {
         apply: false,
         check_n: 16,
         ui_ps: 417,
+        mrl_check: (MRL_CHECK_RX_EN, MRL_CHECK_WANT),
+        mrl_fallback: MRL_FALLBACK,
     };
+
+    /// pstate 0 (WCK 2400 MHz, 4800 MT/s, UI 208 ps). The grid is in UI
+    /// units and stays; the mode launches are the pstate-1 ones (the
+    /// reference's read enable launches at pstate 0 write the same MR18/MR10/
+    /// MR20/MR31-34 values, REFERENCE-DERIVED); the read latency during the
+    /// searches is the vendor's mission value at pstate 0 (DFIMRL and HwtMRL
+    /// 5, feature `av3h` dump, MEASURED), as 4 is at pstate 1; the formula's
+    /// cross-check is that dump's RxEnDly 0x497 (lane-0 DBYTE 0, Tg0) against MRL 5,
+    /// with 5 as the fallback.
+    pub const PSTATE0: TrainConfig = TrainConfig {
+        mrl_search: 5,
+        ui_ps: 208,
+        mrl_check: (0x497, 5),
+        mrl_fallback: 5,
+        ..TrainConfig::PSTATE1
+    };
+
+    /// The configuration of `pstate` (0 or 1; None for the others), with
+    /// [`MRL_SEARCH`] applied.
+    pub const fn for_pstate(pstate: u32) -> Option<TrainConfig> {
+        let mut c = match pstate {
+            0 => TrainConfig::PSTATE0,
+            1 => TrainConfig::PSTATE1,
+            _ => return None,
+        };
+        if let Some(m) = MRL_SEARCH {
+            c.mrl_search = m;
+        }
+        Some(c)
+    }
 
     /// Launches of the gate search.
     pub const fn gate_launches(&self) -> usize {
@@ -326,10 +375,10 @@ pub const fn choose_mrl(rx_en_max: u16, cfg: &TrainConfig) -> (u16, MrlSource) {
     if let Some(m) = cfg.mrl_override {
         return (m, MrlSource::Override);
     }
-    if derive_mrl(MRL_CHECK_RX_EN, cfg) == MRL_CHECK_WANT {
+    if derive_mrl(cfg.mrl_check.0, cfg) == cfg.mrl_check.1 {
         (derive_mrl(rx_en_max, cfg), MrlSource::Formula)
     } else {
-        (MRL_FALLBACK, MrlSource::FallbackFormulaWrong)
+        (cfg.mrl_fallback, MrlSource::FallbackFormulaWrong)
     }
 }
 
@@ -1340,7 +1389,7 @@ fn mrl_sweep<H: Hw>(
     // the formula, the override or the fallback.
     let rx_en_max = out.bytes[0].rx_en.max(out.bytes[1].rx_en);
     out.mrl_formula = derive_mrl(rx_en_max, cfg);
-    out.mrl_check = derive_mrl(MRL_CHECK_RX_EN, cfg);
+    out.mrl_check = derive_mrl(cfg.mrl_check.0, cfg);
     let (m, src) = choose_mrl(rx_en_max, cfg);
     out.mrl = m;
     out.mrl_source = src;
@@ -1504,5 +1553,46 @@ mod lane_mask_tests {
         assert_eq!(lane_mask("1fff"), None);
         assert_eq!(lane_mask("0xff"), None);
         assert_eq!(lane_mask(""), None);
+    }
+}
+
+#[cfg(test)]
+mod pstate_config_tests {
+    use super::*;
+
+    #[test]
+    fn pstate0_config_and_its_latency_choice() {
+        let c1 = TrainConfig::PSTATE1;
+        let c0 = TrainConfig::PSTATE0;
+        // Only the latency inputs and the UI differ; the grid (UI units)
+        // and the mode launches are the pstate-1 ones.
+        assert_eq!(
+            TrainConfig {
+                mrl_search: c1.mrl_search,
+                ui_ps: c1.ui_ps,
+                mrl_check: c1.mrl_check,
+                mrl_fallback: c1.mrl_fallback,
+                ..c0
+            },
+            c1
+        );
+        assert_eq!(c0.ui_ps as u32, crate::pstate::Point::board(0).ui_ps());
+        assert_eq!(c1.ui_ps as u32, crate::pstate::Point::board(1).ui_ps());
+        // The search grid reaches the vendor's pstate-0 RxEnDly (0x497).
+        assert!(c0.gate_step * (c0.gate_n - 1) > 0x497 + c0.en_margin);
+        // The formula misses both vendor points (it gives 3 at each), so
+        // each pstate falls back to the vendor's mission latency.
+        assert_eq!(derive_mrl(c1.mrl_check.0, &c1), 3);
+        assert_eq!(derive_mrl(c0.mrl_check.0, &c0), 3);
+        assert_eq!(choose_mrl(0x2f0, &c1), (4, MrlSource::FallbackFormulaWrong));
+        assert_eq!(choose_mrl(0x497, &c0), (5, MrlSource::FallbackFormulaWrong));
+        // The pstate-1 path is unchanged.
+        assert_eq!(c1.mrl_check, (MRL_CHECK_RX_EN, MRL_CHECK_WANT));
+        assert_eq!(c1.mrl_fallback, MRL_FALLBACK);
+        if MRL_SEARCH.is_none() {
+            assert_eq!(TrainConfig::for_pstate(1), Some(c1));
+            assert_eq!(TrainConfig::for_pstate(0), Some(c0));
+        }
+        assert_eq!(TrainConfig::for_pstate(2), None);
     }
 }

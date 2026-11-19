@@ -432,9 +432,15 @@ pub fn settle_rows() -> [Row; 12] {
 }
 
 /// The closing four-row delay launch.
+/// Its delay row is `0x3b00` at pstate 0 (REFERENCE-DERIVED; a row without F10, which runs once on this PHY whatever
+/// its count, measured).
 pub fn close_rows() -> [Row; 4] {
     let mut rows = [Row::EMPTY; 4];
-    rows[2] = Row::nop(0x2b00);
+    rows[2] = Row::nop(if crate::pstate::ACTIVE == 0 {
+        0x3b00
+    } else {
+        0x2b00
+    });
     rows
 }
 
@@ -490,8 +496,8 @@ fn clocks_start(mask: u16, out: &mut impl FnMut(Step<'_>)) {
         &[
             (0x2007e, 0),
             (0x2007a, 0xff),
-            (0x20042, 0x103),
-            (0x20044, 1),
+            (0x20042, crate::pstate::ACTIVE_LOW_SPEED.enable),
+            (0x20044, crate::pstate::ACTIVE_LOW_SPEED.delay),
             (0x2007a, mask),
             (0x2007e, 0),
         ],

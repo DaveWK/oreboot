@@ -18,8 +18,96 @@ use crate::soc;
 
 /// The pstate the vendor order programs and trains first.
 /// The probe's pstate: 1, or 3 (the lowest, 400 MT/s by the parameter set's
-/// dividers) with feature `probe-ps3` (a timing-independence test).
-const PROBE_PSTATE: u32 = if cfg!(feature = "probe-ps3") { 3 } else { 1 };
+/// dividers) with feature `probe-ps3` (a timing-independence test), or
+/// the build's `A7A_PSTATE` (`cubie_a7a_dram::pstate::ACTIVE`; 0 is the
+/// mission rate, 2400 MHz WCK). The stage generators of the DRAM crate
+/// follow `A7A_PSTATE`, so the two can never disagree.
+const PROBE_PSTATE: u32 = if cubie_a7a_dram::pstate::ACTIVE_FROM_ENV {
+    cubie_a7a_dram::pstate::ACTIVE
+} else if cfg!(feature = "probe-ps3") {
+    3
+} else {
+    1
+};
+const _: () = assert!(
+    !(cfg!(feature = "probe-ps3") && cubie_a7a_dram::pstate::ACTIVE_FROM_ENV),
+    "feature probe-ps3 and A7A_PSTATE select the pstate twice"
+);
+
+/// The pstate our stages run at: the hybrid's trained pstate (A7A_OPEN_OPTS
+/// bits 3-5), else [`PROBE_PSTATE`].
+/// [`stage_pstate`] from the build's knobs (const contexts).
+pub(super) const fn stage_pstate_build() -> u32 {
+    #[cfg(feature = "hybrid")]
+    {
+        hybrid_pstate_build()
+    }
+    #[cfg(not(feature = "hybrid"))]
+    {
+        PROBE_PSTATE
+    }
+}
+
+pub(super) fn stage_pstate() -> u32 {
+    #[cfg(feature = "hybrid")]
+    {
+        hybrid_pstate()
+    }
+    #[cfg(not(feature = "hybrid"))]
+    {
+        PROBE_PSTATE
+    }
+}
+
+/// Our WCK2CK leveling and read training (their ACSM programs and clock
+/// settings) are built for `cubie_a7a_dram::pstate::ACTIVE`: a hybrid that
+/// runs them must have trained that pstate.
+#[cfg(feature = "hybrid")]
+const _: () = assert!(
+    (option_env!("A7A_HYBRID_NO_WL").is_some() && option_env!("A7A_HYBRID_ENDINIT").is_none())
+        || hybrid_pstate_build() == cubie_a7a_dram::pstate::ACTIVE,
+    "hybrid WL/RD at a pstate other than A7A_PSTATE (set A7A_PSTATE to the trained pstate)"
+);
+
+/// The parameter set's DfiClk at the stage pstate must be the one the
+/// generators were built for (`pstate::BOARD_DFI_MHZ`); prints and returns
+/// false otherwise.
+fn clock_matches(p: &Para) -> bool {
+    use cubie_a7a_dram::pstate::{Point, ACTIVE};
+    let ps = stage_pstate();
+    let have = Point::of(p, ps);
+    let want = Point::board(ps);
+    if have != want || (cubie_a7a_dram::pstate::ACTIVE_FROM_ENV && ps != ACTIVE) {
+        println!(
+            "[dram] PSTATE: stages at pstate {ps} need DfiClk {} MHz (generators built for pstate {ACTIVE}); the set gives {} MHz: not running them",
+            want.dfi_mhz, have.dfi_mhz
+        );
+        return false;
+    }
+    println!(
+        "[dram] PSTATE: our stages at pstate {ps}: DfiClk {} MHz, WCK {} MHz, {} MT/s, UI {} ps; low-speed clock {:x?}, DLL gain {:04x}",
+        have.dfi_mhz,
+        have.wck_mhz(),
+        have.data_rate(),
+        have.ui_ps(),
+        cubie_a7a_dram::pstate::ACTIVE_LOW_SPEED,
+        cubie_a7a_dram::pstate::ACTIVE_DLL_GAIN
+    );
+    true
+}
+
+/// FEL lab `A7A_WL_MR16` (hex): MRW MR16 to all ranks right before WCK2CK
+/// leveling, so that its MR18 writes go to a set-point other than the
+/// operating one (measured: WL must not run with FSP-WR = FSP-OP). The PMU
+/// leaves 0x04 at pstate 1; what it leaves at pstate 0 is read by the
+/// pstate-0 control run. Unset: nothing.
+const WL_MR16: Option<u8> = match option_env!("A7A_WL_MR16") {
+    Some(s) => match u8::from_str_radix(s, 16) {
+        Ok(v) => Some(v),
+        Err(_) => panic!("A7A_WL_MR16 is not a hex byte"),
+    },
+    None => None,
+};
 
 fn report(name: &str, r: &Readback) {
     println!(
@@ -144,7 +232,11 @@ static mut WL_SWEEP: cubie_a7a_dram::wl::WlSweep = cubie_a7a_dram::wl::WlSweep::
 fn wck_level(p: &mut Para) {
     use cubie_a7a_dram::phy::wcklevel::{Channel, Rank};
     use cubie_a7a_dram::wl::{self, SNAP_NAMES, WL_POINTS, WL_STEP};
-    let bases = blobless::wl_mr18_bases(p, PROBE_PSTATE);
+    let bases = blobless::wl_mr18_bases(p, stage_pstate());
+    if let Some(v) = WL_MR16 {
+        let f = blobless::mr16_all(&mut Bt0Hw, v);
+        println!("[dram] WL: MR16 {v:02x} to all ranks before leveling: failure {f:?}");
+    }
     {
         use cubie_a7a_dram::phy::wcklevel::Mr18Op;
         let ops = cubie_a7a_dram::knobs::get().wl_mr18_ops;
@@ -275,7 +367,7 @@ fn wck_level(p: &mut Para) {
     }
     #[cfg(feature = "hybrid")]
     if cubie_a7a_dram::knobs::get().hybrid_skip_rd {
-        let r = blobless::mission_handover(&mut Bt0Hw, p, PROBE_PSTATE);
+        let r = blobless::mission_handover(&mut Bt0Hw, p, stage_pstate());
         println!("[dram] MISSION (hybrid, no read training): {r:?}");
         if r.is_ok() {
             let _ = super::wrstage::run();
@@ -306,9 +398,12 @@ fn wck_level(p: &mut Para) {
             #[cfg(any(feature = "bl-mission", feature = "hybrid"))]
             if applied {
                 let relock = cubie_a7a_dram::knobs::get().bl_relock;
-                let r = blobless::mission_handover_relock(&mut Bt0Hw, p, PROBE_PSTATE, relock);
+                let r = blobless::mission_handover_relock(&mut Bt0Hw, p, stage_pstate(), relock);
                 println!("[dram] MISSION: PLL/DLL relock before the DFI init: {relock}");
-                println!("[dram] MISSION: lean hand-over at pstate {PROBE_PSTATE}: {r:?}");
+                println!(
+                    "[dram] MISSION: lean hand-over at pstate {}: {r:?}",
+                    stage_pstate()
+                );
                 if r.is_ok() {
                     let clean = super::wrstage::run();
                     #[cfg(feature = "bl-mission")]
@@ -718,16 +813,20 @@ fn read_training(bases: [Option<cubie_a7a_dram::phy::wcklevel::Mr18Base>; 4]) ->
     ];
     // Applied: the four blocks once; the measurement image repeats A0.
     let runs: &[(Channel, Rank)] = if TRAIN_ONLY { &ALL } else { &ALL[..4] };
+    let ps = stage_pstate();
     let base_cfg = TrainConfig {
         apply: !TRAIN_ONLY,
         mrl_override: cubie_a7a_dram::knobs::get().rd_mrl,
         exit: cubie_a7a_dram::rdtrain::EXIT_MRS(),
-        ..TrainConfig::PSTATE1
+        ..match TrainConfig::for_pstate(ps) {
+            Some(c) => c,
+            None => TrainConfig::PSTATE1,
+        }
     };
     println!(
         "[dram] RDT: read training ({}, pstate {}): order {:?}; config {:x?}; latch events (CSR, read at, bits) {:05x?} held {} us; receive clock effective delay 64 x coarse + fine (fine < 0x40 written); VrefDAC {}; check patterns (MR33, MR34) {:x?} then the first inverted (negative control); MRR {:?} with RxFifoVisibility {:x?}; no PState flip, no refresh; ps = taps x UI / 64; MRL = ceil((RxEnDly/64 UI + {} UI + {} ps) / {} UI) + {}, cross-checked at the vendor's RxEnDly {:x} (must give {}), fallback {}; vendor (av3c) RxEnDly {:x}",
         if TRAIN_ONLY { "measurement image" } else { "applied" },
-        PROBE_PSTATE,
+        ps,
         runs,
         base_cfg,
         rd::EVENTS,
@@ -740,9 +839,9 @@ fn read_training(bases: [Option<cubie_a7a_dram::phy::wcklevel::Mr18Base>; 4]) ->
         base_cfg.fifo_ps,
         base_cfg.dficlk_ui,
         base_cfg.mrl_margin,
-        rdtrain::MRL_CHECK_RX_EN,
-        rdtrain::MRL_CHECK_WANT,
-        rdtrain::MRL_FALLBACK,
+        base_cfg.mrl_check.0,
+        base_cfg.mrl_check.1,
+        base_cfg.mrl_fallback,
         rd::VENDOR_RX_EN,
     );
     if rdtrain::PASS_LANES() != rdtrain::FULL {
@@ -763,9 +862,13 @@ fn read_training(bases: [Option<cubie_a7a_dram::phy::wcklevel::Mr18Base>; 4]) ->
             .unwrap_or(0);
         // pstate 1: the reference's mode MRs, and the vendor's trained
         // references only in the measurement image (never a default);
-        // another pstate: MR18 from the block's WL base, no vendor starts.
-        let (cfg, start) = if PROBE_PSTATE == 1 {
+        // pstate 0: the same mode MRs (the reference's pstate-0 read enable
+        // writes the same values), no vendor starts; another pstate: MR18
+        // from the block's WL base, no vendor starts.
+        let (cfg, start) = if ps == 1 {
             (base_cfg, if TRAIN_ONLY { Some(&AV3C_START) } else { None })
+        } else if ps == 0 {
+            (base_cfg, None)
         } else {
             let base = bases[k].map(|m| m.value()).unwrap_or(0x0c);
             (
@@ -812,7 +915,7 @@ fn read_training(bases: [Option<cubie_a7a_dram::phy::wcklevel::Mr18Base>; 4]) ->
         };
         println!(
             "[dram] RDT {nm} run {n} TABLE block: ok {} applied {} stop {:?} failure {:?} restored {} live {:?}; MRL applied {} ({:?}; formula {} from RxEnDly max {:03x}, vendor check {} want {}; sweep pass set {:#x}); {} launches, {} writes, max {} us, {} us",
-            t.ok(), t.applied, t.stop, t.failure, t.restored, t.live_ok, t.mrl, t.mrl_source, t.mrl_formula, t.bytes[0].rx_en.max(t.bytes[1].rx_en), t.mrl_check, rdtrain::MRL_CHECK_WANT, t.mrl_pass, t.launches, t.writes, t.max_launch_us, t.elapsed_us
+            t.ok(), t.applied, t.stop, t.failure, t.restored, t.live_ok, t.mrl, t.mrl_source, t.mrl_formula, t.bytes[0].rx_en.max(t.bytes[1].rx_en), t.mrl_check, cfg.mrl_check.1, t.mrl_pass, t.launches, t.writes, t.max_launch_us, t.elapsed_us
         );
         for (i, b) in t.bytes.iter().enumerate() {
             let w = span(b.en_win, cfg.en_step);
@@ -1014,7 +1117,7 @@ fn handover_stage(p: &cubie_a7a_dram::Para) {
 #[cfg(not(feature = "wck-alias-probe"))]
 #[inline(never)]
 fn end_of_init(p: &mut Para) -> blobless::EndInitReport {
-    let e = blobless::end_of_init(&mut Bt0Hw, p, PROBE_PSTATE);
+    let e = blobless::end_of_init(&mut Bt0Hw, p, stage_pstate());
     println!(
         "[dram] end of init: {} launches, {} writes, max {} us, {} us, failure {:?}",
         e.launches, e.writes, e.max_launch_us, e.elapsed_us, e.failure
@@ -1107,6 +1210,9 @@ static mut MISSION_OK: bool = false;
 pub fn init_one(para: &[u32; 32]) -> Option<u32> {
     print_ho_knobs();
     let mut p = Para::from_sysconfig(para);
+    if !clock_matches(&p) {
+        crate::halt()
+    }
     let mut rb = [Readback::default(); 2];
     let t0 = soc::ticks();
     let r = blobless::pre_training(&mut Bt0Hw, &mut p, PROBE_PSTATE, &mut rb);
@@ -1357,6 +1463,7 @@ const DCA_CONFIG: cubie_a7a_dram::dca::Config = {
             single_flip: option_env!("A7A_DCA_SINGLE_FLIP").is_some(),
             ..DcaPolicy::DEFAULT
         },
+        timed_waits: option_env!("A7A_DCA_TIMED").is_some(),
         ..Config::DEFAULT
     }
 };
@@ -1453,8 +1560,19 @@ fn acsm_field_probe(v: cubie_a7a_dram::acsm_probe::Variant) {
     }
 }
 
-/// The pstate the hybrid trained and hands over (A7A_OPEN_OPTS bits 3-5;
-/// our WL and read training run at pstate 1 only).
+/// The pstate the hybrid trained and hands over (A7A_OPEN_OPTS bits 3-5);
+/// our WL and read training run there too (they need `A7A_PSTATE` equal to
+/// it: build-time check above).
+#[cfg(feature = "hybrid")]
+/// [`hybrid_pstate`] from the build's `A7A_OPEN_OPTS` (const contexts).
+#[cfg(feature = "hybrid")]
+const fn hybrid_pstate_build() -> u32 {
+    match super::open::opts(cubie_a7a_dram::knobs::BUILD.open_opts).only_pstate {
+        Some(ps) => ps,
+        None => PROBE_PSTATE,
+    }
+}
+
 #[cfg(feature = "hybrid")]
 fn hybrid_pstate() -> u32 {
     match super::open::opts(cubie_a7a_dram::knobs::get().open_opts).only_pstate {
@@ -1485,6 +1603,9 @@ pub fn hybrid_after_pmu(p: &mut Para) -> ! {
         hybrid_pstate()
     );
     print_ho_knobs();
+    if !clock_matches(p) {
+        crate::halt()
+    }
     if let Some(stage) =
         cubie_a7a_dram::knobs::env("A7A_HYBRID_COLD", option_env!("A7A_HYBRID_COLD"))
     {
@@ -1523,7 +1644,7 @@ pub fn hybrid_after_pmu(p: &mut Para) -> ! {
             let _ = super::wrstage::run();
         }
     } else if k.hybrid_skip_wl {
-        let bases = blobless::wl_mr18_bases(p, PROBE_PSTATE);
+        let bases = blobless::wl_mr18_bases(p, stage_pstate());
         if let Some((before, _)) = blobless::RD_FSPWR() {
             let f = blobless::mr16_all(&mut Bt0Hw, before);
             println!(
@@ -1538,8 +1659,11 @@ pub fn hybrid_after_pmu(p: &mut Para) -> ! {
             );
         }
         if applied {
-            let r = blobless::mission_handover(&mut Bt0Hw, p, PROBE_PSTATE);
-            println!("[dram] MISSION: lean hand-over at pstate {PROBE_PSTATE}: {r:?}");
+            let r = blobless::mission_handover(&mut Bt0Hw, p, stage_pstate());
+            println!(
+                "[dram] MISSION: lean hand-over at pstate {}: {r:?}",
+                stage_pstate()
+            );
         }
     } else {
         wck_level(p);

@@ -20,6 +20,7 @@ pub mod para;
 pub mod phy;
 pub mod post;
 pub mod power;
+pub mod pstate;
 pub mod rd;
 pub mod rdtrain;
 pub mod rdvref;

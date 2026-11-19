@@ -81,8 +81,13 @@ const MEM_RESET_L: u32 = 0x20060;
 /// Second row base, used when a launch at row 0 would end on the stop row
 /// ACSMLastAddr already shows, so every launch ends on a new stop row and
 /// ACSMLastAddr can witness a launch that finished before the first poll.
-/// The longest program has 152 rows; rows up to 315 are in use elsewhere.
-const ROW_ALT: u16 = 152;
+/// The longest program has 152 rows (272 at pstate 0); rows up to 315 are
+/// in use elsewhere.
+const ROW_ALT: u16 = if crate::pstate::ACTIVE == 0 {
+    crate::phy::wcklevel::MEASUREMENT_ROWS_PS0 as u16
+} else {
+    152
+};
 /// Time budget of one launch (the 255-loop calibration launches are the
 /// longest). Exceeding it stops the stage.
 pub const LAUNCH_TIMEOUT_US: u64 = 200_000;

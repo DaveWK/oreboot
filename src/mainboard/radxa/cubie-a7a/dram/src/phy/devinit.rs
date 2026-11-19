@@ -95,7 +95,10 @@ const DBYTES: u32 = 4;
 /// and lock parameters: constant in the oracle for every input tried.
 const UI_CAL_WAIT_RUN: u16 = 0x1000;
 const UI_CAL_WAIT: u16 = 0x9c;
-const DLL_GAIN: u16 = 0x7342;
+/// DllGainCtl at pstate 1; the build's pstate takes
+/// [`crate::pstate::ACTIVE_DLL_GAIN`] (0x7353 at pstate 0, REFERENCE-DERIVED).
+pub const DLL_GAIN: u16 = 0x7342;
+const _: () = assert!(crate::pstate::ACTIVE != 1 || crate::pstate::ACTIVE_DLL_GAIN == DLL_GAIN);
 const RX_REPLICA_DLL_GAIN: u16 = 0x73;
 /// PllCtrl3 written between the POR latch pulses.
 const PLL_CTRL3_VALUE: u16 = 0x1f0;
@@ -362,7 +365,7 @@ pub fn pre_release_opts<H: Hw>(hw: &mut H, rep: &mut DevinitReport, keep_dram: b
     // DLL gains and lock parameters.
     p.w(AC_DLL_LOCK_PARAM, 0);
     p.w(DX_DLL_LOCK_PARAM, 0);
-    p.w(DLL_GAIN_CTL, DLL_GAIN);
+    p.w(DLL_GAIN_CTL, crate::pstate::ACTIVE_DLL_GAIN);
     p.w(RX_REPLICA_DLL_GAIN_CTL, RX_REPLICA_DLL_GAIN);
     rep.dll_lock_param = p.r(dx(0, RX_REPLICA_LCDL_PH1UI));
     p.w(RX_REPLICA_DLL_LOCK_PARAM, rep.dll_lock_param);

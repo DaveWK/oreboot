@@ -316,6 +316,38 @@ const SETTLE: [Row; 10] = [
     Row::nop(0x5b00),
     Row::nop(0x4800),
 ];
+/// [`SETTLE`] at pstate 0 (DfiClk 600 MHz, low-speed clock 0x106 / delay
+/// 4): two empty rows fewer. REFERENCE-DERIVED.
+const SETTLE_PS0: [Row; 8] = [
+    Row::nop(0x7b00),
+    Row::EMPTY,
+    Row::nop(0x1b00),
+    Row::nop(0x0400),
+    Row::EMPTY,
+    Row::EMPTY,
+    Row::nop(0x5b00),
+    Row::nop(0x4800),
+];
+/// The settle launch's head at the build's pstate ([`crate::pstate::ACTIVE`]).
+const fn settle_rows() -> &'static [Row] {
+    if crate::pstate::ACTIVE == 0 {
+        &SETTLE_PS0
+    } else {
+        &SETTLE
+    }
+}
+/// The CS initialization launch: three rows holding CS on both ranks and an
+/// empty fourth at pstate 1; four rows at pstate 0. REFERENCE-DERIVED
+/// (at each pstate).
+const CS_INIT: [Row; 4] = [Row::cmd(3, 0), Row::cmd(3, 0), Row::cmd(3, 0), Row::EMPTY];
+const CS_INIT_PS0: [Row; 4] = [Row::cmd(3, 0); 4];
+const fn cs_init_rows() -> &'static [Row; 4] {
+    if crate::pstate::ACTIVE == 0 {
+        &CS_INIT_PS0
+    } else {
+        &CS_INIT
+    }
+}
 
 /// Fixed-capacity row buffer for one launch.
 struct Rows {
@@ -345,8 +377,8 @@ fn ls_on(mask: u16, emit: &mut impl FnMut(Step)) {
     for (csr, v) in [
         (HWT_CONTROL_VAL, 0),
         (HWT_CONTROL_OVR, 0xff),
-        (LOW_SPEED_CLOCK_EN, 0x103),
-        (LOW_SPEED_CLOCK_DELAY, 1),
+        (LOW_SPEED_CLOCK_EN, crate::pstate::ACTIVE_LOW_SPEED.enable),
+        (LOW_SPEED_CLOCK_DELAY, crate::pstate::ACTIVE_LOW_SPEED.delay),
         (HWT_CONTROL_OVR, mask),
         (HWT_CONTROL_VAL, 0),
     ] {
@@ -417,7 +449,7 @@ fn launch_mrws(cs: u8, mrs: &[(u8, u8)], emit: &mut impl FnMut(Step)) {
 pub fn part1(m: &Mrs, emit: &mut impl FnMut(Step)) {
     // CS initialization on both ranks.
     let mut r = Rows::new();
-    r.push(&[Row::cmd(3, 0), Row::cmd(3, 0), Row::cmd(3, 0), Row::EMPTY]);
+    r.push(cs_init_rows());
     emit(Step::Launch {
         start: 0,
         rows: r.rows(),
@@ -425,7 +457,7 @@ pub fn part1(m: &Mrs, emit: &mut impl FnMut(Step)) {
     // Settling delay with the reduced-speed AC clock.
     ls_on(0, emit);
     let mut r = Rows::new();
-    r.push(&SETTLE);
+    r.push(settle_rows());
     r.push(&TAIL);
     emit(Step::Launch {
         start: 0,

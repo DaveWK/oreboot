@@ -399,8 +399,8 @@ pub fn measurement_clocks_start(channel: Channel, out: &mut impl FnMut(Step<'_>)
             (0x20079, 0),
             (0x2007e, 0),
             (0x2007a, 0xff),
-            (0x20042, 0x103),
-            (0x20044, 1),
+            (0x20042, crate::pstate::ACTIVE_LOW_SPEED.enable),
+            (0x20044, crate::pstate::ACTIVE_LOW_SPEED.delay),
             (0x2007a, channel.override_mask()),
             (0x2007e, 0),
         ],
@@ -425,7 +425,7 @@ pub fn measurement_clocks_start(channel: Channel, out: &mut impl FnMut(Step<'_>)
             (0x20044, 2),
             (0x2003e, 0x402),
             (0x2003d, 0x402),
-            (0x20042, 0x183),
+            (0x20042, crate::pstate::ACTIVE_LOW_SPEED.enable_full),
         ],
         out,
     );
@@ -459,20 +459,35 @@ pub fn first_measurement(channel: Channel, rank: Rank, out: &mut impl FnMut(Step
 pub fn measurement_once(rank: Rank, out: &mut impl FnMut(Step<'_>)) {
     clear_counts(out);
     writes(&[(0x20079, 1), (0x20079, 0)], out);
-    out(Step::Launch {
-        rows: &measurement_program(rank),
-        outer: 0,
-    });
+    launch_measurement(rank, out);
 }
 
 /// [`measurement_once`] without the count clear: two consecutive launches
 /// then show whether DTSM counts accumulate (a counting/clear control).
 pub fn measurement_once_no_clear(rank: Rank, out: &mut impl FnMut(Step<'_>)) {
     writes(&[(0x20079, 1), (0x20079, 0)], out);
-    out(Step::Launch {
-        rows: &measurement_program(rank),
-        outer: 0,
-    });
+    launch_measurement(rank, out);
+}
+
+/// One launch of the measurement program of the build's pstate
+/// ([`crate::pstate::ACTIVE`]): [`measurement_program`] at pstate 1,
+/// [`measurement_program_ps0`] at pstate 0.
+fn launch_measurement(rank: Rank, out: &mut impl FnMut(Step<'_>)) {
+    const PS0: [[Row; MEASUREMENT_ROWS_PS0]; 2] = [
+        measurement_program_ps0(Rank::R0),
+        measurement_program_ps0(Rank::R1),
+    ];
+    if crate::pstate::ACTIVE == 0 {
+        out(Step::Launch {
+            rows: &PS0[matches!(rank, Rank::R1) as usize],
+            outer: 0,
+        });
+    } else {
+        out(Step::Launch {
+            rows: &measurement_program(rank),
+            outer: 0,
+        });
+    }
 }
 
 /// DtsmLaneCtrl0_iX of DBYTE `db`, lane `lane` (EIC7700X TRM Part 2,
@@ -524,8 +539,8 @@ pub fn measurement_clocks_stop(channel: Channel, out: &mut impl FnMut(Step<'_>))
     };
     writes(
         &[
-            (0x20044, 1),
-            (0x20042, 0x103),
+            (0x20044, crate::pstate::ACTIVE_LOW_SPEED.delay),
+            (0x20042, crate::pstate::ACTIVE_LOW_SPEED.enable),
             (0x2007e, 0),
             (0x2007a, all_but_active),
             (0x20042, 0),
@@ -728,18 +743,19 @@ pub const fn calibration_program(rank: Rank) -> [Row; 26] {
     rows
 }
 
-/// Hold a command edge for three observed pairs of ACSM rows. Every pair
-/// repeats CA/CS and alternates control bit 10. Chip selects and rank control
-/// use the existing original cold-init encoder.
-const fn held_edge(rows: &mut [Row; 152], start: usize, rank: Rank, ca: u8, cs: bool) {
+/// Hold a command edge for `n` ACSM rows (six at pstate 1, twelve at
+/// pstate 0: the slow CK stays 40 ns while the row rate doubles). Every row
+/// repeats CA/CS; control bit 10 is set on the even rows. Chip selects and
+/// rank control use the existing original cold-init encoder.
+const fn held_edge(rows: &mut [Row], start: usize, n: usize, rank: Rank, ca: u8, cs: bool) {
     let edge = Row::cmd(if cs { rank.cs() } else { 0 }, ca);
     let mut i = 0;
-    while i < 6 {
+    while i < n {
         rows[start + i] = Row::raw(
             edge.0[0],
             0,
             0,
-            edge.0[3] | if i % 2 == 0 { 0x0400 } else { 0 },
+            edge.0[3] | if (start + i) % 2 == 0 { 0x0400 } else { 0 },
         );
         i += 1;
     }
@@ -758,10 +774,10 @@ pub const fn measurement_program(rank: Rank) -> [Row; 152] {
         rows[i] = Row::nop(0x0400);
         i += 2;
     }
-    held_edge(&mut rows, 12, rank, 0x58, true);
-    held_edge(&mut rows, 18, rank, 18, true);
-    held_edge(&mut rows, 24, rank, 0x48, true);
-    held_edge(&mut rows, 30, rank, 0x48, false);
+    held_edge(&mut rows, 12, 6, rank, 0x58, true);
+    held_edge(&mut rows, 18, 6, rank, 18, true);
+    held_edge(&mut rows, 24, 6, rank, 0x48, true);
+    held_edge(&mut rows, 30, 6, rank, 0x48, false);
     rows[36] = Row::nop(0x0400);
     rows[38] = Row::nop(0x5f00);
     rows[39] = Row::nop(0x0c00);
@@ -792,9 +808,9 @@ pub const fn measurement_program(rank: Rank) -> [Row; 152] {
         rows[i] = Row::nop(0x0400);
         i += 2;
     }
-    held_edge(&mut rows, 124, rank, 0x58, true);
-    held_edge(&mut rows, 130, rank, 18, true);
-    held_edge(&mut rows, 136, rank, 0x48, true);
+    held_edge(&mut rows, 124, 6, rank, 0x58, true);
+    held_edge(&mut rows, 130, 6, rank, 18, true);
+    held_edge(&mut rows, 136, 6, rank, 0x48, true);
     i = 142;
     while i <= 148 {
         rows[i] = Row::nop(0x0400);
@@ -803,6 +819,122 @@ pub const fn measurement_program(rank: Rank) -> [Row; 152] {
     rows[150] = Row::nop(0x5f00);
     rows[151] = Row::nop(0x0c00);
     rows
+}
+
+/// Rows of [`measurement_program_ps0`].
+pub const MEASUREMENT_ROWS_PS0: usize = 272;
+
+/// [`measurement_program`] at pstate 0 (DfiClk 600 MHz). REFERENCE-DERIVED (every
+/// block's measurement launch), and
+/// its rules agree with the pstate-1 program:
+/// - the time waits keep their duration with the MEASURED ACSM unit
+///   ((N + 1) x 4 DfiClk; `pstate::acsm_scale`): 0x5f00/0x0c00 (29) becomes
+///   0x3f00/0x1c00 (59), 0x5e00/0x0000 (5) becomes 0x3e00/0x0400 (11);
+/// - the waits in clocks stay (0x4f00/0x1400, 0x4f00/0x0800, 0x1e80, 0x0500);
+/// - the held MR18 edges take twelve rows instead of six (the low-speed
+///   AC clock 0x186 keeps the slow CK at 40 ns), the idle rows double
+///   (ten before the edges, twelve before the second set, eight after it);
+/// - the eight WCK pattern periods take twelve rows each (six 0x2000, six
+///   0x1000) instead of six.
+pub const fn measurement_program_ps0(rank: Rank) -> [Row; MEASUREMENT_ROWS_PS0] {
+    let mut rows = [Row::EMPTY; MEASUREMENT_ROWS_PS0];
+    let r = rank.control();
+    rows[0] = Row::nop(0x3f00);
+    rows[1] = Row::nop(0x1c00);
+    let mut i = 2;
+    while i <= 20 {
+        rows[i] = Row::nop(0x0400);
+        i += 2;
+    }
+    held_edge(&mut rows, 21, 12, rank, 0x58, true);
+    held_edge(&mut rows, 33, 12, rank, 18, true);
+    held_edge(&mut rows, 45, 12, rank, 0x48, true);
+    held_edge(&mut rows, 57, 12, rank, 0x48, false);
+    rows[70] = Row::nop(0x0400);
+    rows[72] = Row::nop(0x0400);
+    rows[74] = Row::nop(0x3f00);
+    rows[75] = Row::nop(0x1c00);
+    rows[76] = Row::nop(0x3e00);
+    rows[77] = Row::nop(0x0400);
+    rows[78] = Row::nop(0x0500);
+    // Eight periods, twelve rows each: six with hw1=0x2000, six=0x1000.
+    i = 0;
+    while i < 96 {
+        let data = if i % 12 < 6 { 0x2000 } else { 0x1000 };
+        rows[80 + i] = Row::raw(0, data, 0, r | if i % 2 == 0 { 0x0400 } else { 0 });
+        i += 1;
+    }
+    rows[176] = Row::nop(0x0400);
+    rows[178] = Row::nop(0x4f00);
+    rows[179] = Row::nop(0x1400);
+    rows[180] = Row::raw(0x81, 3, 0, 0x0400);
+    rows[182] = Row::nop(0x4f00);
+    rows[183] = Row::nop(0x0800);
+    rows[184] = Row::raw(0, 3, 0, 0x0400);
+    rows[186] = Row::nop(0x4f00);
+    rows[187] = Row::nop(0x0800);
+    rows[188] = Row::nop(0x1e80);
+    rows[190] = Row::nop(0x0500);
+    rows[192] = Row::nop(0x3f00);
+    rows[193] = Row::nop(0x1c00);
+    i = 194;
+    while i <= 216 {
+        rows[i] = Row::nop(0x0400);
+        i += 2;
+    }
+    held_edge(&mut rows, 217, 12, rank, 0x58, true);
+    held_edge(&mut rows, 229, 12, rank, 18, true);
+    held_edge(&mut rows, 241, 12, rank, 0x48, true);
+    i = 254;
+    while i <= 268 {
+        rows[i] = Row::nop(0x0400);
+        i += 2;
+    }
+    rows[270] = Row::nop(0x3f00);
+    rows[271] = Row::nop(0x1c00);
+    rows
+}
+
+#[cfg(test)]
+mod ps0_program_tests {
+    use super::*;
+    use crate::phy::acsm_row;
+    use crate::pstate::{acsm_scale, acsm_wait_ps};
+
+    /// The REPEATCNT of the F10 pair at rows (`even`, `even + 1`).
+    fn count(rows: &[Row], even: usize) -> u32 {
+        acsm_row::repeat_count(rows[even], rows[even + 1]) as u32
+    }
+
+    #[test]
+    fn time_waits_keep_their_duration_and_clock_waits_their_count() {
+        for rank in [Rank::R0, Rank::R1] {
+            let p1 = measurement_program(rank);
+            let p0 = measurement_program_ps0(rank);
+            // Time waits: pstate 1 rows 0, 38, 108, 150; pstate 0 rows 0,
+            // 74, 192, 270 (head, before the pattern, after it, tail).
+            for (a, b) in [(0, 0), (38, 74), (108, 192), (150, 270)] {
+                let (n1, n0) = (count(&p1, a), count(&p0, b));
+                assert_eq!(n0, acsm_scale(n1, 300, 600), "rows {a}/{b}");
+                assert_eq!(acsm_wait_ps(n1, 300), acsm_wait_ps(n0, 600));
+            }
+            assert_eq!(count(&p1, 40), 5);
+            assert_eq!(count(&p0, 76), acsm_scale(5, 300, 600));
+            // Clock waits keep their count.
+            for (a, b) in [(94, 178), (98, 182), (102, 186)] {
+                assert_eq!(count(&p1, a), count(&p0, b), "rows {a}/{b}");
+            }
+            // Twice the pattern rows, the same pattern.
+            let pat = |p: &[Row], from: usize, n: usize| {
+                p[from..from + n]
+                    .iter()
+                    .filter(|x| x.0[1] == 0x2000)
+                    .count()
+            };
+            assert_eq!(pat(&p1, 44, 48), 24);
+            assert_eq!(pat(&p0, 80, 96), 48);
+        }
+    }
 }
 
 #[cfg(test)]

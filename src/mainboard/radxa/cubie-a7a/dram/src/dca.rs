@@ -403,17 +403,47 @@ pub const fn dcm_waits(pstate: u32) -> &'static [u16] {
 /// Rows of [`dcm_program`] at most.
 pub const DCM_ROWS_MAX: usize = 32;
 
+/// Pairs of a timed DCM wait at most (tDCMM at 600 MHz takes two).
+pub const DCM_TIMED_PAIRS: usize = 3;
+
+/// Wait rows of tDCMM at `dfi_mhz` that the ACSM does time: F10 pairs
+/// (`0x?f00` even, the count's high bits odd) in the MEASURED unit,
+/// (REPEATCNT + 1) x 4 DfiClk per pair (measured: T21 is this row
+/// form). The reference's [`dcm_waits`] rows carry no F10 and, by the same
+/// measurement, run once whatever their count; this is the alternative
+/// (FEL lab `A7A_DCA_TIMED`). Returns the control words and how many.
+pub const fn dcm_waits_timed(dfi_mhz: u32) -> ([u16; 2 * DCM_TIMED_PAIRS], usize) {
+    use crate::phy::acsm_row::hw3;
+    let mut out = [0u16; 2 * DCM_TIMED_PAIRS];
+    let t = jedec_lpddr::lp5::timing::T_DCMM_PS as u64;
+    let Some((counts, n)) = crate::pstate::acsm_split::<DCM_TIMED_PAIRS>(t, dfi_mhz) else {
+        panic!("tDCMM needs more pairs");
+    };
+    let mut k = 0;
+    while k < n {
+        let c = counts[k] as u16;
+        out[2 * k] = (c & 7) << hw3::CNT_LO_SHIFT | hw3::F11 | hw3::F10 | hw3::F9 | hw3::F8;
+        out[2 * k + 1] = (c >> 3) << hw3::CNT_HI_SHIFT;
+        k += 1;
+    }
+    (out, 2 * n)
+}
+
 /// The DCM program: CAS (WS_FS, starts WCK), MR26 start with flip, wait,
 /// MR26 start, wait, MR26 stop, CAS (WS_WR/RD/FS), closing rows; 28 rows
 /// at pstate 1, 32 at pstate 0, 24 at pstates 2 and 3. Returns the rows
 /// and how many are used.
 pub const fn dcm_program(rank: Rank, pstate: u32) -> ([Row; DCM_ROWS_MAX], usize) {
+    dcm_program_with(rank, dcm_waits(pstate))
+}
+
+/// [`dcm_program`] with the wait rows `waits` after each MR26 start.
+pub const fn dcm_program_with(rank: Rank, waits: &[u16]) -> ([Row; DCM_ROWS_MAX], usize) {
     let mut rows = [Row::EMPTY; DCM_ROWS_MAX];
     let c = rank.control();
     rows[0] = Row::raw(cs_bits(rank) | CA_CAS_FS, 0xd000, 0x0001, c);
     rows[2] = Row::nop(0x4b00);
     let mut n = 4;
-    let waits = dcm_waits(pstate);
     let ops = [MR26_START_FLIP, MR26_START];
     let mut k = 0;
     while k < 2 {
@@ -507,6 +537,9 @@ pub struct Config {
     pub policy: DcaPolicy,
     /// MR5 the MRR path must return before any MR30/MR26 write (CXMT 0x13).
     pub mr5_want: u8,
+    /// The DCM waits as timed F10 pairs from tDCMM ([`dcm_waits_timed`])
+    /// instead of the reference's rows (FEL lab `A7A_DCA_TIMED`).
+    pub timed_waits: bool,
 }
 
 impl Config {
@@ -519,7 +552,19 @@ impl Config {
         iterations: 1,
         policy: DcaPolicy::DEFAULT,
         mr5_want: 0x13,
+        timed_waits: false,
     };
+
+    /// The DCM program of this configuration for `rank`.
+    pub const fn dcm(&self, rank: Rank) -> ([Row; DCM_ROWS_MAX], usize) {
+        if self.timed_waits {
+            let (w, n) = dcm_waits_timed(crate::pstate::Point::board(self.pstate).dfi_mhz);
+            let (rows, k) = dcm_program_with(rank, w.split_at(n).0);
+            (rows, k)
+        } else {
+            dcm_program(rank, self.pstate)
+        }
+    }
 }
 
 /// One MRR through the ACSM and the RX FIFO, both DBYTEs of the channel:
@@ -788,7 +833,7 @@ fn body<H: Hw>(ex: &mut WlExec<'_, H>, out: &mut DcaBlock, dbs: [u32; 2], cfg: &
     match cfg.mode {
         Mode::Mrr => {}
         Mode::Dcm => {
-            let (rows, n) = dcm_program(rank, cfg.pstate);
+            let (rows, n) = cfg.dcm(rank);
             launch(ex, &rows[..n]);
             out.dcm_once = mrr(ex, dbs, rank, 26, cfg.vis).get(mdb);
         }
@@ -824,7 +869,7 @@ fn sweep<H: Hw>(
     found: u8,
 ) {
     let rank = out.rank;
-    let (rows, n) = dcm_program(rank, cfg.pstate);
+    let (rows, n) = cfg.dcm(rank);
     for _ in 0..cfg.iterations.max(1) {
         for i in 0..STEPS {
             if ex.failure.is_some() {
@@ -1505,5 +1550,57 @@ mod sim {
         assert_eq!(a0.decision[0].unwrap().step, Err(NoDecision::Flat));
         assert_eq!(a0.decision[1].unwrap().step, Ok(0));
         assert_eq!(a0.mr30_final, Some(0x00));
+    }
+}
+
+#[cfg(test)]
+mod timed_tests {
+    use super::*;
+    use crate::phy::acsm_row::{self, hw3};
+    use crate::pstate::{acsm_wait_ps, Point};
+
+    #[test]
+    fn timed_dcm_waits_cover_tdcmm_at_every_pstate() {
+        let t = jedec_lpddr::lp5::timing::T_DCMM_PS as u64;
+        for ps in 0..4 {
+            let mhz = Point::board(ps).dfi_mhz;
+            let (w, n) = dcm_waits_timed(mhz);
+            // DfiClk of the whole wait: (count + 1) x 4 per pair.
+            let mut clocks = 0u64;
+            for p in w[..n].chunks(2) {
+                assert!(p[0] & hw3::F10 != 0, "F10 on the even row");
+                let c = acsm_row::repeat_count(Row::nop(p[0]), Row::nop(p[1])) as u64;
+                clocks += (c + 1) * crate::pstate::ACSM_DFICLK_PER_COUNT;
+            }
+            let total = clocks * 1_000_000 / mhz as u64;
+            assert!(clocks * 1_000_000 >= t * mhz as u64, "pstate {ps}: {total}");
+            // Not more than one step over.
+            assert!(total < t + acsm_wait_ps(0, mhz), "pstate {ps}: {total}");
+            let cfg = Config {
+                timed_waits: true,
+                pstate: ps,
+                ..Config::DEFAULT
+            };
+            let (rows, k) = cfg.dcm(Rank::R0);
+            assert_eq!(k, 20 + 2 * n);
+            assert!(k <= DCM_ROWS_MAX);
+            // The commands are those of the reference program.
+            let (r1, _) = dcm_program(Rank::R0, 1);
+            assert_eq!(rows[0], r1[0]);
+            assert_eq!(rows[4], r1[4]);
+        }
+        assert_eq!(dcm_waits_timed(600).1, 4);
+        assert_eq!(dcm_waits_timed(300).1, 2);
+        // The default stays the reference's program.
+        for ps in 0..4 {
+            assert_eq!(
+                Config {
+                    pstate: ps,
+                    ..Config::DEFAULT
+                }
+                .dcm(Rank::R1),
+                dcm_program(Rank::R1, ps)
+            );
+        }
     }
 }
