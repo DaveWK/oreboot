@@ -28,6 +28,7 @@ pub mod prefix;
 pub mod prog;
 pub mod rxen;
 pub mod sequence;
+pub mod vrefinit;
 pub mod wckalias;
 pub mod wcklevel;
 #[rustfmt::skip]
