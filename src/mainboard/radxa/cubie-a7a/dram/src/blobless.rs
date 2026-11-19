@@ -1061,6 +1061,22 @@ pub fn mission_handover_relock<H: Hw>(
     const T: u64 = 100_000;
     let channels = p.channels();
     csr_access(hw, true);
+    // FEL lab: whole-cycle corrections of the trained delays, before the
+    // mission CSRs and the DFI init (delay CSR writes after the DFI init do
+    // not take effect: measured). TxWckDlyTg0/1 0x1n02a/0x1n02b and
+    // RxEnDlyTg0/1 0x1n020/0x1n021 of every DBYTE.
+    for (add, base) in [(HO_TXWCK_ADD, 0x1002a), (HO_RXEN_ADD, 0x10020)] {
+        if add == 0 {
+            continue;
+        }
+        for db in 0..4u32 {
+            for tg in 0..2u32 {
+                let c = csr(base + 0x1000 * db + tg);
+                let v = hw.read16(c);
+                hw.write16(c, v.wrapping_add(add));
+            }
+        }
+    }
     for (c, v) in [(0x2006e, 0u16), (0x20060, 1), (0x20054, 1), (0x2002a, 0)] {
         hw.write16(csr(c), v);
     }
@@ -1139,6 +1155,35 @@ pub const HO_RDDATA_EN: Option<u32> = match option_env!("A7A_HO_RDDATA_EN") {
     },
     None => None,
 };
+
+/// FEL lab `A7A_HO_TXWCK_ADD=<hex>` and `A7A_HO_RXEN_ADD=<hex>`: added to
+/// every DBYTE's TxWckDlyTg0/1 and RxEnDlyTg0/1 by the lean hand-over before
+/// anything else. Blobless WL lands exactly one WCK cycle (0x80) before the
+/// PMU's TxWckDly; the read training (WCK always on) follows with RxEnDly
+/// about 0x75 earlier. Unset: 0.
+pub const HO_TXWCK_ADD: u16 = hex_knob(option_env!("A7A_HO_TXWCK_ADD"));
+pub const HO_RXEN_ADD: u16 = hex_knob(option_env!("A7A_HO_RXEN_ADD"));
+
+const fn hex_knob(s: Option<&str>) -> u16 {
+    let Some(s) = s else {
+        return 0;
+    };
+    let b = s.as_bytes();
+    let mut v: u32 = 0;
+    let mut i = 0;
+    if b.is_empty() || b.len() > 3 {
+        panic!("A7A_HO_*_ADD is up to three hex digits");
+    }
+    while i < b.len() {
+        v = v * 16
+            + match hex_nib(b[i]) {
+                Some(d) => d as u32,
+                None => panic!("A7A_HO_*_ADD is up to three hex digits"),
+            };
+        i += 1;
+    }
+    v as u16
+}
 
 /// FEL lab `A7A_HO_MR2=<hex>`: after the lean hand-over, MR2 of every
 /// channel and rank's operating set through the controller (MR16 0x05,

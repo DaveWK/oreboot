@@ -1026,11 +1026,17 @@ fn end_of_init(p: &mut Para) -> blobless::EndInitReport {
 /// FEL lab: print the hand-over knobs (`blobless::HO_RDDATA_EN`,
 /// `blobless::HO_MR2`) when set.
 fn print_ho_knobs() {
-    if blobless::HO_RDDATA_EN.is_some() || blobless::HO_MR2.is_some() {
+    if blobless::HO_RDDATA_EN.is_some()
+        || blobless::HO_MR2.is_some()
+        || blobless::HO_TXWCK_ADD != 0
+        || blobless::HO_RXEN_ADD != 0
+    {
         println!(
-            "[dram] HO knobs: dfi_t_rddata_en {:x?}, MR2 after the hand-over {:x?}",
+            "[dram] HO knobs: dfi_t_rddata_en {:x?}, MR2 after the hand-over {:x?}, TxWckDly +{:x}, RxEnDly +{:x}",
             blobless::HO_RDDATA_EN,
-            blobless::HO_MR2
+            blobless::HO_MR2,
+            blobless::HO_TXWCK_ADD,
+            blobless::HO_RXEN_ADD
         );
     }
 }
