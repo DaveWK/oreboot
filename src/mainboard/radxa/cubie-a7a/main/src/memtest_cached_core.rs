@@ -112,12 +112,155 @@ pub const fn rank_bit_from_addrmap1(addrmap1: u32, shift: u32) -> Option<u32> {
     }
 }
 
-/// Filter a decoded rank bit against the usable DRAM size so an out-of-range
-/// register read cannot select an unreachable rank.
-pub const fn effective_rank_bit(rank_bit: Option<u32>, dram_size: u64) -> Option<u32> {
-    match rank_bit {
-        Some(b) if b < 63 && (1u64 << b) < dram_size => Some(b),
-        _ => None,
+/// Validated live rank-map decode from channel-0 `ADDRMAP1` + usable `dram_size`
+/// (`cubie-a7a-dram/src/ctrl.rs` `RankMap`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LiveRankMap {
+    /// Supported dual-rank CXMT map: 4 GB (rank bit 31) or 6 GB (rank bit 30).
+    DualRank { rank_bit: u32 },
+    /// Single-rank map (`ADDRMAP1` chip-select field `0x3f`, e.g. HYNIX 4 GB).
+    SingleRank,
+}
+
+impl LiveRankMap {
+    pub const fn rank_bit(self) -> Option<u32> {
+        match self {
+            Self::DualRank { rank_bit } => Some(rank_bit),
+            Self::SingleRank => None,
+        }
+    }
+}
+
+/// Validate the live channel-0 `ADDRMAP1` readback against `dram_size` and the
+/// supported A7A board maps (`cubie-a7a-dram/src/ctrl.rs` `RankMap`).
+/// Unreadable or unsupported decodes fail explicitly instead of silently
+/// dropping dual-rank legs.
+pub fn validate_live_rank_map(addrmap1: u32, dram_size: u64) -> Result<LiveRankMap, &'static str> {
+    const GIB: u64 = 1u64 << 30;
+    if addrmap1 == 0 || addrmap1 == u32::MAX {
+        return Err("unreadable ADDRMAP1 register value");
+    }
+    match rank_bit_from_addrmap1(addrmap1, DUAL_CH_SHIFT) {
+        None => Ok(LiveRankMap::SingleRank),
+        Some(31) if dram_size == 4 * GIB => Ok(LiveRankMap::DualRank { rank_bit: 31 }),
+        Some(30) if dram_size == 6 * GIB => Ok(LiveRankMap::DualRank { rank_bit: 30 }),
+        Some(_) => Err("unsupported dual-rank ADDRMAP1 / DRAM size geometry"),
+    }
+}
+
+/// Check that `plan` includes testable words in both rank 0 and rank 1 (and at
+/// least one word above 4 GiB) under `rank_bit`.
+pub fn plan_covers_both_ranks_and_above_4g(plan: &Plan, dram_base: u64, rank_bit: u32) -> bool {
+    if rank_bit >= 63 {
+        return false;
+    }
+    let stride = 1u64 << rank_bit;
+    let mut saw_r0 = false;
+    let mut saw_r1 = false;
+    let mut saw_hi = false;
+    for r in plan.ranges() {
+        if r.bytes() == 0 {
+            continue;
+        }
+        let mut a = r.start;
+        while a < r.end {
+            let rk = rank_of_addr(a, dram_base, Some(rank_bit));
+            if rk == 0 {
+                saw_r0 = true;
+            } else {
+                saw_r1 = true;
+            }
+            if a >= ABOVE_4G {
+                saw_hi = true;
+            }
+            // Jump to the next rank boundary or above-4-GiB boundary inside `r`.
+            let off = a - dram_base;
+            let next_rank = dram_base + ((off / stride) + 1) * stride;
+            let next = if a < ABOVE_4G && ABOVE_4G < next_rank {
+                ABOVE_4G
+            } else {
+                next_rank
+            };
+            a = next.min(r.end);
+        }
+    }
+    saw_r0 && saw_r1 && saw_hi
+}
+
+/// Three-state verdict of a `memtest-cached` run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Verdict {
+    /// Zero errors and full dual-rank + above-4-GiB coverage (all passes + all
+    /// three 16 MiB copy legs with non-zero bytes).
+    Pass,
+    /// Zero errors on a single-rank geometry (dual-rank copy legs unavailable);
+    /// never reported as `PASS`.
+    Limited,
+    /// Any DRAM error, unusable/unsupported rank map, or missing required leg.
+    Fail,
+}
+
+impl Verdict {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pass => "PASS",
+            Self::Limited => "LIMITED",
+            Self::Fail => "FAIL",
+        }
+    }
+}
+
+/// Coverage facts collected across a `memtest-cached` run.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RunCoverage {
+    pub stress_ran_both_ranks: bool,
+    pub march_ran_both_ranks: bool,
+    pub bit37_ran_both_ranks: bool,
+    pub copy_r0_to_r1_bytes: u64,
+    pub copy_r1_to_r0_bytes: u64,
+    pub copy_r1_above4g_bytes: u64,
+}
+
+/// Evaluate the run verdict from the live rank map, error total and per-phase
+/// / per-leg coverage.
+pub fn evaluate_verdict(
+    rank_map: Result<LiveRankMap, &'static str>,
+    total_errors: u64,
+    cov: &RunCoverage,
+) -> (Verdict, &'static str) {
+    let Ok(map) = rank_map else {
+        return (Verdict::Fail, "invalid or unsupported rank map");
+    };
+    if total_errors > 0 {
+        return (Verdict::Fail, "DRAM errors detected");
+    }
+    match map {
+        LiveRankMap::SingleRank => (
+            Verdict::Limited,
+            "single-rank geometry; dual-rank copy legs unavailable",
+        ),
+        LiveRankMap::DualRank { .. } => {
+            if !cov.stress_ran_both_ranks || !cov.march_ran_both_ranks || !cov.bit37_ran_both_ranks
+            {
+                return (
+                    Verdict::Fail,
+                    "plan did not cover both ranks and above 4 GiB",
+                );
+            }
+            if cov.copy_r0_to_r1_bytes == 0
+                || cov.copy_r1_to_r0_bytes == 0
+                || cov.copy_r1_above4g_bytes == 0
+            {
+                return (
+                    Verdict::Fail,
+                    "missing required dual-rank or above-4-GiB copy leg",
+                );
+            }
+            (
+                Verdict::Pass,
+                "full dual-rank and above-4-GiB coverage clean",
+            )
+        }
     }
 }
 
@@ -1141,7 +1284,10 @@ mod tests {
         // 0x17 -> rank bit 31 (cubie-a7a-dram/src/ctrl.rs:440, 450-462).
         let rank_bit_4g = rank_bit_from_addrmap1(0x3f17, DUAL_CH_SHIFT);
         assert_eq!(rank_bit_4g, Some(31));
-        assert_eq!(effective_rank_bit(rank_bit_4g, 4 * GIB), Some(31));
+        assert_eq!(
+            validate_live_rank_map(0x3f17, 4 * GIB),
+            Ok(LiveRankMap::DualRank { rank_bit: 31 })
+        );
 
         // Unaligned payload/DTB sizes test outward 64-byte cache-line rounding.
         let payload_size = 4 * MIB - 13;
@@ -1411,10 +1557,102 @@ mod tests {
             assert!(r.end <= 0x4100_0000 || r.start >= 0x4100_1040);
         }
 
-        // Out-of-range rank bit is filtered to single-rank.
-        assert_eq!(effective_rank_bit(Some(32), 4 * GIB), None);
-        assert_eq!(effective_rank_bit(Some(63), 4 * GIB), None);
-        assert_eq!(effective_rank_bit(None, 4 * GIB), None);
+        // Unreadable or out-of-range rank decodes fail validation explicitly.
+        assert!(validate_live_rank_map(0, 4 * GIB).is_err());
+        assert!(validate_live_rank_map(u32::MAX, 4 * GIB).is_err());
+        assert!(validate_live_rank_map(0x3f18, 4 * GIB).is_err());
+    }
+
+    #[test]
+    fn verdict_requires_valid_map_and_all_three_copy_legs() {
+        let full_cov = RunCoverage {
+            stress_ran_both_ranks: true,
+            march_ran_both_ranks: true,
+            bit37_ran_both_ranks: true,
+            copy_r0_to_r1_bytes: 64 * MIB,
+            copy_r1_to_r0_bytes: 64 * MIB,
+            copy_r1_above4g_bytes: 64 * MIB,
+        };
+
+        // 1. Decode failure -> FAIL, never PASS.
+        for (am1, size) in [
+            (0u32, 4 * GIB),
+            (u32::MAX, 4 * GIB),
+            (0x3f16, 4 * GIB), // 6 GB rank bit on 4 GB size
+            (0x3f17, 6 * GIB), // 4 GB rank bit on 6 GB size
+            (0x3f18, 4 * GIB), // bit 32 out of range for 4 GB
+        ] {
+            let map = validate_live_rank_map(am1, size);
+            assert!(map.is_err(), "expected Err for am1={am1:#x} size={size:#x}");
+            let (v, _) = evaluate_verdict(map, 0, &full_cov);
+            assert_eq!(v, Verdict::Fail);
+            assert_eq!(v.as_str(), "FAIL");
+        }
+
+        // 2. Missing or empty above-4-GiB (or cross-rank) leg -> FAIL.
+        let map_4g = validate_live_rank_map(0x3f17, 4 * GIB);
+        let no_hi = RunCoverage {
+            copy_r1_above4g_bytes: 0,
+            ..full_cov
+        };
+        assert_eq!(evaluate_verdict(map_4g, 0, &no_hi).0, Verdict::Fail);
+        let no_r01 = RunCoverage {
+            copy_r0_to_r1_bytes: 0,
+            ..full_cov
+        };
+        assert_eq!(evaluate_verdict(map_4g, 0, &no_r01).0, Verdict::Fail);
+        let no_r10 = RunCoverage {
+            copy_r1_to_r0_bytes: 0,
+            ..full_cov
+        };
+        assert_eq!(evaluate_verdict(map_4g, 0, &no_r10).0, Verdict::Fail);
+        let no_both = RunCoverage {
+            march_ran_both_ranks: false,
+            ..full_cov
+        };
+        assert_eq!(evaluate_verdict(map_4g, 0, &no_both).0, Verdict::Fail);
+
+        // 3. Single-rank map -> LIMITED (never PASS); errors still FAIL.
+        let map_1r = validate_live_rank_map(0x3f3f, 4 * GIB);
+        assert_eq!(map_1r, Ok(LiveRankMap::SingleRank));
+        let empty_copy = RunCoverage::default();
+        let (v_1r, _) = evaluate_verdict(map_1r, 0, &empty_copy);
+        assert_eq!(v_1r, Verdict::Limited);
+        assert_eq!(v_1r.as_str(), "LIMITED");
+        assert_eq!(evaluate_verdict(map_1r, 1, &empty_copy).0, Verdict::Fail);
+
+        // 4. Full 4 GB and 6 GB CXMT plans give PASS when error-free.
+        for (am1, size, expected_bit) in [(0x3f17u32, 4 * GIB, 31u32), (0x3f16u32, 6 * GIB, 30u32)]
+        {
+            let map = validate_live_rank_map(am1, size).unwrap();
+            assert_eq!(
+                map,
+                LiveRankMap::DualRank {
+                    rank_bit: expected_bit
+                }
+            );
+            assert_eq!(map.rank_bit(), Some(expected_bit));
+            let h = sample_handoff(size, 4 * MIB, None);
+            let plan = cached_plan_from_handoff(&h).unwrap();
+            assert!(plan_covers_both_ranks_and_above_4g(
+                &plan,
+                h.dram_base,
+                expected_bit
+            ));
+            let cp = build_copy_plan(&plan, h.dram_base, map.rank_bit(), COPY_BLOCK_BYTES);
+            let cov = RunCoverage {
+                stress_ran_both_ranks: true,
+                march_ran_both_ranks: true,
+                bit37_ran_both_ranks: true,
+                copy_r0_to_r1_bytes: cp.r0_to_r1.pairs().iter().map(|p| p.len).sum(),
+                copy_r1_to_r0_bytes: cp.r1_to_r0.pairs().iter().map(|p| p.len).sum(),
+                copy_r1_above4g_bytes: cp.r1_above4g.pairs().iter().map(|p| p.len).sum(),
+            };
+            let (v, _) = evaluate_verdict(Ok(map), 0, &cov);
+            assert_eq!(v, Verdict::Pass);
+            assert_eq!(v.as_str(), "PASS");
+            assert_eq!(evaluate_verdict(Ok(map), 1, &cov).0, Verdict::Fail);
+        }
     }
 
     #[test]
