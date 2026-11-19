@@ -1,0 +1,294 @@
+// SPDX-License-Identifier: GPL-2.0-only
+//! FEL lab, measurement only: our write DQ centring and write Vref
+//! (`cubie_a7a_dram::wrtrain`) on the mission state, after the lean
+//! hand-over. Env `A7A_WR_STAGE` (hex) at build time; unset: nothing runs.
+//!
+//! | bit | effect |
+//! |---|---|
+//! | 0x1 | discovery, then write DQ centring of every reachable timing group |
+//! | 0x2 | after discovery, every TxDqDly to the reset value 0x20 (the untrained blobless state) before the centring |
+//! | 0x4 | write Vref sweep (MR14/MR15, operating set-point) after the centring |
+//! | 0x8 | measurement only: the delays and Vref codes found before go back at the end |
+//!
+//! The compare is through the controller: the CPU writes and reads back
+//! [`PROBE`] blocks. The verdict is the host's check afterwards (MRR,
+//! then 3 x 16 MiB memtest), plus the printed delays against the ones found
+//! before (the PMU's in the hybrid).
+
+use cubie_a7a_dram::phy::{csr, csr_access};
+use cubie_a7a_dram::wrtrain::{
+    self, Delays, Folds, LaneFit, MrPort, WritePort, BLOCKS, DBYTES, DMI_LANE, LANES,
+};
+use cubie_a7a_dram::{Error, RegIo};
+
+use super::bt0hw::Bt0Hw;
+
+const BITS: u32 = match option_env!("A7A_WR_STAGE") {
+    Some(s) => match u32::from_str_radix(s, 16) {
+        Ok(v) if v < 0x10 => v,
+        _ => panic!("A7A_WR_STAGE is a hex mask below 0x10"),
+    },
+    None => 0,
+};
+
+/// Probe blocks: 128 bytes each, at power-of-two offsets (so that any
+/// channel interleave from 128 B to 8 KiB puts blocks on both channels),
+/// at the bottom and the top of the 32-bit DRAM window (rank 1, if it is
+/// mapped inside the window at all).
+const PROBE: [usize; BLOCKS] = {
+    let off = [0usize, 0x80, 0x100, 0x200, 0x400, 0x800, 0x1000, 0x2000];
+    let mut p = [0usize; BLOCKS];
+    let mut i = 0;
+    while i < 8 {
+        p[i] = 0x4010_0000 + off[i];
+        p[i + 8] = 0xbf00_0000 + off[i];
+        i += 1;
+    }
+    p
+};
+const BLOCK_BYTES: usize = 128;
+/// Vref codes of the sweep (10 % + 0.5 % of VDDQ per code: 26 %..41 %;
+/// at VDDQ 560 mV 146..230 mV, inside the 75..350 mV DQ Vref range at a
+/// WCK up to 1600 MHz) and the code that identifies each MR's byte (15 %,
+/// 84 mV).
+const VREF_FIRST: u8 = 0x20;
+const VREF_N: usize = 31;
+const VREF_BAD: u8 = 0x0a;
+
+fn pattern(addr: usize, seed: u32) -> u32 {
+    let x = (addr as u32).wrapping_mul(0x9e37_79b1) ^ seed;
+    x ^ (x >> 15)
+}
+
+struct Port(Bt0Hw);
+
+impl WritePort for Port {
+    type Error = Error;
+    fn set_tx_dq(&mut self, db: usize, lane: usize, tg: usize, v: u16) -> Result<(), Error> {
+        csr_access(&mut self.0, true);
+        self.0.write16(csr(wrtrain::tx_dq_csr(db, lane, tg)), v);
+        csr_access(&mut self.0, false);
+        Ok(())
+    }
+    fn tx_dq(&mut self, db: usize, lane: usize, tg: usize) -> Result<u16, Error> {
+        csr_access(&mut self.0, true);
+        let v = self.0.read16(csr(wrtrain::tx_dq_csr(db, lane, tg)));
+        csr_access(&mut self.0, false);
+        Ok(v)
+    }
+    fn check(&mut self, seed: u32) -> Result<Folds, Error> {
+        for &b in PROBE.iter() {
+            for a in (b..b + BLOCK_BYTES).step_by(4) {
+                // SAFETY: DRAM in mission mode; bt0 runs from SRAM and
+                // nothing else uses these blocks.
+                unsafe { core::ptr::write_volatile(a as *mut u32, pattern(a, seed)) };
+            }
+        }
+        let mut f = [0u32; BLOCKS];
+        for (k, &b) in PROBE.iter().enumerate() {
+            for a in (b..b + BLOCK_BYTES).step_by(4) {
+                // SAFETY: as above.
+                let got = unsafe { core::ptr::read_volatile(a as *const u32) };
+                f[k] |= got ^ pattern(a, seed);
+            }
+        }
+        crate::recovery::kick();
+        Ok(f)
+    }
+}
+
+impl MrPort for Port {
+    type Error = Error;
+    fn mrw(&mut self, ch: usize, rank: usize, ma: u8, op: u8) -> Result<(), Error> {
+        cubie_a7a_dram::mr::write_rank(&mut self.0, ch, rank as u32, ma as u32, op as u32)
+    }
+    fn mrr(&mut self, ch: usize, rank: usize, ma: u8) -> Result<u8, Error> {
+        cubie_a7a_dram::mr::read(&mut self.0, ch, rank as u32, ma as u32).map(|v| v as u8)
+    }
+    fn settle(&mut self) {
+        // tVREF is not in our public sources yet:
+        // a conservative wait.
+        self.0.udelay(10);
+    }
+}
+
+/// Two ports on one `Bt0Hw` (a unit struct): the write side and the MR side.
+fn ports() -> (Port, Port) {
+    (Port(Bt0Hw), Port(Bt0Hw))
+}
+
+fn print_delays(tag: &str, tg: usize, d: &Delays) {
+    for (db, lanes) in d.iter().enumerate() {
+        println!("[dram] WR {tag} tg {tg} DB{db}: {lanes:03x?}");
+    }
+}
+
+/// The stage (see the module docs); nothing when `A7A_WR_STAGE` is unset.
+pub fn run() {
+    if BITS == 0 {
+        return;
+    }
+    let (mut p, mut mp) = ports();
+    let mut seed = 0x5eed_0001u32;
+    println!("[dram] WR: stage bits {BITS:x}, probe blocks {PROBE:08x?} x {BLOCK_BYTES} B");
+    let m = match wrtrain::discover(&mut p, &mut seed) {
+        Ok(m) => m,
+        Err(e) => {
+            println!("[dram] WR: discovery failed: {e:?}; stopping");
+            return;
+        }
+    };
+    println!(
+        "[dram] WR: blocks tg {:?}, DBYTEs {:x?}",
+        m.block_tg, m.block_dbs
+    );
+    for db in 0..DBYTES {
+        println!(
+            "[dram] WR: DB{db} lane bits {:08x?}, reachable tg0 {} tg1 {}",
+            m.lane_bits[db],
+            m.reachable(db, 0),
+            m.reachable(db, 1)
+        );
+    }
+    let mut pmu = [[[0u16; LANES]; DBYTES]; 2];
+    for (tg, d) in pmu.iter_mut().enumerate() {
+        for (db, lanes) in d.iter_mut().enumerate() {
+            for (lane, v) in lanes.iter_mut().enumerate() {
+                *v = p.tx_dq(db, lane, tg).unwrap_or(0);
+            }
+        }
+        print_delays("before", tg, d);
+    }
+    if BITS & 2 != 0 {
+        for tg in 0..2 {
+            for db in 0..DBYTES {
+                for lane in 0..LANES {
+                    let _ = p.set_tx_dq(db, lane, tg, 0x20);
+                }
+            }
+        }
+        println!("[dram] WR: every TxDqDly at 0x20 (untrained)");
+    }
+    let measure_only = BITS & 8 != 0;
+    let mut centred = [None; 2];
+    for tg in 0..2 {
+        if (0..DBYTES).all(|db| !m.reachable(db, tg)) {
+            println!("[dram] WR: tg {tg} not reachable from the probe blocks; left as it is");
+            continue;
+        }
+        match wrtrain::centre(&mut p, &m, tg, true, &mut seed) {
+            Ok(c) => {
+                print_delays("ours", tg, &c.applied);
+                for db in 0..DBYTES {
+                    let mut delta = [0i16; LANES];
+                    let mut width = [0u16; LANES];
+                    for lane in 0..LANES {
+                        delta[lane] = c.applied[db][lane] as i16 - pmu[tg][db][lane] as i16;
+                        width[lane] = c.fine[db][lane].width().unwrap_or(0);
+                    }
+                    let kinds = c.fine[db].map(|f| match f {
+                        LaneFit::Centre { .. } => 'c',
+                        LaneFit::AtEdge { .. } => 'e',
+                        LaneFit::NoWindow => 'n',
+                        LaneFit::Unmeasured => '-',
+                    });
+                    println!(
+                        "[dram] WR tg {tg} DB{db}: ours - before {delta:?}, fine widths {width:?}, fits {kinds:?}"
+                    );
+                }
+                centred[tg] = Some(c.applied);
+            }
+            Err(e) => {
+                println!("[dram] WR: centring tg {tg} failed: {e:?}");
+            }
+        }
+    }
+    if BITS & 4 != 0 {
+        for tg in 0..2 {
+            let Some(centres) = centred[tg] else {
+                continue;
+            };
+            let mut cur = [[0u8; 2]; 2];
+            for (ch, c) in cur.iter_mut().enumerate() {
+                for (k, ma) in [14u8, 15].into_iter().enumerate() {
+                    c[k] = wrtrain::read_operating(&mut mp, ch, tg, ma).unwrap_or(0x2e) & 0x7f;
+                }
+            }
+            println!("[dram] WR: tg {tg} operating MR14/MR15 per channel {cur:02x?}");
+            let bytes = match wrtrain::identify_vref_bytes(
+                &mut p, &mut mp, &m, tg, cur, VREF_BAD, &mut seed,
+            ) {
+                Ok(Some(b)) => b,
+                r => {
+                    println!("[dram] WR: tg {tg} Vref byte identification: {r:?}; no sweep");
+                    continue;
+                }
+            };
+            println!("[dram] WR: tg {tg} MR14/MR15 drive DBYTEs {bytes:?}");
+            let (codes, n) = wrtrain::vref_codes(VREF_FIRST, 1, VREF_N);
+            match wrtrain::vref_sweep(
+                &mut p,
+                &mut mp,
+                &m,
+                tg,
+                &bytes,
+                &codes[..n],
+                cur,
+                &centres,
+                !measure_only,
+                &mut seed,
+            ) {
+                Ok(r) => {
+                    for db in 0..DBYTES {
+                        let w = r.widths[db].map(|x| x.unwrap_or(0));
+                        println!(
+                            "[dram] WR Vref tg {tg} DB{db}: codes {:02x}.. widths {:?}, chosen {:02x?} (max-min {:02x?})",
+                            codes[0],
+                            &w[..n],
+                            r.chosen[db],
+                            r.max_min[db]
+                        );
+                    }
+                    if !measure_only {
+                        match wrtrain::centre(&mut p, &m, tg, true, &mut seed) {
+                            Ok(c) => {
+                                print_delays("ours@vref", tg, &c.applied);
+                                centred[tg] = Some(c.applied);
+                            }
+                            Err(e) => {
+                                println!("[dram] WR: re-centring tg {tg} failed: {e:?}");
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    println!("[dram] WR: Vref sweep tg {tg} failed: {e:?}");
+                }
+            }
+        }
+    }
+    if measure_only {
+        for (tg, d) in pmu.iter().enumerate() {
+            for (db, lanes) in d.iter().enumerate() {
+                for (lane, &v) in lanes.iter().enumerate() {
+                    let _ = p.set_tx_dq(db, lane, tg, v);
+                }
+            }
+        }
+        println!("[dram] WR: measurement only; the delays found before are back");
+    }
+    let mut bad = 0u32;
+    for _ in 0..4 {
+        seed = seed.wrapping_add(0x9e37_79b9);
+        if let Ok(f) = p.check(seed) {
+            for (b, v) in f.iter().enumerate() {
+                if *v != 0 {
+                    bad |= 1 << b;
+                }
+            }
+        }
+    }
+    println!(
+        "[dram] WR: final probe check: failing blocks {bad:04x}; DMI lane {DMI_LANE} set from its DBYTE's median"
+    );
+}

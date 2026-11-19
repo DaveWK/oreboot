@@ -25,6 +25,8 @@ mod bt0hw;
 mod open;
 #[cfg(feature = "dramlib")]
 mod vendor;
+#[cfg(any(feature = "bl-mission", feature = "hybrid"))]
+mod wrstage;
 
 #[cfg(feature = "blobless")]
 use blobless as backend;

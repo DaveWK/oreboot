@@ -269,6 +269,9 @@ fn wck_level(p: &mut Para) {
     if option_env!("A7A_HYBRID_SKIP_RD").is_some() {
         let r = blobless::mission_handover(&mut Bt0Hw, p, PROBE_PSTATE);
         println!("[dram] MISSION (hybrid, no read training): {r:?}");
+        if r.is_ok() {
+            super::wrstage::run();
+        }
         return;
     }
     if b.failure.is_none() {
@@ -283,6 +286,9 @@ fn wck_level(p: &mut Para) {
                 let r = blobless::mission_handover_relock(&mut Bt0Hw, p, PROBE_PSTATE, relock);
                 println!("[dram] MISSION: PLL/DLL relock before the DFI init: {relock}");
                 println!("[dram] MISSION: lean hand-over at pstate {PROBE_PSTATE}: {r:?}");
+                if r.is_ok() {
+                    super::wrstage::run();
+                }
             } else {
                 println!("[dram] MISSION: skipped, read training not applied on every block");
             }
@@ -1097,6 +1103,9 @@ pub fn hybrid_after_pmu(p: &mut Para) -> ! {
     if option_env!("A7A_HYBRID_NO_WL").is_some() {
         let r = blobless::mission_handover(&mut Bt0Hw, p, PROBE_PSTATE);
         println!("[dram] MISSION (hybrid, no leveling, no read training): {r:?}");
+        if r.is_ok() {
+            super::wrstage::run();
+        }
     } else if option_env!("A7A_HYBRID_SKIP_WL").is_some() {
         let bases = blobless::wl_mr18_bases(p, PROBE_PSTATE);
         let applied = read_training(bases);

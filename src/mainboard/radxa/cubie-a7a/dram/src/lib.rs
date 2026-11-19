@@ -23,6 +23,7 @@ pub mod size;
 pub mod timing;
 pub mod vendor_cmp;
 pub mod wl;
+pub mod wrtrain;
 
 pub use hw::{Error, Hw, Rail, RegIo};
 pub use para::Para;
