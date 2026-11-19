@@ -12,7 +12,7 @@
 //! | `continue`                  | `boot` of the last download                   |
 //! | `reboot`                    | watchdog reset of the board                   |
 //! | `reboot-bootloader`, `oem fel` | back to the mask ROM's FEL (DRAM stays up) |
-//! | `oem help/log/read32`       | diagnostics                                   |
+//! | `oem help/log`              | diagnostics (`read32` only with `fel-lab`)    |
 //! | `flash`/`erase`, `oem nor-*`| SPI NOR, only with `fastboot-nor-write`       |
 //! | `fetch:emmc*`, `oem emmc`   | eMMC module, read-only (DRAM extension)       |
 //! | `flash`/`erase:emmc-*`, `oem emmc-arm/bootcfg` | eMMC, only with `fastboot-emmc-write` |
@@ -32,7 +32,9 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use cubie_a7a_common::{crc32, fwlog};
 use cubie_a7a_fastboot::proto::{self, Command, Device, Exit, Info, Line};
 use cubie_a7a_fastboot::{fetch, nor, plan, usb};
-use util::mmio::{read32, read64le, read8};
+#[cfg(feature = "fel-lab")]
+use util::mmio::read32;
+use util::mmio::{read64le, read8};
 
 use crate::musb::{self, Musb};
 use crate::{soc, Bringup};
@@ -135,6 +137,7 @@ const NAMES: &[&str] = &[
 
 const HELP: &[&str] = &[
     "oem log [hex bytes]: tail of the bt0 console log",
+    #[cfg(feature = "fel-lab")]
     "oem read32 <hex addr>: one 32-bit register read",
     "oem fel: back to the mask ROM's FEL (as reboot-bootloader)",
     "oem nor-id: SPI NOR JEDEC ID and status register 1",
@@ -230,6 +233,7 @@ fn oem_log(n: usize, info: &mut dyn Info) -> Result<(), &'static str> {
 
 /// `oem read32 <addr>`: one aligned 32-bit read. Not the USB0 FIFOs
 /// (reading one would take fastboot's own packets).
+#[cfg(feature = "fel-lab")]
 fn oem_read32(arg: &str, info: &mut dyn Info) -> Result<(), &'static str> {
     let a = proto::hex_u32(arg).ok_or("usage: oem read32 <hex address>")? as usize;
     if !a.is_multiple_of(4) {
@@ -659,6 +663,7 @@ impl Device for A7a<'_> {
                 };
                 oem_log(n.min(0x8000), info).map(|()| None)
             }
+            #[cfg(feature = "fel-lab")]
             "read32" => oem_read32(rest, info).map(|()| None),
             "fel" => Ok(Some(Exit::Bootloader)),
             "nor-id" => {

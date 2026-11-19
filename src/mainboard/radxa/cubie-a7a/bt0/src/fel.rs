@@ -87,8 +87,13 @@ pub mod state {
     /// ... an image does not match its CRC.
     pub const BOOT_CRC: u32 = 0xe2;
     /// Entry 3 (lab) running / done.
+    #[cfg(feature = "fel-lab")]
     pub const LAB_RUNNING: u32 = 0x30;
+    #[cfg(feature = "fel-lab")]
     pub const LAB_DONE: u32 = 0x31;
+    /// Entry 3 in a build without feature `fel-lab`.
+    #[cfg(not(feature = "fel-lab"))]
+    pub const NO_LAB: u32 = 0xe4;
     /// Entry 4: fastboot serving (FEL is gone until it returns).
     pub const FASTBOOT: u32 = 0x40;
     /// Entry 4 in a build without feature `fastboot`.
@@ -535,11 +540,15 @@ extern "C" fn fel_fastboot() {
 }
 
 /// Mailbox words of the lab entry (entry 3, `lab.rs`).
+#[cfg(feature = "fel-lab")]
 const MB_LAB_OPS: usize = MAILBOX + 0x20;
+#[cfg(feature = "fel-lab")]
 const MB_LAB_OUT: usize = MAILBOX + 0x24;
+#[cfg(feature = "fel-lab")]
 const MB_LAB_ERR: usize = MAILBOX + 0x28;
 
 /// Entry 3: the host's lab command list (`lab.rs`), watchdog armed.
+#[cfg(feature = "fel-lab")]
 #[unsafe(no_mangle)]
 extern "C" fn fel_lab() {
     write32(MB_STATE, state::LAB_RUNNING);
@@ -550,6 +559,13 @@ extern "C" fn fel_lab() {
     write32(MB_LAB_ERR, err);
     recovery::stop_watchdog();
     write32(MB_STATE, state::LAB_DONE);
+}
+
+/// Keep entry addresses stable without consuming a lab command list.
+#[cfg(not(feature = "fel-lab"))]
+#[unsafe(no_mangle)]
+extern "C" fn fel_lab() {
+    write32(MB_STATE, state::NO_LAB);
 }
 
 /// GIC-600 distributor and CPU0's redistributor SGI/PPI frame (main gic.rs).

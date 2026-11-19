@@ -68,7 +68,7 @@ mod fel;
 mod felreboot;
 mod gpadc;
 mod gpio;
-#[cfg(feature = "fel")]
+#[cfg(feature = "fel-lab")]
 mod lab;
 #[cfg(feature = "dram-lab")]
 mod labfb;

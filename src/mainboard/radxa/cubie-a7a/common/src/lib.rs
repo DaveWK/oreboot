@@ -14,6 +14,9 @@
 #![no_std]
 
 #[cfg(test)]
+#[path = "../../bt0/src/dram/open/lab_fw.rs"]
+mod bt0_lab_fw;
+#[cfg(test)]
 #[path = "../../bt0/src/smhc/sd_width.rs"]
 mod bt0_sd_width;
 
