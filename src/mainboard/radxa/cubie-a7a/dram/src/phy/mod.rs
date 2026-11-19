@@ -124,14 +124,15 @@ pub fn read_latency_csrs<H: Hw>(hw: &mut H) -> (u32, u32) {
 /// PUBMODE[0] = 0: leave PHY training mode and return the DFI to the controller.
 /// A7A readback: `2026-11-18-1725-4g-luckfox.log`, byte 3825500: `2006e=0000`.
 pub(crate) const PUBMODE: u32 = 0x2006e;
-/// MemResetL[1:0] = 01: clear ProtectMemReset and keep BP_MemReset_L high
-/// (DRAM reset released). Same log, byte 3825462: `20060=0001`.
+/// MemResetL[1:0] = 01 clears ProtectMemReset and sets MemResetLValue.
+/// MemResetLValue drives BP_MemReset_L only when ProtectMemReset is set
+/// (TRM p. 530). Same log, byte 3825462: `20060=0001`.
 pub const MEM_RESET_L: u32 = 0x20060;
-/// PMIEnable[0] = 1: enable the PHY's PMI for mission operation.
-/// Same log, byte 3825424: `20054=0001`.
+/// The PHY Initialization Engine writes PMIEnable[0] during frequency changes
+/// (TRM p. 527). Mission readback in the same log, byte 3825424: `20054=0001`.
 pub(crate) const PMI_ENABLE: u32 = 0x20054;
-/// ACSMWckEnControl[0] = 0: release the training sequencer's WCK enable
-/// control. Same log, byte 3825535: `2002a=0000`.
+/// ACSMWckEnControl[1:0]: 00 = NOP, 01 = ACSM control (TRM p. 506).
+/// Mission readback in the same log, byte 3825535: `2002a=0000` (NOP).
 pub(crate) const ACSM_WCK_EN_CONTROL: u32 = 0x2002a;
 
 #[cfg(test)]
