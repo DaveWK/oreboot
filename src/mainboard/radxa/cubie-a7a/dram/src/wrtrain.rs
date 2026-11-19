@@ -44,9 +44,22 @@
 //! - mode registers go to the set-point MR16 FSP-WR selects: a Vref MRW
 //!   first points FSP-WR at the operating set (FSP-OP), then restores MR16
 //!   ([`write_operating`]). The end-of-init bisect showed what happens otherwise.
-//! - The DMI lane (8) carries no data in this compare (write DBI off, MR3
-//!   OP[7] = 0): it gets the median of its DBYTE's DQ lanes; a data-mask
-//!   check is a separate step.
+//! - The DMI lane (8). Write DBI is off (MR3 OP[7] = 0), so DMI carries no
+//!   data bit, but it can carry the data mask: the compare stores single
+//!   32-bit words, two beats of a 16-beat burst, and with the controller's
+//!   data mask on (DBICTL dm_en = 1, the DRAM's MR13 OP[5] = 0; with it off
+//!   the controller reads, modifies and writes the whole burst) such a store
+//!   is a masked write, DMI high on the fourteen other beats. A DMI lane
+//!   moved by a UI then masks the wrong beats and fails its DBYTE's bytes,
+//!   on the fold bits of that DBYTE's DQ lanes. [`measure`] records what a
+//!   DMI lane fails; the rules of [`Map::check`] are about the DQ lanes.
+//!   (Judged as a ninth data lane, a DMI lane that carries the mask ends
+//!   every discovery with [`WrError::LaneOverlap`] on the first lane of
+//!   the first DBYTE: so the memory model of the tests, and so every board
+//!   run reported while the rule stood; the map of a board is still to be
+//!   seen.) In [`centre`] a DMI lane that is seen is held while the DQ
+//!   lanes move, then gets its own window; one that is not seen gets the
+//!   median of its DBYTE's DQ lanes.
 
 use dram_train::window::{longest_run_linear, Window};
 
@@ -60,6 +73,19 @@ pub const TX_DQ_MAX: u16 = 0x1ff;
 pub const UI: u16 = 64;
 /// Points per sweep (pass maps are `u128`).
 pub const MAX_POINTS: u32 = 128;
+/// Lanes a [`sweep`] moves (bit n: lane n): the DQ lanes, the DMI lane,
+/// all nine.
+pub const DQ_LANES: u16 = 0x0ff;
+pub const DMI_ONLY: u16 = 0x100;
+pub const ALL_LANES: u16 = 0x1ff;
+
+/// The data word a compare stores at `addr` (a hash of the address and
+/// the seed, so that neighbouring beats of a lane differ about half the
+/// time).
+pub fn pattern(addr: usize, seed: u32) -> u32 {
+    let x = (addr as u32).wrapping_mul(0x9e37_79b1) ^ seed;
+    x ^ (x >> 15)
+}
 
 /// TxDqDly CSR of DBYTE `db`, lane `lane`, timing group (rank) `tg`.
 pub const fn tx_dq_csr(db: usize, lane: usize, tg: usize) -> u32 {
@@ -100,8 +126,9 @@ pub enum WrError<E> {
     BlockTg(usize),
     /// A DQ lane (db, lane) moved no data bit.
     LaneUnseen(usize, usize),
-    /// Two lanes of one channel share data bits (db, lane, other db).
-    LaneOverlap(usize, usize, usize),
+    /// Two DQ lanes that share a block share data bits (db, lane, other
+    /// db, other lane).
+    LaneOverlap(usize, usize, usize, usize),
     /// The applied result does not read back cleanly (blocks).
     Verify(u32),
     /// A sweep with more than [`MAX_POINTS`] points or a zero step.
@@ -115,7 +142,11 @@ pub struct Map {
     pub block_tg: [Option<u8>; BLOCKS],
     /// DBYTEs whose lanes change each block's data (bit n: DBYTE n).
     pub block_dbs: [u8; BLOCKS],
-    /// The fold bits each lane drives.
+    /// Blocks that reacted to lanes of both timing groups (bit n: block n).
+    pub block_both: u32,
+    /// The fold bits each lane fails when it is moved by a UI: a DQ lane
+    /// its own data bits, a DMI lane that carries the data mask the bits
+    /// of its DBYTE's bytes.
     pub lane_bits: [[u32; LANES]; DBYTES],
 }
 
@@ -135,9 +166,44 @@ impl Map {
     pub fn reachable(&self, db: usize, tg: usize) -> bool {
         self.blocks(db, tg) != 0
     }
-    /// DQ lanes of `db` this compare sees.
+    /// Lanes of `db` this compare sees.
     pub fn seen(&self, db: usize, lane: usize) -> bool {
         self.lane_bits[db][lane] != 0
+    }
+    /// The fold bits of all of `db`'s lanes.
+    pub fn dbyte_bits(&self, db: usize) -> u32 {
+        self.lane_bits[db].iter().fold(0, |a, b| a | b)
+    }
+    /// The rules of a map the centring can use: no block reacts to both
+    /// timing groups, every DQ lane moves some bit, and no two DQ lanes
+    /// that share a block share bits. The DMI lanes are not judged: one
+    /// that carries the data mask shares its DBYTE's bits by nature.
+    pub fn check<E>(&self) -> Result<(), WrError<E>> {
+        if self.block_both != 0 {
+            return Err(WrError::BlockTg(self.block_both.trailing_zeros() as usize));
+        }
+        for db in 0..DBYTES {
+            for lane in 0..DMI_LANE {
+                if self.lane_bits[db][lane] == 0 {
+                    return Err(WrError::LaneUnseen(db, lane));
+                }
+                for other in 0..DBYTES {
+                    let shared_block = (0..BLOCKS).any(|b| {
+                        self.block_dbs[b] & (1 << db) != 0 && self.block_dbs[b] & (1 << other) != 0
+                    });
+                    for ol in 0..DMI_LANE {
+                        if (other, ol) == (db, lane) {
+                            continue;
+                        }
+                        if shared_block && self.lane_bits[db][lane] & self.lane_bits[other][ol] != 0
+                        {
+                            return Err(WrError::LaneOverlap(db, lane, other, ol));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -165,11 +231,13 @@ const fn disturbed(v: u16) -> u16 {
     }
 }
 
-/// The block and lane maps, from a state that writes cleanly (the
-/// PMU-trained one): each lane of each DBYTE and timing group in turn is
-/// moved by one UI, the blocks and data bits that fail belong to it, the
-/// lane goes back.
-pub fn discover<P: WritePort>(p: &mut P, seed: &mut u32) -> Result<Map, WrError<P::Error>> {
+/// The block and lane maps as measured, from a state that writes cleanly
+/// (the PMU-trained one, or a clean [`blind_baseline`]): each lane of each
+/// DBYTE and timing group in turn is moved by one UI, the blocks and data
+/// bits that fail belong to it, the lane goes back. Nothing is judged
+/// here ([`Map::check`] does that), so a caller can show a map that the
+/// rules refuse.
+pub fn measure<P: WritePort>(p: &mut P, seed: &mut u32) -> Result<Map, WrError<P::Error>> {
     let bad = clean(p, seed).map_err(WrError::Port)?;
     if bad != 0 {
         return Err(WrError::Baseline(bad));
@@ -177,6 +245,7 @@ pub fn discover<P: WritePort>(p: &mut P, seed: &mut u32) -> Result<Map, WrError<
     let mut m = Map {
         block_tg: [None; BLOCKS],
         block_dbs: [0; BLOCKS],
+        block_both: 0,
         lane_bits: [[0; LANES]; DBYTES],
     };
     for tg in 0..2 {
@@ -194,7 +263,7 @@ pub fn discover<P: WritePort>(p: &mut P, seed: &mut u32) -> Result<Map, WrError<
                         continue;
                     }
                     match m.block_tg[b] {
-                        Some(t) if t != tg as u8 => return Err(WrError::BlockTg(b)),
+                        Some(t) if t != tg as u8 => m.block_both |= 1 << b,
                         _ => m.block_tg[b] = Some(tg as u8),
                     }
                     m.block_dbs[b] |= 1 << db;
@@ -203,26 +272,13 @@ pub fn discover<P: WritePort>(p: &mut P, seed: &mut u32) -> Result<Map, WrError<
             }
         }
     }
-    for db in 0..DBYTES {
-        for lane in 0..DMI_LANE {
-            if m.lane_bits[db][lane] == 0 {
-                return Err(WrError::LaneUnseen(db, lane));
-            }
-            for other in 0..DBYTES {
-                for ol in 0..LANES {
-                    if (other, ol) == (db, lane) {
-                        continue;
-                    }
-                    let shared_block = (0..BLOCKS).any(|b| {
-                        m.block_dbs[b] & (1 << db) != 0 && m.block_dbs[b] & (1 << other) != 0
-                    });
-                    if shared_block && m.lane_bits[db][lane] & m.lane_bits[other][ol] != 0 {
-                        return Err(WrError::LaneOverlap(db, lane, other));
-                    }
-                }
-            }
-        }
-    }
+    Ok(m)
+}
+
+/// [`measure`], then [`Map::check`].
+pub fn discover<P: WritePort>(p: &mut P, seed: &mut u32) -> Result<Map, WrError<P::Error>> {
+    let m = measure(p, seed)?;
+    m.check()?;
     Ok(m)
 }
 
@@ -374,6 +430,13 @@ pub const FINE: Sweep = Sweep {
     step: 1,
     n: 81,
 };
+/// The sweep of a DMI lane around the value it was held at: -64..=+63 by
+/// 1, a UI to either side, so a window that holds that value ends inside.
+pub const DMI_SPAN: Sweep = Sweep {
+    lo: -64,
+    step: 1,
+    n: 128,
+};
 
 /// Pass maps per DBYTE and lane (bit i: point i passed).
 pub type PassMaps = [[u128; LANES]; DBYTES];
@@ -388,14 +451,18 @@ fn point(base: u16, s: &Sweep, i: u32) -> Option<u16> {
 }
 
 /// Run sweep `s` on timing group `tg` around `base` (all zeros for
-/// [`COARSE`]); lanes of unreachable DBYTEs stay untouched. The delays are
-/// left at the last point: callers apply a result afterwards.
+/// [`COARSE`]) with the lanes of mask `lanes` ([`DQ_LANES`], [`DMI_ONLY`],
+/// [`ALL_LANES`]); the other lanes and the lanes of unreachable DBYTEs
+/// stay untouched. A DQ lane passes a point where none of its bits fails
+/// in its DBYTE's blocks, a DMI lane where no bit of its DBYTE does. The
+/// delays are left at the last point: callers apply a result afterwards.
 pub fn sweep<P: WritePort>(
     p: &mut P,
     m: &Map,
     tg: usize,
     base: &Delays,
     s: &Sweep,
+    lanes: u16,
     seed: &mut u32,
 ) -> Result<PassMaps, WrError<P::Error>> {
     if s.n == 0 || s.n > MAX_POINTS || s.step == 0 {
@@ -409,6 +476,9 @@ pub fn sweep<P: WritePort>(
                 continue;
             }
             for lane in 0..LANES {
+                if lanes & (1 << lane) == 0 {
+                    continue;
+                }
                 if let Some(v) = point(base[db][lane], s, i) {
                     p.set_tx_dq(db, lane, tg, v).map_err(WrError::Port)?;
                     valid[db][lane] = true;
@@ -425,11 +495,15 @@ pub fn sweep<P: WritePort>(
         }
         for db in 0..DBYTES {
             let blocks = m.blocks(db, tg);
-            for lane in 0..DMI_LANE {
+            for lane in 0..LANES {
                 if !valid[db][lane] || blocks == 0 {
                     continue;
                 }
-                let bits = m.lane_bits[db][lane];
+                let bits = if lane == DMI_LANE {
+                    m.dbyte_bits(db)
+                } else {
+                    m.lane_bits[db][lane]
+                };
                 let ok = (0..BLOCKS).all(|b| blocks & (1 << b) == 0 || fails[b] & bits == 0);
                 if ok {
                     maps[db][lane] |= 1 << i;
@@ -451,7 +525,7 @@ pub enum LaneFit {
     AtEdge { value: u16, width: u16 },
     /// Narrower than `min_points` points (noise) or empty.
     NoWindow,
-    /// Not measured (unreachable DBYTE or timing group, or the DMI lane).
+    /// Not measured (unreachable DBYTE or timing group).
     Unmeasured,
 }
 
@@ -493,8 +567,8 @@ pub fn fit(map: u128, base: u16, s: &Sweep, min_points: u32) -> LaneFit {
     }
 }
 
-/// Fits of every lane; the DMI lane gets the median centre of its
-/// DBYTE's DQ lanes when all eight are centred.
+/// Fits of the DQ lanes; the DMI lane gets the median centre of its
+/// DBYTE's DQ lanes when all eight are centred (width 0: not measured).
 pub fn fits(
     m: &Map,
     tg: usize,
@@ -542,10 +616,23 @@ pub struct Centring {
     pub centred: u64,
 }
 
-/// Write DQ centring of timing group `tg`: coarse sweep over the whole
-/// range, fine sweep around each lane's coarse centre, apply the fine
-/// centres (other lanes keep their value), check the result. With
-/// `apply` false the `before` delays are put back (measurement only).
+/// Write DQ centring of timing group `tg`:
+/// 1. a coarse sweep of all nine lanes together over the whole range;
+/// 2. a fine sweep of the DQ lanes around each lane's coarse centre, with
+///    the DMI lane held at the median of the coarse centres (or where it
+///    was, when a lane has none): a DMI lane that carries the data mask
+///    would otherwise cut every DQ lane's window to its own;
+/// 3. for the DBYTEs whose DMI lane the map sees, a sweep of that lane
+///    alone ([`DMI_SPAN`]) with the DQ lanes at their fine centres. Such a
+///    lane without a centred window keeps the value it had before; a DMI
+///    lane the map does not see gets the median of the fine centres;
+/// 4. the fine centres are applied (other lanes keep their value) and the
+///    timing group's blocks must write cleanly.
+///
+/// With `apply` false the `before` delays are put back (measurement only).
+/// They are also put back when the result does not write cleanly
+/// ([`WrError::Verify`]) or the port fails: the caller keeps the state it
+/// came with.
 pub fn centre<P: WritePort>(
     p: &mut P,
     m: &Map,
@@ -559,10 +646,30 @@ pub fn centre<P: WritePort>(
             before[db][lane] = p.tx_dq(db, lane, tg).map_err(WrError::Port)?;
         }
     }
+    let r = centre_from(p, m, tg, apply, &before, seed);
+    if r.is_err() {
+        for db in 0..DBYTES {
+            for lane in 0..LANES {
+                let _ = p.set_tx_dq(db, lane, tg, before[db][lane]);
+            }
+        }
+    }
+    r
+}
+
+fn centre_from<P: WritePort>(
+    p: &mut P,
+    m: &Map,
+    tg: usize,
+    apply: bool,
+    before: &Delays,
+    seed: &mut u32,
+) -> Result<Centring, WrError<P::Error>> {
     let zero = [[0u16; LANES]; DBYTES];
-    let cmaps = sweep(p, m, tg, &zero, &COARSE, seed)?;
-    let coarse = fits(m, tg, &cmaps, &zero, &COARSE);
-    let mut fbase = before;
+    // One set of pass maps, reused sweep after sweep (bt0's stack).
+    let mut maps = sweep(p, m, tg, &zero, &COARSE, ALL_LANES, seed)?;
+    let coarse = fits(m, tg, &maps, &zero, &COARSE);
+    let mut fbase = *before;
     for db in 0..DBYTES {
         for lane in 0..LANES {
             if let Some(v) = coarse[db][lane].value() {
@@ -570,9 +677,26 @@ pub fn centre<P: WritePort>(
             }
         }
     }
-    let fmaps = sweep(p, m, tg, &fbase, &FINE, seed)?;
-    let fine = fits(m, tg, &fmaps, &fbase, &FINE);
-    let mut applied = before;
+    for db in (0..DBYTES).filter(|&db| m.reachable(db, tg)) {
+        p.set_tx_dq(db, DMI_LANE, tg, fbase[db][DMI_LANE])
+            .map_err(WrError::Port)?;
+    }
+    maps = sweep(p, m, tg, &fbase, &FINE, DQ_LANES, seed)?;
+    let mut fine = fits(m, tg, &maps, &fbase, &FINE);
+    let masks = |db: usize| m.reachable(db, tg) && m.seen(db, DMI_LANE);
+    if (0..DBYTES).any(masks) {
+        for db in (0..DBYTES).filter(|&db| m.reachable(db, tg)) {
+            for lane in 0..DMI_LANE {
+                let v = fine[db][lane].value().unwrap_or(before[db][lane]);
+                p.set_tx_dq(db, lane, tg, v).map_err(WrError::Port)?;
+            }
+        }
+        maps = sweep(p, m, tg, &fbase, &DMI_SPAN, DMI_ONLY, seed)?;
+        for db in (0..DBYTES).filter(|&db| masks(db)) {
+            fine[db][DMI_LANE] = fit(maps[db][DMI_LANE], fbase[db][DMI_LANE], &DMI_SPAN, 3);
+        }
+    }
+    let mut applied = *before;
     let mut centred = 0u64;
     if apply {
         for db in 0..DBYTES {
@@ -599,7 +723,7 @@ pub fn centre<P: WritePort>(
     }
     Ok(Centring {
         tg,
-        before,
+        before: *before,
         coarse,
         fine,
         applied,
@@ -763,8 +887,9 @@ pub fn choose(widths: &[Option<u8>], codes: &[u8]) -> (Option<u8>, Option<u8>) {
 
 /// Write Vref sweep of timing group `tg`: the same code to MR14 and MR15
 /// of both channels at every point (operating set-point, [`write_operating`],
-/// VRCG on during the sweep), the fine write window re-centred around
-/// `centres` at each point, the narrowest lane per DBYTE as its width.
+/// VRCG on during the sweep), the fine write window of the DQ lanes
+/// re-centred around `centres` at each point (the DMI lanes stay there),
+/// the narrowest lane per DBYTE as its width.
 /// Afterwards every Vref MR gets its byte's chosen code (or `restore` where
 /// none was chosen) and the delays are re-centred at the chosen codes when
 /// `apply`; otherwise the `restore` codes and the `centres` go back.
@@ -805,7 +930,7 @@ where
     };
     for (i, &code) in codes.iter().enumerate().take(n) {
         mrw_all(mp, &|_, _| code, true).map_err(|e| WrError::Port(e.into()))?;
-        let maps = sweep(p, m, tg, centres, &FINE, seed)?;
+        let maps = sweep(p, m, tg, centres, &FINE, DQ_LANES, seed)?;
         let f = fits(m, tg, &maps, centres, &FINE);
         for db in 0..DBYTES {
             if !m.reachable(db, tg) {
@@ -870,6 +995,9 @@ mod tests {
         /// Which DBYTE MR14 / MR15 of a channel drive.
         bytes: VrefBytes,
         checks: u32,
+        /// (compare, units): from that compare on every window sits that
+        /// many units later.
+        drift: Option<(u32, u16)>,
         mrws: Vec<(usize, usize, u8, u8)>,
     }
 
@@ -904,6 +1032,7 @@ mod tests {
                 blocks,
                 bytes: [[0, 1], [2, 3]],
                 checks: 0,
+                drift: None,
                 mrws: Vec::new(),
             }
         }
@@ -951,6 +1080,13 @@ mod tests {
         }
         fn check(&mut self, _seed: u32) -> Result<Folds, ()> {
             self.checks += 1;
+            if let Some((at, by)) = self.drift {
+                if self.checks == at {
+                    for c in self.centre.iter_mut().flatten().flatten() {
+                        *c += by;
+                    }
+                }
+            }
             let mut f = [0u32; BLOCKS];
             for (b, &(tg, ch)) in self.blocks.iter().enumerate() {
                 if ch < 0 {
@@ -1296,7 +1432,7 @@ mod tests {
             n: 10,
         };
         assert_eq!(
-            sweep(&mut s, &m, 0, &zero, &bad, &mut seed),
+            sweep(&mut s, &m, 0, &zero, &bad, ALL_LANES, &mut seed),
             Err(WrError::Config)
         );
         let bad = Sweep {
@@ -1305,9 +1441,100 @@ mod tests {
             n: 129,
         };
         assert_eq!(
-            sweep(&mut s, &m, 0, &zero, &bad, &mut seed),
+            sweep(&mut s, &m, 0, &zero, &bad, ALL_LANES, &mut seed),
             Err(WrError::Config)
         );
+    }
+
+    #[test]
+    fn a_result_that_does_not_write_cleanly_is_taken_back() {
+        let mut s = Sim::new().trained();
+        let mut seed = 9;
+        let m = discover(&mut s, &mut seed).unwrap();
+        // A start off the centres, still clean.
+        for db in 0..DBYTES {
+            for lane in 0..LANES {
+                s.dq[db][lane][0] -= 5;
+            }
+        }
+        let before = s.dq;
+        // The eye moves after the sweeps (coarse and fine, two compares a
+        // point), before the check of the applied centres.
+        s.drift = Some((s.checks + 2 * (COARSE.n + FINE.n) + 1, 30));
+        let r = centre(&mut s, &m, 0, true, &mut seed);
+        assert!(matches!(r, Err(WrError::Verify(0xff))), "{r:?}");
+        assert_eq!(s.dq, before);
+    }
+
+    #[test]
+    fn sweep_moves_only_the_lanes_of_its_mask() {
+        let mut s = Sim::new().trained();
+        let mut seed = 2;
+        let m = discover(&mut s, &mut seed).unwrap();
+        let base = s.dq.map(|l| l.map(|t| t[0]));
+        sweep(&mut s, &m, 0, &base, &DMI_SPAN, DMI_ONLY, &mut seed).unwrap();
+        for db in 0..DBYTES {
+            for lane in 0..DMI_LANE {
+                assert_eq!(s.dq[db][lane][0], base[db][lane]);
+            }
+            assert_eq!(s.dq[db][DMI_LANE][0], base[db][DMI_LANE] + 63);
+            s.dq[db][DMI_LANE][0] = base[db][DMI_LANE];
+        }
+        let maps = sweep(&mut s, &m, 0, &base, &FINE, DQ_LANES, &mut seed).unwrap();
+        for db in 0..DBYTES {
+            assert_eq!(s.dq[db][DMI_LANE][0], base[db][DMI_LANE]);
+            assert_eq!(s.dq[db][0][0], base[db][0] + 40);
+            assert_eq!(
+                maps[db][DMI_LANE], 0,
+                "no pass map for a lane that did not move"
+            );
+        }
+        // The other timing group was never written.
+        assert_eq!(
+            s.dq.map(|l| l.map(|t| t[1])),
+            Sim::new().trained().dq.map(|l| l.map(|t| t[1]))
+        );
+    }
+
+    #[test]
+    fn map_rules() {
+        let mut m = Map {
+            block_tg: [Some(0); BLOCKS],
+            block_dbs: [0; BLOCKS],
+            block_both: 0,
+            lane_bits: [[0; LANES]; DBYTES],
+        };
+        // Channel A on the even blocks, channel B on the odd ones.
+        for b in 0..BLOCKS {
+            m.block_dbs[b] = 0b11 << (2 * (b % 2));
+        }
+        for db in 0..DBYTES {
+            for lane in 0..DMI_LANE {
+                m.lane_bits[db][lane] = bits(db, lane);
+            }
+        }
+        assert_eq!(m.check::<()>(), Ok(()));
+        // DBYTEs 0 and 2 use the same bits, in different blocks: fine. A
+        // DMI lane on its DBYTE's bits: fine too.
+        assert_eq!(m.lane_bits[0][3], m.lane_bits[2][3]);
+        m.lane_bits[0][DMI_LANE] = 0x00ff_00ff;
+        m.lane_bits[3][DMI_LANE] = 0x0000_ff00;
+        assert_eq!(m.check::<()>(), Ok(()));
+        assert_eq!(m.dbyte_bits(0), 0x00ff_00ff);
+        // Two DQ lanes of one DBYTE on one bit.
+        let mut x = m;
+        x.lane_bits[1][6] |= bits(1, 2);
+        assert_eq!(x.check::<()>(), Err(WrError::LaneOverlap(1, 2, 1, 6)));
+        // Two DBYTEs that share a block on one bit.
+        let mut x = m;
+        x.lane_bits[3][7] = bits(2, 5);
+        assert_eq!(x.check::<()>(), Err(WrError::LaneOverlap(2, 5, 3, 7)));
+        // A DQ lane that moved nothing; a block on both timing groups.
+        let mut x = m;
+        x.lane_bits[2][4] = 0;
+        assert_eq!(x.check::<()>(), Err(WrError::LaneUnseen(2, 4)));
+        x.block_both = 1 << 9 | 1 << 12;
+        assert_eq!(x.check::<()>(), Err(WrError::BlockTg(9)));
     }
 
     // The sim is both ports: two wrappers share it.
@@ -1356,5 +1583,360 @@ mod vref_cap_tests {
         assert!(BOARD_VDDQ_MV * (100 + 5 * 0x0a) / 1000 >= 75);
         assert_eq!(vref_n_capped(0x40, 1, 5, 0x3c), 0);
         assert_eq!(vref_n_capped(0x20, 2, 31, 0x3c), 15);
+    }
+}
+
+#[cfg(test)]
+mod mem_tests {
+    //! The compare on a model of the memory behind it: two 16-bit channels
+    //! interleaved every 128 bytes, a burst of 16 beats (32 bytes) per
+    //! channel, the even bytes on one DBYTE and the odd bytes on the other,
+    //! the rank in the top bit of the DRAM offset. The stage stores single
+    //! 32-bit words, two beats of a burst: with the controller's data mask
+    //! on that is a masked write (DMI high on the fourteen other beats),
+    //! with it off a read-modify-write of the whole burst (DMI unused).
+    extern crate std;
+    use super::*;
+    use std::collections::BTreeMap;
+
+    const DRAM_BASE: usize = 0x4000_0000;
+    /// The stage's probe blocks on a part with the rank in DRAM offset bit
+    /// 31: all sixteen in rank 0.
+    const PROBE: [usize; BLOCKS] = probe(0xbf00_0000);
+    /// The same with the upper eight in rank 1.
+    const PROBE_R1: [usize; BLOCKS] = probe(0xc010_0000);
+    const fn probe(upper: usize) -> [usize; BLOCKS] {
+        let off = [0usize, 0x80, 0x100, 0x200, 0x400, 0x800, 0x1000, 0x2000];
+        let mut p = [0usize; BLOCKS];
+        let mut i = 0;
+        while i < 8 {
+            p[i] = 0x4010_0000 + off[i];
+            p[i + 8] = upper + off[i];
+            i += 1;
+        }
+        p
+    }
+    /// Memory DQ of each PHY lane, per DBYTE (a board's lane swap).
+    const LANE_DQ: [[u8; 8]; DBYTES] = [
+        [4, 3, 5, 7, 0, 1, 6, 2],
+        [3, 2, 1, 0, 5, 7, 6, 4],
+        [1, 4, 5, 2, 7, 6, 0, 3],
+        [6, 7, 3, 0, 4, 5, 1, 2],
+    ];
+    /// Window centre of each lane against its DBYTE's base (lane 8: DMI),
+    /// and the half width: every lane passes 43 values.
+    const SKEW: [i16; LANES] = [0, 7, 3, -6, 9, 5, -8, 2, 11];
+    const BASE: [u16; DBYTES] = [0xdb, 0xb0, 0xef, 0xce];
+    const HALF: i32 = 22;
+
+    struct Mem {
+        dq: [[[u16; 2]; LANES]; DBYTES],
+        centre: [[[u16; 2]; LANES]; DBYTES],
+        /// The controller's data mask (see the module text).
+        dm: bool,
+        probe: [usize; BLOCKS],
+        cells: BTreeMap<usize, u8>,
+    }
+
+    /// The fold bits of DBYTE `db` lane `lane` in this model.
+    fn bits(db: usize, lane: usize) -> u32 {
+        0x0001_0001 << (8 * (db % 2) + LANE_DQ[db][lane] as usize)
+    }
+
+    impl Mem {
+        fn new(dm: bool, probe: [usize; BLOCKS]) -> Mem {
+            let mut centre = [[[0u16; 2]; LANES]; DBYTES];
+            for db in 0..DBYTES {
+                for lane in 0..LANES {
+                    for tg in 0..2 {
+                        centre[db][lane][tg] =
+                            (BASE[db] as i16 + SKEW[lane] - 3 * tg as i16) as u16;
+                    }
+                }
+            }
+            Mem {
+                dq: [[[0x20; 2]; LANES]; DBYTES],
+                centre,
+                dm,
+                probe,
+                cells: BTreeMap::new(),
+            }
+        }
+        /// Whole beats the lane's data arrives late, or None outside
+        /// every window.
+        fn shift(&self, db: usize, lane: usize, tg: usize) -> Option<i32> {
+            let d = self.dq[db][lane][tg] as i32 - self.centre[db][lane][tg] as i32;
+            let s = (d + UI as i32 / 2).div_euclid(UI as i32);
+            ((d - s * UI as i32).abs() < HALF).then_some(s)
+        }
+        /// A 32-bit store: beats `k` and `k + 1` of its burst.
+        fn store(&mut self, addr: usize, w: u32) {
+            let tg = (addr - DRAM_BASE) >> 31;
+            let ch = (addr >> 7) & 1;
+            let burst = addr & !31;
+            let k = ((addr & 31) / 2) as i32;
+            for i in 0..2 {
+                let db = 2 * ch + i;
+                let old: [u8; 16] =
+                    core::array::from_fn(|n| *self.cells.get(&(burst + 2 * n + i)).unwrap_or(&0));
+                // What the controller drives on beat `m`: the word's two
+                // bytes; on the other beats ones (masked write) or the
+                // data it read first (read-modify-write).
+                let dq = |m: i32| -> u8 {
+                    if m == k {
+                        (w >> (8 * i)) as u8
+                    } else if m == k + 1 {
+                        (w >> (8 * i + 16)) as u8
+                    } else if !self.dm && (0..16).contains(&m) {
+                        old[m as usize]
+                    } else {
+                        0xff
+                    }
+                };
+                let dmi = |m: i32| (0..16).contains(&m) && m != k && m != k + 1;
+                let st: [Option<i32>; LANES] = core::array::from_fn(|l| self.shift(db, l, tg));
+                for n in 0..16i32 {
+                    let masked = self.dm
+                        && match st[DMI_LANE] {
+                            Some(s) => dmi(n - s),
+                            None => !dmi(n),
+                        };
+                    if masked {
+                        continue;
+                    }
+                    let mut v = 0u8;
+                    for (lane, s) in st.iter().take(DMI_LANE).enumerate() {
+                        let bit = LANE_DQ[db][lane];
+                        let b = match s {
+                            Some(s) => dq(n - s) >> bit & 1,
+                            None => !(dq(n) >> bit) & 1,
+                        };
+                        v |= b << bit;
+                    }
+                    self.cells.insert(burst + 2 * n as usize + i, v);
+                }
+            }
+        }
+        fn load(&self, addr: usize) -> u32 {
+            (0..4).fold(0, |w, i| {
+                w | (*self.cells.get(&(addr + i)).unwrap_or(&0) as u32) << (8 * i)
+            })
+        }
+        /// A clean start as the stage makes it: blind start, blind centre.
+        fn blind(dm: bool, probe: [usize; BLOCKS], seed: &mut u32) -> Mem {
+            let mut s = Mem::new(dm, probe);
+            let (v, left) = blind_baseline(&mut s, seed).unwrap();
+            assert_eq!(left, 0, "blind start {v:x?}");
+            let (c, run, left) = blind_center(&mut s, v, seed).unwrap();
+            assert_eq!(left, 0, "blind centre {c:x?} runs {run:x?}");
+            s
+        }
+    }
+
+    impl WritePort for Mem {
+        type Error = ();
+        fn set_tx_dq(&mut self, db: usize, lane: usize, tg: usize, v: u16) -> Result<(), ()> {
+            assert!(v <= TX_DQ_MAX);
+            self.dq[db][lane][tg] = v;
+            Ok(())
+        }
+        fn tx_dq(&mut self, db: usize, lane: usize, tg: usize) -> Result<u16, ()> {
+            Ok(self.dq[db][lane][tg])
+        }
+        /// The stage's compare: every block stored word by word, then read.
+        fn check(&mut self, seed: u32) -> Result<Folds, ()> {
+            let probe = self.probe;
+            for &b in probe.iter() {
+                for a in (b..b + 128).step_by(4) {
+                    self.store(a, pattern(a, seed));
+                }
+            }
+            let mut f = [0u32; BLOCKS];
+            for (k, &b) in probe.iter().enumerate() {
+                for a in (b..b + 128).step_by(4) {
+                    f[k] |= self.load(a) ^ pattern(a, seed);
+                }
+            }
+            Ok(f)
+        }
+    }
+
+    /// The rule [`Map::check`] replaces: DMI judged as a ninth data lane.
+    /// Returns what `WrError::LaneOverlap` carried then (db, lane, other
+    /// db).
+    fn former_rule(m: &Map) -> Option<(usize, usize, usize)> {
+        for db in 0..DBYTES {
+            for lane in 0..DMI_LANE {
+                for other in 0..DBYTES {
+                    for ol in 0..LANES {
+                        if (other, ol) == (db, lane) {
+                            continue;
+                        }
+                        let shared_block = (0..BLOCKS).any(|b| {
+                            m.block_dbs[b] & (1 << db) != 0 && m.block_dbs[b] & (1 << other) != 0
+                        });
+                        if shared_block && m.lane_bits[db][lane] & m.lane_bits[other][ol] != 0 {
+                            return Some((db, lane, other));
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn masked_stores_put_the_dmi_lane_on_its_dbytes_bits() {
+        let mut seed = 0x5eed_0001;
+        let mut s = Mem::blind(true, PROBE, &mut seed);
+        let start = s.dq;
+        let m = measure(&mut s, &mut seed).unwrap();
+        assert_eq!(s.dq, start, "every lane went back");
+        // Bit 7 of the address is the channel; no block is in rank 1.
+        assert_eq!(
+            m.block_dbs,
+            [3, 0xc, 3, 3, 3, 3, 3, 3, 3, 0xc, 3, 3, 3, 3, 3, 3]
+        );
+        assert_eq!(m.block_tg, [Some(0); BLOCKS]);
+        assert_eq!(m.block_both, 0);
+        for db in 0..DBYTES {
+            for lane in 0..DMI_LANE {
+                assert_eq!(m.lane_bits[db][lane], bits(db, lane), "db {db} lane {lane}");
+            }
+            // DMI a UI late: the first beat of every word is masked.
+            assert_eq!(m.lane_bits[db][DMI_LANE], 0xff << (8 * (db % 2)), "db {db}");
+            assert!(m.reachable(db, 0) && !m.reachable(db, 1));
+        }
+        // What every board run printed: the first DQ lane of the first
+        // DBYTE against that DBYTE's DMI lane.
+        assert_ne!(m.lane_bits[0][0] & m.lane_bits[0][DMI_LANE], 0);
+        assert_eq!(former_rule(&m), Some((0, 0, 0)));
+        assert_eq!(m.check::<()>(), Ok(()));
+    }
+
+    #[test]
+    fn without_the_data_mask_the_dmi_lane_is_not_seen() {
+        let mut seed = 0x5eed_0001;
+        let mut s = Mem::blind(false, PROBE, &mut seed);
+        let m = measure(&mut s, &mut seed).unwrap();
+        for db in 0..DBYTES {
+            for lane in 0..DMI_LANE {
+                assert_eq!(m.lane_bits[db][lane], bits(db, lane), "db {db} lane {lane}");
+            }
+            assert!(!m.seen(db, DMI_LANE));
+        }
+        assert_eq!(former_rule(&m), None);
+        assert_eq!(m.check::<()>(), Ok(()));
+    }
+
+    #[test]
+    fn every_lane_gets_its_own_centre_on_masked_stores() {
+        let mut seed = 0x5eed_0001;
+        let mut s = Mem::blind(true, PROBE_R1, &mut seed);
+        let m = discover(&mut s, &mut seed).unwrap();
+        assert_eq!(m.block_tg[..8], [Some(0); 8]);
+        assert_eq!(m.block_tg[8..], [Some(1); 8]);
+        for tg in 0..2 {
+            let r = centre(&mut s, &m, tg, true, &mut seed).unwrap();
+            assert_eq!(r.centred.count_ones(), 36);
+            for db in 0..DBYTES {
+                for lane in 0..LANES {
+                    let want = s.centre[db][lane][tg];
+                    assert_eq!(r.applied[db][lane], want, "tg {tg} db {db} lane {lane}");
+                    assert_eq!(s.dq[db][lane][tg], want);
+                    assert_eq!(r.fine[db][lane].width(), Some(2 * HALF as u16 - 1));
+                }
+                // The DMI lane is measured, not the median of the DQ lanes.
+                let mut c: [u16; DMI_LANE] = core::array::from_fn(|l| r.applied[db][l]);
+                c.sort_unstable();
+                assert!(r.applied[db][DMI_LANE] > (c[3] + c[4]) / 2 + 5);
+            }
+        }
+        assert_eq!(error_bits(&mut s, &mut seed), Ok(0));
+    }
+
+    #[test]
+    fn a_rank_out_of_the_blocks_reach_keeps_its_delays() {
+        let mut seed = 0x5eed_0001;
+        let mut s = Mem::blind(true, PROBE, &mut seed);
+        let m = discover(&mut s, &mut seed).unwrap();
+        let start = s.dq;
+        let r = centre(&mut s, &m, 1, true, &mut seed).unwrap();
+        assert_eq!(r.centred, 0);
+        assert!(r.fine.iter().flatten().all(|f| *f == LaneFit::Unmeasured));
+        assert_eq!(s.dq, start);
+        let r = centre(&mut s, &m, 0, true, &mut seed).unwrap();
+        assert_eq!(r.centred.count_ones(), 36);
+        assert_eq!(
+            s.dq.map(|l| l.map(|t| t[1])),
+            start.map(|l| l.map(|t| t[1]))
+        );
+    }
+
+    #[test]
+    fn without_the_data_mask_the_dmi_lane_gets_the_median() {
+        let mut seed = 0x5eed_0001;
+        let mut s = Mem::blind(false, PROBE, &mut seed);
+        let m = discover(&mut s, &mut seed).unwrap();
+        let r = centre(&mut s, &m, 0, true, &mut seed).unwrap();
+        for db in 0..DBYTES {
+            let mut c = [0u16; DMI_LANE];
+            for lane in 0..DMI_LANE {
+                assert_eq!(r.applied[db][lane], s.centre[db][lane][0]);
+                c[lane] = r.applied[db][lane];
+            }
+            c.sort_unstable();
+            assert_eq!(r.applied[db][DMI_LANE], (c[3] + c[4]) / 2);
+            assert_eq!(r.fine[db][DMI_LANE].width(), Some(0));
+        }
+        assert_eq!(error_bits(&mut s, &mut seed), Ok(0));
+    }
+
+    #[test]
+    fn a_dmi_lane_without_a_window_keeps_its_delay() {
+        let mut seed = 0x5eed_0001;
+        let mut s = Mem::blind(true, PROBE, &mut seed);
+        let m = discover(&mut s, &mut seed).unwrap();
+        let start = s.dq;
+        // The map of a compare without the mask on DBYTE 2, with the mask
+        // in use: its DMI lane is swept with the DQ lanes (coarse), held
+        // (fine), never measured, and set to the median.
+        let mut blind = m;
+        blind.lane_bits[2][DMI_LANE] = 0;
+        let r = centre(&mut s, &blind, 0, true, &mut seed).unwrap();
+        assert_eq!(r.fine[2][DMI_LANE].width(), Some(0));
+        assert_eq!(r.fine[1][DMI_LANE].width(), Some(2 * HALF as u16 - 1));
+        // A DMI window that ends outside the sweep is not a centre: the
+        // lane stays where it was before the stage.
+        for (db, lanes) in start.iter().enumerate() {
+            for (lane, v) in lanes.iter().enumerate() {
+                s.dq[db][lane][0] = v[0];
+            }
+        }
+        s.centre[3][DMI_LANE][0] = start[3][DMI_LANE][0];
+        let mut port = Wide(s);
+        let r = centre(&mut port, &m, 0, true, &mut seed).unwrap();
+        assert!(matches!(r.fine[3][DMI_LANE], LaneFit::AtEdge { .. }));
+        assert_eq!(r.applied[3][DMI_LANE], start[3][DMI_LANE][0]);
+        assert_eq!(r.centred.count_ones(), 35);
+    }
+
+    /// A port whose DBYTE 3 DMI lane never fails (a window wider than
+    /// [`DMI_SPAN`] can show).
+    struct Wide(Mem);
+    impl WritePort for Wide {
+        type Error = ();
+        fn set_tx_dq(&mut self, db: usize, lane: usize, tg: usize, v: u16) -> Result<(), ()> {
+            if (db, lane) != (3, DMI_LANE) {
+                self.0.set_tx_dq(db, lane, tg, v)?;
+            }
+            Ok(())
+        }
+        fn tx_dq(&mut self, db: usize, lane: usize, tg: usize) -> Result<u16, ()> {
+            self.0.tx_dq(db, lane, tg)
+        }
+        fn check(&mut self, seed: u32) -> Result<Folds, ()> {
+            self.0.check(seed)
+        }
     }
 }
