@@ -392,7 +392,7 @@ fn wck_level(p: &mut Para) {
                     blobless::ACSM_PULSE_ADJUST
                 );
             }
-            let applied = read_training(bases);
+            let applied = read_training_staged(bases);
             if let Some((_, after)) = blobless::RD_FSPWR() {
                 let f = blobless::mr16_all(&mut Bt0Hw, after);
                 println!("[dram] RD: MR16 {after:02x} to all ranks after the read training: failure {f:?}");
@@ -407,7 +407,7 @@ fn wck_level(p: &mut Para) {
                     stage_pstate()
                 );
                 if r.is_ok() {
-                    let clean = super::wrstage::run();
+                    let clean = mission_stages();
                     #[cfg(dram_mission)]
                     // SAFETY: bt0 is single-threaded.
                     unsafe {
@@ -746,7 +746,7 @@ fn read_enable(bases: [Option<cubie_a7a_dram::phy::wcklevel::Mr18Base>; 4]) {
 /// `,<start>,<step>,<n>[,<dacs>]` in hex. Unset: no sweep (the default).
 #[cfg(all(not(feature = "wck-alias-probe"), not(feature = "rd-measure")))]
 const RD_VREF: Option<cubie_a7a_dram::rdvref::VrefPlan> =
-    match cubie_a7a_dram::rdvref::VrefPlan::parse(crate::knob!("A7A_RD_VREF")) {
+    match RdVrefKnob::parse(crate::knob!("A7A_RD_VREF")) {
         Ok(p) => p,
         Err(()) => panic!("A7A_RD_VREF: measure|apply[,start,step,n[,dacs]] (hex)"),
     };
@@ -1119,7 +1119,7 @@ fn handover_stage(p: &cubie_a7a_dram::Para) {
 #[cfg(not(feature = "wck-alias-probe"))]
 #[inline(never)]
 fn end_of_init(p: &mut Para) -> blobless::EndInitReport {
-    let e = blobless::end_of_init(&mut Bt0Hw, p, stage_pstate());
+    let e = end_of_init_staged(&mut Bt0Hw, p, stage_pstate());
     println!(
         "[dram] end of init: {} launches, {} writes, max {} us, {} us, failure {:?}",
         e.launches, e.writes, e.max_launch_us, e.elapsed_us, e.failure
@@ -1260,7 +1260,7 @@ pub fn init_one(para: &[u32; 32]) -> Option<u32> {
                     && m2 == cubie_a7a_dram::phy::coldinit::Mrs2::ORACLE_PSTATE1_CXMT_4G
             );
                 let mut t = blobless::CaTrainReport::EMPTY;
-                blobless::cold_init_ca_train(&mut Bt0Hw, &m1, &m2, &mut t);
+                ca_train_staged(&mut Bt0Hw, &m1, &m2, &mut t);
                 let e = &t.exec;
                 println!(
                 "[dram] blobless: CA train: {} blocks, {} launches ({} witnessed, max {} busy polls), {} us, failure {:?}",
@@ -1405,7 +1405,7 @@ fn acsm_reset_probe() -> ! {
 /// `A7A_DCA_VIS` (hex RxFifoVisibility for the MRR contents, default
 /// fffc), `A7A_DCA_MRL=trace` (the reference's read latency during the stage),
 /// `A7A_DCA_ITER` (sweeps, 1-9), `A7A_DCA_SINGLE_FLIP=1`.
-#[cfg(feature = "hybrid")]
+#[cfg(all(feature = "hybrid", not(feature = "full-speed")))]
 const DCA_MODE: Option<cubie_a7a_dram::dca::Mode> = match crate::knob!("A7A_DCA") {
     None => None,
     Some(s) => match cubie_a7a_dram::dca::Mode::parse(s) {
@@ -1414,7 +1414,7 @@ const DCA_MODE: Option<cubie_a7a_dram::dca::Mode> = match crate::knob!("A7A_DCA"
     },
 };
 
-#[cfg(feature = "hybrid")]
+#[cfg(all(feature = "hybrid", not(feature = "full-speed")))]
 const fn hex_knob(s: Option<&str>, default: u32, max: u32, what: &str) -> u32 {
     let Some(s) = s else {
         return default;
@@ -1425,7 +1425,7 @@ const fn hex_knob(s: Option<&str>, default: u32, max: u32, what: &str) -> u32 {
     }
 }
 
-#[cfg(feature = "hybrid")]
+#[cfg(all(feature = "hybrid", not(feature = "full-speed")))]
 const DCA_CONFIG: cubie_a7a_dram::dca::Config = {
     use cubie_a7a_dram::dca::{Config, DcaPolicy, Mode, VIS_TRACE};
     let mr16_default = if crate::knob!("A7A_HYBRID_ENDINIT").is_some() {
@@ -1470,14 +1470,14 @@ const DCA_CONFIG: cubie_a7a_dram::dca::Config = {
     }
 };
 
-#[cfg(feature = "hybrid")]
+#[cfg(all(feature = "hybrid", not(feature = "full-speed")))]
 static mut DCA_BLOCK: cubie_a7a_dram::dca::DcaBlock = cubie_a7a_dram::dca::DcaBlock::empty(
     cubie_a7a_dram::phy::wcklevel::Channel::A,
     cubie_a7a_dram::phy::wcklevel::Rank::R0,
 );
 
 /// The DCA stage on the four blocks, printed (`DCA ...` lines).
-#[cfg(feature = "hybrid")]
+#[cfg(all(feature = "hybrid", not(feature = "full-speed")))]
 #[inline(never)]
 fn dca_stage() {
     use cubie_a7a_dram::dca::{self, MRR_FOUND, MRR_OPERATING};
@@ -1679,4 +1679,375 @@ pub fn hybrid_after_pmu(p: &mut Para) -> ! {
 #[cfg(dram_blobfree)]
 pub fn run_mhz(para: &[u32; 32]) -> u32 {
     Para::from_sysconfig(para).pstate_mhz(stage_pstate() as usize)
+}
+
+// The full-speed lab stages of the blob-free flow (feature `full-speed`;
+// below the code, so that no line of it moves). The flow above uses five
+// names: without the feature each is another name of what the flow used
+// before (the read training, the write stage, command bus training, the
+// end of initialization, the parser of `A7A_RD_VREF`), so an image built
+// without the feature is the image from before these stages existed;
+// with it each is that function plus the stage its build knob selects.
+// Without the feature the stages' knobs (`A7A_DCA` outside the hybrid,
+// `A7A_DCA_CTL`, `A7A_CA_VREF`) are not read at all.
+#[cfg(all(
+    not(feature = "full-speed"),
+    any(dram_mission, feature = "hybrid"),
+    not(feature = "wck-alias-probe"),
+    not(feature = "rd-measure")
+))]
+use super::wrstage::run as mission_stages;
+#[cfg(all(not(feature = "full-speed"), not(feature = "wck-alias-probe")))]
+use cubie_a7a_dram::blobless::cold_init_ca_train as ca_train_staged;
+#[cfg(all(not(feature = "full-speed"), not(feature = "wck-alias-probe")))]
+use cubie_a7a_dram::blobless::end_of_init as end_of_init_staged;
+#[cfg(all(
+    not(feature = "full-speed"),
+    not(feature = "wck-alias-probe"),
+    not(feature = "rd-measure")
+))]
+use cubie_a7a_dram::rdvref::VrefPlan as RdVrefKnob;
+#[cfg(all(
+    not(feature = "full-speed"),
+    not(feature = "wck-alias-probe"),
+    not(feature = "rd-measure")
+))]
+use read_training as read_training_staged;
+
+#[cfg(all(feature = "full-speed", not(feature = "wck-alias-probe")))]
+use cubie_a7a_dram::blobless::cavref::{
+    ca_train as ca_train_staged, end_of_init as end_of_init_staged,
+};
+#[cfg(all(
+    feature = "full-speed",
+    not(feature = "wck-alias-probe"),
+    not(feature = "rd-measure")
+))]
+use cubie_a7a_dram::rdvref::EyeKnob as RdVrefKnob;
+
+/// `A7A_DCA` with feature `full-speed` (FEL lab): the WCK duty-cycle stage
+/// through the PHY's ACSM (crate module `dca`) with the located read-out:
+/// `mrr`, `dcm`, `measure` or `apply`. Unset: no stage (the default). With
+/// feature `hybrid` it runs right after the PMU's training, before
+/// anything else of ours; in the blob-free flow it runs after the read
+/// training ([`dca_after_read_training`]: it reads mode registers, which
+/// needs a trained read path). Companions: `A7A_DCA_MR16` (hex, MR16 as
+/// the DRAM has it at that point; default: hybrid 04, the PMU's end
+/// state, or the end of initialization's switch value when
+/// `A7A_HYBRID_ENDINIT` ran; blob-free the read training's window value,
+/// `A7A_RD_FSPWR`'s first, else the end of initialization's switch
+/// value), `A7A_DCA_VIS` (hex: the first read-out form, that
+/// RxFifoVisibility value for every lane, instead of the located
+/// read-out), `A7A_DCA_MRL=trace` (the reference's read latency during
+/// the stage), `A7A_DCA_ITER` (sweeps, 1-9),
+/// `A7A_DCA_SINGLE_FLIP=1`, `A7A_DCA_TIMED=1` (the monitor's waits timed).
+#[cfg(all(feature = "full-speed", any(feature = "hybrid", dram_mission)))]
+const DCA_MODE: Option<cubie_a7a_dram::dca::Mode> = match crate::knob!("A7A_DCA") {
+    None => None,
+    Some(s) => match cubie_a7a_dram::dca::Mode::parse(s) {
+        Some(m) => Some(m),
+        None => panic!("A7A_DCA must be mrr, dcm, measure or apply"),
+    },
+};
+
+#[cfg(all(feature = "full-speed", any(feature = "hybrid", dram_mission)))]
+const fn hex_knob(s: Option<&str>, default: u32, max: u32, what: &str) -> u32 {
+    let Some(s) = s else {
+        return default;
+    };
+    match u32::from_str_radix(s, 16) {
+        Ok(v) if v <= max => v,
+        _ => panic!("{}", what),
+    }
+}
+
+/// MR16 as the DRAM has it when the DCA stage runs, unless `A7A_DCA_MR16`
+/// says otherwise (see [`DCA_MODE`]).
+#[cfg(all(feature = "full-speed", feature = "hybrid"))]
+const DCA_MR16_DEFAULT: u32 = if crate::knob!("A7A_HYBRID_ENDINIT").is_some() {
+    blobless::END_OF_INIT_VARIANT.mr16_switch as u32
+} else {
+    0x04
+};
+#[cfg(all(dram_mission, feature = "full-speed", not(feature = "hybrid")))]
+const DCA_MR16_DEFAULT: u32 = match crate::knob!("A7A_RD_FSPWR") {
+    Some(s) => match blobless::hex_pair(s) {
+        Some((before, _)) => before as u32,
+        None => panic!("A7A_RD_FSPWR is two hex bytes: before,after"),
+    },
+    None => blobless::END_OF_INIT_VARIANT.mr16_switch as u32,
+};
+
+#[cfg(all(feature = "full-speed", any(feature = "hybrid", dram_mission)))]
+const DCA_CONFIG: cubie_a7a_dram::dca::Config = {
+    use cubie_a7a_dram::dca::{Config, DcaPolicy, Mode, Readout};
+    Config {
+        mode: match DCA_MODE {
+            Some(m) => m,
+            None => Mode::Mrr,
+        },
+        // The build's pstate (a const; the DCA stage is not a lab knob).
+        pstate: stage_pstate_build(),
+        mr16_found: hex_knob(
+            crate::knob!("A7A_DCA_MR16"),
+            DCA_MR16_DEFAULT,
+            0xff,
+            "A7A_DCA_MR16: hex byte",
+        ) as u8,
+        readout: match crate::knob!("A7A_DCA_VIS") {
+            Some(s) => {
+                Readout::Fixed(hex_knob(Some(s), 0, 0xffff, "A7A_DCA_VIS: hex halfword") as u16)
+            }
+            None => Readout::Located,
+        },
+        trace_mrl: match crate::knob!("A7A_DCA_MRL") {
+            None => false,
+            Some(s) if s.len() == 5 && s.as_bytes()[0] == b't' => true,
+            Some(_) => panic!("A7A_DCA_MRL must be trace"),
+        },
+        iterations: hex_knob(crate::knob!("A7A_DCA_ITER"), 1, 9, "A7A_DCA_ITER: 1-9") as u8,
+        policy: DcaPolicy {
+            single_flip: crate::knob!("A7A_DCA_SINGLE_FLIP").is_some(),
+            ..DcaPolicy::DEFAULT
+        },
+        timed_waits: crate::knob!("A7A_DCA_TIMED").is_some(),
+        ..Config::DEFAULT
+    }
+};
+
+#[cfg(all(feature = "full-speed", any(feature = "hybrid", dram_mission)))]
+static mut DCA_BLOCK: cubie_a7a_dram::dca::DcaBlock = cubie_a7a_dram::dca::DcaBlock::empty(
+    cubie_a7a_dram::phy::wcklevel::Channel::A,
+    cubie_a7a_dram::phy::wcklevel::Rank::R0,
+);
+
+/// The DCA stage on the four blocks, printed (`DCA ...` lines). Returns
+/// how many blocks left another MR30 than they found.
+#[cfg(all(feature = "full-speed", any(feature = "hybrid", dram_mission)))]
+#[inline(never)]
+fn dca_stage() -> u32 {
+    use cubie_a7a_dram::dca;
+    let cfg = DCA_CONFIG;
+    println!("[dram] DCA: {cfg:x?}");
+    // SAFETY: bt0 is single-threaded and nothing else refers to it.
+    let b = unsafe { &mut *core::ptr::addr_of_mut!(DCA_BLOCK) };
+    let mut changed = 0;
+    for &(ch, rank) in dca::BLOCKS.iter() {
+        crate::recovery::kick();
+        b.channel = ch;
+        b.rank = rank;
+        dca::run_block(&mut Bt0Hw, b, &cfg);
+        dca::log_block(&mut Bt0Hw, b);
+        changed += dca::changed(b) as u32;
+    }
+    changed
+}
+
+/// The read training, then, in the blob-free flow with `A7A_DCA`, the WCK
+/// duty-cycle stage ([`dca_after_read_training`]). Without the knob: the
+/// read training.
+#[cfg(all(
+    feature = "full-speed",
+    not(feature = "wck-alias-probe"),
+    not(feature = "rd-measure")
+))]
+#[inline(always)]
+fn read_training_staged(bases: [Option<cubie_a7a_dram::phy::wcklevel::Mr18Base>; 4]) -> bool {
+    let applied = read_training(bases);
+    #[cfg(all(dram_mission, not(feature = "hybrid")))]
+    if applied && DCA_MODE.is_some() {
+        return dca_after_read_training(bases);
+    }
+    applied
+}
+
+/// `A7A_DCA` in the blob-free flow: the DCA stage through the PHY's ACSM
+/// in the PHY's training mode, after the applied read training (its
+/// mode-register reads go through the trained read path) and inside the
+/// read training's MR16 window (`A7A_RD_FSPWR`: FSP-WR on the operating
+/// set). When a block left another MR30 than it found, the WCK duty has
+/// changed under the leveling and the read path trained before it: WCK2CK
+/// leveling runs again on every block (with MR16 as outside the window,
+/// where leveling must run), then the read training again; its result is
+/// this function's. Nothing changed: the first training stands.
+#[cfg(all(
+    dram_mission,
+    feature = "full-speed",
+    not(feature = "hybrid"),
+    not(feature = "wck-alias-probe"),
+    not(feature = "rd-measure")
+))]
+#[inline(never)]
+fn dca_after_read_training(bases: [Option<cubie_a7a_dram::phy::wcklevel::Mr18Base>; 4]) -> bool {
+    println!("[dram] DCA: WCK duty-cycle stage after the read training, PHY training mode");
+    let changed = dca_stage();
+    if changed == 0 {
+        println!("[dram] DCA: MR30 as found on every block; leveling and read training stand");
+        return true;
+    }
+    println!(
+        "[dram] DCA: MR30 changed on {changed} block(s): WCK2CK leveling and the read training again"
+    );
+    let window = blobless::RD_FSPWR();
+    if let Some((_, after)) = window {
+        let f = blobless::mr16_all(&mut Bt0Hw, after);
+        println!("[dram] DCA: MR16 {after:02x} to all ranks before the leveling: failure {f:?}");
+    }
+    let leveled = relevel(bases);
+    if let Some((before, _)) = window {
+        let f = blobless::mr16_all(&mut Bt0Hw, before);
+        println!(
+            "[dram] DCA: MR16 {before:02x} to all ranks before the read training: failure {f:?}"
+        );
+    }
+    if !leveled {
+        println!("[dram] DCA: leveling after the change failed; no read training");
+        return false;
+    }
+    read_training(bases)
+}
+
+/// WCK2CK leveling of every block once more (after a WCK duty change),
+/// with the result lines only: per block the TxWckDly it found (the first
+/// leveling's) and the one it leaves. False: a block failed or a lane map
+/// did not go back.
+#[cfg(all(
+    dram_mission,
+    feature = "full-speed",
+    not(feature = "hybrid"),
+    not(feature = "wck-alias-probe"),
+    not(feature = "rd-measure")
+))]
+#[inline(never)]
+fn relevel(bases: [Option<cubie_a7a_dram::phy::wcklevel::Mr18Base>; 4]) -> bool {
+    use cubie_a7a_dram::phy::wcklevel::{Channel, Rank};
+    use cubie_a7a_dram::wl;
+    let saved = wl::begin(&mut Bt0Hw);
+    // SAFETY: bt0 is single-threaded and nothing else refers to these.
+    let (b, sw) = unsafe {
+        (
+            &mut *core::ptr::addr_of_mut!(WL_BLOCK),
+            &mut *core::ptr::addr_of_mut!(WL_SWEEP),
+        )
+    };
+    let mut ok = true;
+    for (k, &(ch, rank)) in wl::BLOCKS.iter().enumerate() {
+        crate::recovery::kick();
+        let Some(mr18) = bases[k] else {
+            ok = false;
+            break;
+        };
+        b.channel = ch;
+        b.rank = rank;
+        wl::level_block(&mut Bt0Hw, mr18, b, sw);
+        println!(
+            "[dram] WL again ch {} rank {}: TxWckDly per byte before {:04x?} now {:04x?}; results {:?} / {:?}; {} launches, failure {:?}",
+            if ch == Channel::A { "A" } else { "B" },
+            if rank == Rank::R0 { 0 } else { 1 },
+            b.saved_delay,
+            b.final_delay,
+            b.counter[0],
+            b.counter[1],
+            b.launches,
+            b.failure
+        );
+        if b.failure.is_some() {
+            ok = false;
+            break;
+        }
+    }
+    let bad = wl::end(&mut Bt0Hw, &saved);
+    println!("[dram] WL again: lane maps restored, mismatch mask {bad:x}");
+    if blobless::WL_TXWCK_ADD() != 0 {
+        let after = blobless::wl_txwck_add(&mut Bt0Hw);
+        println!(
+            "[dram] WL again: TxWckDly +{:x} (held update): Tg0 per DBYTE {after:03x?}",
+            blobless::WL_TXWCK_ADD()
+        );
+    }
+    ok && bad == 0
+}
+
+/// `A7A_DCA_CTL=measure|apply` (FEL lab, feature `full-speed`): the WCK
+/// duty-cycle stage through the controller, in mission mode, right after
+/// the hand-over and before the write stage (crate module `dcactl`;
+/// `apply` changes the duty under the leveling found before it: see
+/// there). Unset: no stage. Companions: `A7A_DCA_MR16` (hex, MR16 as the
+/// hand-over left it; default 04), `A7A_DCA_ITER`, `A7A_DCA_SINGLE_FLIP`.
+#[cfg(all(feature = "full-speed", any(dram_mission, feature = "hybrid")))]
+const DCA_CTL: Option<cubie_a7a_dram::dcactl::Config> = {
+    use cubie_a7a_dram::dcactl::{Config, Mode};
+    match crate::knob!("A7A_DCA_CTL") {
+        None => None,
+        Some(s) => Some(Config {
+            mode: match Mode::parse(s) {
+                Some(m) => m,
+                None => panic!("A7A_DCA_CTL must be measure or apply"),
+            },
+            mr16_found: hex_knob(
+                crate::knob!("A7A_DCA_MR16"),
+                0x04,
+                0xff,
+                "A7A_DCA_MR16: hex byte",
+            ) as u8,
+            iterations: hex_knob(crate::knob!("A7A_DCA_ITER"), 1, 9, "A7A_DCA_ITER: 1-9") as u8,
+            policy: cubie_a7a_dram::dca::DcaPolicy {
+                single_flip: crate::knob!("A7A_DCA_SINGLE_FLIP").is_some(),
+                ..cubie_a7a_dram::dca::DcaPolicy::DEFAULT
+            },
+            ..Config::DEFAULT
+        }),
+    }
+};
+// One MR16 knob serves both routes, and they find different values.
+#[cfg(all(feature = "full-speed", any(dram_mission, feature = "hybrid")))]
+const _: () = assert!(
+    !(DCA_MODE.is_some() && DCA_CTL.is_some() && crate::knob!("A7A_DCA_MR16").is_some()),
+    "A7A_DCA_MR16 with both A7A_DCA and A7A_DCA_CTL: the two stages find different MR16 values"
+);
+
+/// The stages on the mission state after the lean hand-over: with
+/// `A7A_DCA_CTL` the duty-cycle stage through the controller (both
+/// channels, the ranks the controller has), then the write stage, whose
+/// result is this function's. Without the knob: the write stage.
+#[cfg(all(
+    feature = "full-speed",
+    any(dram_mission, feature = "hybrid"),
+    not(feature = "wck-alias-probe"),
+    not(feature = "rd-measure")
+))]
+#[inline(always)]
+fn mission_stages() -> bool {
+    if let Some(cfg) = DCA_CTL {
+        dca_ctl_stage(&cfg);
+    }
+    super::wrstage::run()
+}
+
+#[cfg(all(
+    feature = "full-speed",
+    any(dram_mission, feature = "hybrid"),
+    not(feature = "wck-alias-probe"),
+    not(feature = "rd-measure")
+))]
+#[inline(never)]
+fn dca_ctl_stage(cfg: &cubie_a7a_dram::dcactl::Config) {
+    use cubie_a7a_dram::ctrl::{ddrc, MSTR0};
+    use cubie_a7a_dram::RegIo;
+    let channels = cubie_a7a_dram::wrtrain::DBYTES / 2;
+    // MSTR0.active_ranks: 1 one rank, 3 two.
+    let ranks = if Bt0Hw.read32(ddrc(0, MSTR0)) >> 24 & 2 != 0 {
+        2
+    } else {
+        1
+    };
+    let changed = cubie_a7a_dram::dcactl::run(&mut Bt0Hw, channels, ranks, cfg);
+    println!(
+        "[dram] DCC: done; MR30 changed on {changed} block(s){}",
+        if changed != 0 {
+            "; WCK2CK leveling was not repeated (it cannot run in mission mode)"
+        } else {
+            ""
+        }
+    );
 }

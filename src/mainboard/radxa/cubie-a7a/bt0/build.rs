@@ -192,6 +192,21 @@ fn main() {
     if blobfree || env::var_os("CARGO_FEATURE_BL_MISSION").is_some() {
         println!("cargo:rustc-cfg=dram_mission");
     }
+    // The full-speed lab stages (src/dram/blobless.rs) exist only with
+    // feature `full-speed`; without it their knobs are not read, so a knob
+    // set for such a build is refused here instead of being ignored.
+    // (`A7A_DCA` is also the hybrid's own knob.)
+    let hybrid = env::var_os("CARGO_FEATURE_HYBRID").is_some();
+    for knob in ["A7A_DCA", "A7A_DCA_CTL", "A7A_CA_VREF"] {
+        println!("cargo:rerun-if-env-changed={knob}");
+        let own = knob == "A7A_DCA" && hybrid;
+        if env::var_os("CARGO_FEATURE_FULL_SPEED").is_none() && !own {
+            assert!(
+                env::var_os(knob).is_none(),
+                "{knob} is set, and this build has no such stage: add feature full-speed"
+            );
+        }
+    }
     let fastboot = env::var_os("CARGO_FEATURE_FASTBOOT").is_some();
     let lab = env::var_os("CARGO_FEATURE_DRAM_LAB").is_some();
     let memory = if env::var_os("CARGO_FEATURE_FEL").is_some() {

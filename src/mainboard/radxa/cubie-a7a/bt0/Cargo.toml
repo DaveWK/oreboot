@@ -149,6 +149,18 @@ wr-r1 = ["cubie-a7a-dram/rank-map"]
 # returns their counts, MR4 and the PHY's drift indicators; it compensates
 # nothing. Lab builds only; without it every image is built as before.
 drift-log = ["fel", "cubie-a7a-dram/drift-log"]
+# The full-speed lab stages of the blob-free flow, each selected by its own
+# build knob and off without it (src/dram/blobless.rs, below the code;
+# crate cubie-a7a-dram): `A7A_DCA=mrr|dcm|measure|apply` (the WCK
+# duty-cycle stage after the read training; an applied change levels and
+# trains reads again), `A7A_DCA_CTL=measure|apply` (the same stage through
+# the controller after the hand-over), `A7A_RD_VREF=eye|eye-apply` (the
+# read eye in two dimensions, reference against receive clock, per lane),
+# `A7A_CA_VREF=measure|apply` (the command-bus reference inside command
+# bus training). With the blob-free boot, or with `bl-mission` or
+# `hybrid`. None of the stages has run on a board; without the feature
+# every image is built as before.
+full-speed = ["cubie-a7a-dram/full-speed"]
 # The blobless probe at pstate 3 (the lowest) instead of 1, the
 # timing-independence test of the data-mode compare.
 probe-ps3 = ["blobless"]
