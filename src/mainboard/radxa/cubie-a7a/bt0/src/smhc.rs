@@ -25,8 +25,9 @@
 //! `cubie_a7a_fastboot::sd::ALLOWED` (identification and read commands;
 //! no write, erase, lock, switch or programming command), in every build.
 //! For the eMMC it applies `cubie_a7a_fastboot::emmc::command_allowed`
-//! (index and argument: CMD6 only to PARTITION_ACCESS and BUS_WIDTH); there
-//! is no block write path.
+//! (index and argument: CMD6 only to PARTITION_ACCESS and BUS_WIDTH), and
+//! the block write path (`cmd_write`, CMD24/25 only) exists only in
+//! `fastboot-emmc-write` builds.
 
 use util::mmio::{read32, write32};
 
@@ -70,6 +71,8 @@ const CMD_RESP: u32 = 1 << 6;
 const CMD_LONG_RESP: u32 = 1 << 7;
 const CMD_CHK_CRC: u32 = 1 << 8;
 const CMD_DATA: u32 = 1 << 9;
+#[cfg(feature = "fastboot-emmc-write")]
+const CMD_WRITE: u32 = 1 << 10;
 const CMD_AUTO_STOP: u32 = 1 << 12;
 const CMD_WAIT_PRE_OVER: u32 = 1 << 13;
 const CMD_SEND_INIT_SEQ: u32 = 1 << 15;
@@ -101,6 +104,8 @@ const RINT_ERRORS: u32 = RINT_RESP_ERR
     | RINT_END_BIT_ERR;
 
 const STATUS_FIFO_EMPTY: u32 = 1 << 2;
+#[cfg(feature = "fastboot-emmc-write")]
+const STATUS_FIFO_FULL: u32 = 1 << 3;
 const STATUS_CARD_BUSY: u32 = 1 << 9;
 
 const NTSR_MODE_NEW: u32 = 1 << 31;
@@ -148,9 +153,9 @@ pub struct Smhc {
     detect: bool,
 }
 
-/// The eMMC write commands exist in this build (none yet).
+/// The eMMC write commands exist in this build.
 #[cfg(any(feature = "emmc", feature = "fastboot"))]
-const EMMC_WRITE: bool = false;
+const EMMC_WRITE: bool = cfg!(feature = "fastboot-emmc-write");
 
 /// SDC2 pins on port C, function 3 (SoC pinout): DS PC0, RST PC1, CLK PC5,
 /// CMD PC6, D0 PC10, D1 PC13, D2 PC15, D3 PC8, D4 PC9, D5 PC11, D6 PC14,
@@ -470,6 +475,76 @@ impl Smhc {
     }
 }
 
+impl Smhc {
+    /// A block write (CMD24, CMD25 with auto stop) of `data`, then wait
+    /// until the card releases DAT0: the only path that moves data to a
+    /// card, eMMC only, in `fastboot-emmc-write` builds only.
+    #[cfg(feature = "fastboot-emmc-write")]
+    fn cmd_write(&self, idx: u32, arg: u32, data: &[u32]) -> Result<(), Error> {
+        if !self.emmc
+            || !matches!(idx, 24 | 25)
+            || !cubie_a7a_fastboot::emmc::command_allowed(idx, arg, EMMC_WRITE)
+            || data.is_empty()
+            || !(data.len() * 4).is_multiple_of(BLOCK_SIZE)
+            || (idx == 25) != (data.len() * 4 > BLOCK_SIZE)
+        {
+            return Err(Error::Unsupported("write not allowed"));
+        }
+        let bytes = (data.len() * 4) as u32;
+        let mut c =
+            CMD_START | idx | CMD_RESP | CMD_CHK_CRC | CMD_DATA | CMD_WRITE | CMD_WAIT_PRE_OVER;
+        if idx == 25 {
+            c |= CMD_AUTO_STOP;
+        }
+        self.w(BLKSZ, BLOCK_SIZE as u32);
+        self.w(BYTECNT, bytes);
+        self.w(GCTRL, self.r(GCTRL) | GCTRL_FIFO_AHB);
+        self.w(RINT, 0xffff_ffff);
+        self.w(CMDARG, arg);
+        self.w(CMD, c);
+        let fail = |rint: u32| {
+            self.recover();
+            Error::Cmd { idx, rint }
+        };
+        let t0 = time_us();
+        for &word in data {
+            while self.r(STATUS) & STATUS_FIFO_FULL != 0 {
+                let rint = self.r(RINT);
+                if rint & RINT_ERRORS != 0 {
+                    return Err(fail(rint));
+                }
+                if time_us() - t0 > 2_000_000 {
+                    self.recover();
+                    return Err(Error::Timeout("write fifo"));
+                }
+            }
+            self.w(FIFO, word);
+        }
+        let mut done = RINT_CMD_DONE | RINT_DATA_OVER;
+        if idx == 25 {
+            done |= RINT_AUTO_CMD_DONE;
+        }
+        loop {
+            let rint = self.r(RINT);
+            if rint & RINT_ERRORS != 0 {
+                return Err(fail(rint));
+            }
+            if rint & done == done {
+                break;
+            }
+            if time_us() - t0 > 2_000_000 {
+                self.recover();
+                return Err(Error::Timeout("write"));
+            }
+        }
+        self.wait("card busy after write", 2_000_000, |s| {
+            s.r(STATUS) & STATUS_CARD_BUSY == 0
+        })?;
+        self.w(RINT, 0xffff_ffff);
+        Ok(())
+    }
+}
+
 /// The eMMC controller for cubie_a7a_fastboot::emmc (the eMMC boot path
 /// and fastboot's eMMC targets; the gate in `cmd_data` applies).
 #[cfg(any(feature = "emmc", feature = "fastboot"))]
@@ -538,6 +613,19 @@ impl cubie_a7a_fastboot::emmc::MmcBus for Smhc {
         self.cmd_data(idx, arg, Resp::R1, Some(buf))
             .map(|_| ())
             .map_err(bus_error)
+    }
+
+    #[cfg(feature = "fastboot-emmc-write")]
+    fn write(
+        &mut self,
+        idx: u32,
+        arg: u32,
+        buf: &[u32],
+    ) -> Result<(), cubie_a7a_fastboot::sd::BusError> {
+        self.cmd_write(idx, arg, buf).map_err(|e| {
+            println!("[fastboot] eMMC CMD{idx} {arg:#x}: {e:?}");
+            bus_error(e)
+        })
     }
 
     fn delay_ms(&mut self, ms: u32) {

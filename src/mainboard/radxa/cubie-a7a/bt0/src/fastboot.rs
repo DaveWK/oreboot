@@ -14,6 +14,8 @@
 //! | `reboot-bootloader`, `oem fel` | back to the mask ROM's FEL (DRAM stays up) |
 //! | `oem help/log/read32`       | diagnostics                                   |
 //! | `flash`/`erase`, `oem nor-*`| SPI NOR, only with `fastboot-nor-write`       |
+//! | `fetch:emmc*`, `oem emmc`   | eMMC module, read-only (DRAM extension)       |
+//! | `flash`/`erase:emmc-*`, `oem emmc-arm/bootcfg` | eMMC, only with `fastboot-emmc-write` |
 //!
 //! A bundle is any cut of the boot medium that holds the layout table and
 //! the images it names (cubie_a7a_fastboot::bundle): the image's
@@ -40,10 +42,10 @@ use crate::{soc, Bringup};
 /// bundle's images never land in it (plan::check checks that too).
 pub const BUF: usize = 0x4800_0000;
 pub const BUF_MAX: usize = 0x0800_0000;
-/// Read-back scratch for NOR writes, after the download buffer.
-#[cfg(feature = "fastboot-nor-write")]
+/// Read-back scratch for NOR and eMMC writes, after the download buffer.
+#[cfg(any(feature = "fastboot-nor-write", feature = "fastboot-emmc-write"))]
 const SCRATCH: usize = BUF + BUF_MAX;
-#[cfg(feature = "fastboot-nor-write")]
+#[cfg(any(feature = "fastboot-nor-write", feature = "fastboot-emmc-write"))]
 const SCRATCH_LEN: usize = 0x1_0000;
 
 /// USB sessions (take-over, serve) before bt0 gives up and goes back to FEL.
@@ -118,6 +120,7 @@ const NAMES: &[&str] = &[
     "dram-mhz",
     "usb-speed",
     "nor-writes",
+    "emmc-writes",
     "partition-type:bt0",
     "partition-size:bt0",
     "partition-type:layout",
@@ -137,12 +140,27 @@ const HELP: &[&str] = &[
     "oem nor-id: SPI NOR JEDEC ID and status register 1",
     "oem usb0: open the blue-port USB disk, show it and its GPT",
     "oem sd: identify the SD card",
+    "oem emmc: identify the eMMC (CID, CSD, EXT_CSD fields, GPT)",
     "fetch: nor bt0 layout main edk2 usb0 usb0p<N> sd [@hexoff+hexlen]",
+    "fetch: emmc emmc-boot0 emmc-boot1 emmcp<N> emmc-extcsd [@hexoff+hexlen]",
 ];
+#[cfg(feature = "fastboot-emmc-write")]
+const HELP_EMMC: &[&str] = &[
+    "oem emmc-arm <emmc-fw|emmc-boot0|emmc-boot1|emmc@off+len> flash <len> <crc32> | <t> erase",
+    "oem emmc-arm bootcfg <pc> <bb>; oem emmc-bootcfg <pc> <bb>",
+];
+#[cfg(not(feature = "fastboot-emmc-write"))]
+const HELP_EMMC: &[&str] = &[];
 #[cfg(feature = "fastboot-nor-write")]
 const HELP_NOR: &[&str] = &["oem nor-arm <part> flash <hex len> <hex crc32> | <part> erase"];
 #[cfg(not(feature = "fastboot-nor-write"))]
 const HELP_NOR: &[&str] = &[];
+
+/// A fresh eMMC write guard, built at compile time (no call into the DRAM
+/// extension).
+#[cfg(feature = "fastboot-emmc-write")]
+const EMMC_GUARD: cubie_a7a_fastboot::emmcarm::Guard =
+    cubie_a7a_fastboot::emmcarm::Guard::new(true);
 
 /// The negotiated speed, for `getvar:usb-speed`.
 static HIGH_SPEED: AtomicBool = AtomicBool::new(true);
@@ -154,6 +172,9 @@ struct A7a<'b> {
     nor: Option<crate::spinor::SpiNor>,
     usb: Option<crate::ext::UsbDisk>,
     sd: Option<crate::ext::SdCard>,
+    emmc: Option<crate::ext::Emmc>,
+    #[cfg(feature = "fastboot-emmc-write")]
+    eguard: cubie_a7a_fastboot::emmcarm::Guard,
 }
 
 /// A read-only device behind a fetch target.
@@ -162,6 +183,8 @@ enum Dev {
     Nor,
     Usb,
     Sd,
+    /// Sizes only; eMMC reads go through `ext::emmc_fetch`.
+    Emmc,
 }
 
 fn now_ms() -> u64 {
@@ -258,6 +281,10 @@ impl A7a<'_> {
             let c = self.sd()?;
             return Ok((Dev::Sd, 0, crate::ext::sd_size(c)));
         }
+        if name.starts_with("emmc") {
+            let d = self.emmc()?;
+            return Ok((Dev::Emmc, 0, crate::ext::emmc_size(d, name)?));
+        }
         Err("unknown partition")
     }
 
@@ -287,6 +314,7 @@ impl A7a<'_> {
                 let c = self.sd()?;
                 crate::ext::sd_read(c, start, len as u64, buf)
             }
+            Dev::Emmc => Err("eMMC reads go through emmc_fetch"),
         }
     }
 
@@ -308,6 +336,54 @@ impl A7a<'_> {
         Ok(self.sd.as_mut().unwrap())
     }
 
+    /// The eMMC module, identified on first use (needs the DRAM part).
+    fn emmc(&mut self) -> Result<&mut crate::ext::Emmc, &'static str> {
+        if self.emmc.is_none() {
+            crate::extcheck::ready()?;
+            self.emmc = Some(crate::ext::emmc_open()?);
+        }
+        Ok(self.emmc.as_mut().unwrap())
+    }
+
+    #[cfg(feature = "fastboot-emmc-write")]
+    fn emmc_flash(
+        &mut self,
+        part: &str,
+        image: &[u8],
+        info: &mut dyn Info,
+    ) -> Result<(), &'static str> {
+        // The arm first: no eMMC access unless this exact flash is armed
+        // (the guard lives in the DRAM extension, as the writer).
+        crate::extcheck::ready()?;
+        let t = self.eguard.take(part, Some(image), now_ms())?;
+        let dram_end = self.b.dram_end as u64;
+        let d = self.emmc()?;
+        crate::ext::emmc_flash(d, &t, image, dram_end, scratch_words(), info)
+    }
+
+    #[cfg(feature = "fastboot-emmc-write")]
+    fn emmc_erase(&mut self, part: &str, info: &mut dyn Info) -> Result<(), &'static str> {
+        crate::extcheck::ready()?;
+        let t = self.eguard.take(part, None, now_ms())?;
+        let d = self.emmc()?;
+        crate::ext::emmc_erase(d, &t, scratch_words(), info)
+    }
+
+    #[cfg(not(feature = "fastboot-emmc-write"))]
+    fn emmc_flash(
+        &mut self,
+        _p: &str,
+        _i: &[u8],
+        _info: &mut dyn Info,
+    ) -> Result<(), &'static str> {
+        Err("eMMC writes are not built in (bt0 feature fastboot-emmc-write)")
+    }
+
+    #[cfg(not(feature = "fastboot-emmc-write"))]
+    fn emmc_erase(&mut self, _p: &str, _info: &mut dyn Info) -> Result<(), &'static str> {
+        Err("eMMC writes are not built in (bt0 feature fastboot-emmc-write)")
+    }
+
     /// Stop what fastboot started besides USB0 (before the hand-over or
     /// the return to FEL).
     fn quiesce(&mut self) {
@@ -322,6 +398,12 @@ impl A7a<'_> {
 fn scratch() -> &'static mut [u8] {
     // SAFETY: DRAM after the download buffer, used only here.
     unsafe { core::slice::from_raw_parts_mut(SCRATCH as *mut u8, SCRATCH_LEN) }
+}
+
+#[cfg(feature = "fastboot-emmc-write")]
+fn scratch_words() -> &'static mut [u32] {
+    // SAFETY: DRAM after the download buffer (aligned), used only here.
+    unsafe { core::slice::from_raw_parts_mut(SCRATCH as *mut u32, SCRATCH_LEN / 4) }
 }
 
 /// The layout partition's content check: a valid frame for this board
@@ -375,6 +457,15 @@ impl Device for A7a<'_> {
                     "full"
                 }
             ),
+            "emmc-writes" => write!(
+                out,
+                "{}",
+                if cfg!(feature = "fastboot-emmc-write") {
+                    "built in"
+                } else {
+                    "no"
+                }
+            ),
             "nor-writes" => write!(
                 out,
                 "{}",
@@ -415,10 +506,15 @@ impl Device for A7a<'_> {
 
     fn command(&mut self, c: &Command) {
         self.guard.observe(c);
+        #[cfg(feature = "fastboot-emmc-write")]
+        self.eguard.observe(c);
     }
 
     #[cfg(feature = "fastboot-nor-write")]
     fn flash(&mut self, part: &str, image: &[u8], info: &mut dyn Info) -> Result<(), &'static str> {
+        if part.starts_with("emmc") {
+            return self.emmc_flash(part, image, info);
+        }
         let b = self.b;
         // The arm first: no SPI controller access unless this exact
         // flash is armed (and the arm is used up whatever happens next).
@@ -439,17 +535,18 @@ impl Device for A7a<'_> {
     }
 
     #[cfg(not(feature = "fastboot-nor-write"))]
-    fn flash(
-        &mut self,
-        _part: &str,
-        _image: &[u8],
-        _info: &mut dyn Info,
-    ) -> Result<(), &'static str> {
+    fn flash(&mut self, part: &str, image: &[u8], info: &mut dyn Info) -> Result<(), &'static str> {
+        if part.starts_with("emmc") {
+            return self.emmc_flash(part, image, info);
+        }
         Err("NOR writes are not built in (bt0 feature fastboot-nor-write)")
     }
 
     #[cfg(feature = "fastboot-nor-write")]
     fn erase(&mut self, part: &str, info: &mut dyn Info) -> Result<(), &'static str> {
+        if part.starts_with("emmc") {
+            return self.emmc_erase(part, info);
+        }
         let p = self.guard.take(part, None, now_ms())?;
         let f = self.nor()?;
         nor::erase_partition(f, p, scratch(), info).map_err(|e| {
@@ -459,7 +556,10 @@ impl Device for A7a<'_> {
     }
 
     #[cfg(not(feature = "fastboot-nor-write"))]
-    fn erase(&mut self, _part: &str, _info: &mut dyn Info) -> Result<(), &'static str> {
+    fn erase(&mut self, part: &str, info: &mut dyn Info) -> Result<(), &'static str> {
+        if part.starts_with("emmc") {
+            return self.emmc_erase(part, info);
+        }
         Err("NOR writes are not built in (bt0 feature fastboot-nor-write)")
     }
 
@@ -511,11 +611,18 @@ impl Device for A7a<'_> {
         _info: &mut dyn Info,
     ) -> Result<Range<usize>, &'static str> {
         let (base, window) = fetch::split_window(part)?;
-        let (dev, at, part_size) = self.target(base)?;
         let max = proto::MAX_FETCH.min(buf.len()) as u64;
-        let (start, len) = fetch::resolve(part_size, window, offset, size, max)?;
         let t0 = soc::time_us();
-        let r = self.read(dev, at + start, len, buf)?;
+        let (r, len) = if base.starts_with("emmc") {
+            let d = self.emmc()?;
+            let r = crate::ext::emmc_fetch(d, base, window, offset, size, max, buf)?;
+            let n = r.len() as u64;
+            (r, n)
+        } else {
+            let (dev, at, part_size) = self.target(base)?;
+            let (start, len) = fetch::resolve(part_size, window, offset, size, max)?;
+            (self.read(dev, at + start, len, buf)?, len)
+        };
         let us = (soc::time_us() - t0).max(1);
         if offset == 0 || (offset & 0xfff_ffff) == 0 {
             println!(
@@ -536,7 +643,7 @@ impl Device for A7a<'_> {
         let (cmd, rest) = args.split_once(' ').unwrap_or((args, ""));
         match cmd {
             "help" | "" => {
-                for l in HELP.iter().chain(HELP_NOR) {
+                for l in HELP.iter().chain(HELP_NOR).chain(HELP_EMMC) {
                     info.info(format_args!("{l}"));
                 }
                 Ok(None)
@@ -570,6 +677,30 @@ impl Device for A7a<'_> {
                 let c = self.sd()?;
                 crate::ext::sd_info(c, info);
                 Ok(None)
+            }
+            "emmc" => {
+                // Identify afresh (after a write the GPT may have changed).
+                self.emmc = None;
+                let d = self.emmc()?;
+                crate::ext::emmc_info(d, info);
+                Ok(None)
+            }
+            #[cfg(feature = "fastboot-emmc-write")]
+            "emmc-arm" => {
+                crate::extcheck::ready()?;
+                self.eguard.arm(rest, now_ms())?;
+                println!("[fastboot] eMMC armed: {rest}");
+                info.info(format_args!(
+                    "armed: {rest} (next matching command only, 60 s)"
+                ));
+                Ok(None)
+            }
+            #[cfg(feature = "fastboot-emmc-write")]
+            "emmc-bootcfg" => {
+                crate::extcheck::ready()?;
+                let (pc, bb) = self.eguard.take_boot_config(rest, now_ms())?;
+                let d = self.emmc()?;
+                crate::ext::emmc_boot_config(d, pc, bb, info).map(|()| None)
             }
             #[cfg(feature = "fastboot-nor-write")]
             "nor-arm" => {
@@ -629,6 +760,9 @@ pub fn run(b: &Bringup) -> Back {
             nor: None,
             usb: None,
             sd: None,
+            emmc: None,
+            #[cfg(feature = "fastboot-emmc-write")]
+            eguard: EMMC_GUARD,
         };
         let r = proto::serve(&mut Speed(&mut usb, 0), &mut dev, buf);
         dev.quiesce();

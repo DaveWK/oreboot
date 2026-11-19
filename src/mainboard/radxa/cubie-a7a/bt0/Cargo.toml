@@ -89,6 +89,9 @@ fastboot = ["fel"]
 # length and CRC-32, JEDEC ID, no protection bits, erase/program/read-back
 # inside the partition, never at or above 0x700000). Bench builds only.
 fastboot-nor-write = ["fastboot"]
+# eMMC flash/erase and the boot configuration (PARTITION_CONFIG bits 6:3,
+# BOOT_BUS_CONDITIONS) behind arming and content checks.
+fastboot-emmc-write = ["fastboot"]
 # The blobless probe at pstate 3 (the lowest) instead of 1, the
 # timing-independence test of the data-mode compare.
 probe-ps3 = ["blobless"]

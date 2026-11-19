@@ -1,10 +1,11 @@
 //! The DRAM part of the fastboot bt0 (feature `fastboot`): the block
-//! device dumps (`fetch:usb0`, `usb0p<N>`, `sd`), which do not fit the FEL
+//! device dumps (`fetch:usb0`, `usb0p<N>`, `sd`, `emmc*`) and the guarded
+//! eMMC writer (`fastboot-emmc-write`), which do not fit the FEL
 //! SRAM window beside the DRAM bring-up.
 //!
 //! build.rs links this module, `ehci.rs` and the dump modules of
-//! cubie-a7a-fastboot (`msc`, `gpt`, `usbhost`, `sd`, including the
-//! `SdBus` impl in smhc.rs) into the output section `.dram` at [`BASE`]:
+//! cubie-a7a-fastboot (`msc`, `gpt`, `usbhost`, `sd`, `emmc`, including
+//! the `SdBus` and `MmcBus` impls in smhc.rs) into the output section `.dram` at [`BASE`]:
 //! the same ELF, split by objcopy into `bt0-*.bin` (the SRAM image, as
 //! before) and `bt0-*-ext.bin`. The host writes the extension to [`BASE`]
 //! once DRAM is up (after FEL entry 1) and its length and CRC-32 to the
@@ -19,8 +20,9 @@
 //! unwinds; PREL31 cannot span SRAM to 0x59000000).
 use core::ops::Range;
 
+use cubie_a7a_fastboot::emmcarm::Part;
 use cubie_a7a_fastboot::proto::Info;
-use cubie_a7a_fastboot::{fetch, gpt, msc, sd};
+use cubie_a7a_fastboot::{emmc, fetch, gpt, msc, sd};
 
 use crate::{ehci, smhc, soc};
 
@@ -210,4 +212,269 @@ pub fn sd_info(c: &SdCard, info: &mut dyn Info) {
         "{} blocks, OCR {:08x}",
         c.card.blocks, c.card.ocr
     ));
+}
+
+/// The eMMC module on SMHC2, identified, with its user-area GPT.
+pub struct Emmc {
+    host: smhc::Smhc,
+    card: emmc::Card,
+    ext: [u32; emmc::WORDS],
+    parts: [Option<gpt::Part>; gpt::MAX_PARTS],
+}
+
+const EMMC_WRITE: bool = cfg!(feature = "fastboot-emmc-write");
+
+/// Detect, identify (up to 8-bit, read-only bus test), EXT_CSD, GPT.
+#[inline(never)]
+pub fn emmc_open() -> Result<Emmc, &'static str> {
+    let t0 = soc::time_us();
+    let mut host = smhc::Smhc::new_smhc2(soc::SMHC2_BASE, true);
+    let mut ext = [0u32; emmc::WORDS];
+    let mut card = emmc::Card::identify(&mut host, &mut ext, 8, EMMC_WRITE).map_err(|e| {
+        println!("[fastboot] emmc: {e:?}");
+        e.message()
+    })?;
+    let mut parts = [None; gpt::MAX_PARTS];
+    // SAFETY: DRAM reserved for GPT reads (as usb_open).
+    let g = unsafe { core::slice::from_raw_parts_mut(GPT_BUF as *mut u32, GPT_BUF_LEN / 4) };
+    let note = match card
+        .read(&mut host, Part::User, 1, &mut g[..emmc::WORDS])
+        .map_err(|e| e.message())
+        .and_then(|()| {
+            let h = gpt::header(words_as_bytes(&g[..emmc::WORDS]), card.user_blocks)?;
+            let n = gpt::entries_len(&h).div_ceil(emmc::BLOCK) * emmc::BLOCK;
+            if n > GPT_BUF_LEN {
+                return Err("GPT entry array too large");
+            }
+            card.read(&mut host, Part::User, h.entries_lba, &mut g[..n / 4])
+                .map_err(|e| e.message())?;
+            gpt::parts(&h, words_as_bytes(&g[..n / 4]), card.user_blocks)
+        }) {
+        Ok(p) => {
+            parts = p;
+            "GPT ok"
+        }
+        Err(e) => e,
+    };
+    let f = card.fields;
+    println!(
+        "[fastboot] emmc: CID {:08x}{:08x}{:08x}{:08x}, {} MiB, boot 2 x {} KiB, EXT_CSD rev {}, \
+         PARTITION_CONFIG {:#04x}, BOOT_BUS {:#04x}, {}-bit, {note}, {} ms",
+        card.cid[0],
+        card.cid[1],
+        card.cid[2],
+        card.cid[3],
+        card.user_blocks >> 11,
+        card.boot_blocks / 2,
+        f.rev,
+        f.part_config,
+        f.boot_bus,
+        card.width,
+        (soc::time_us() - t0) / 1000
+    );
+    Ok(Emmc {
+        host,
+        card,
+        ext,
+        parts,
+    })
+}
+
+fn words_as_bytes(w: &[u32]) -> &[u8] {
+    // SAFETY: plain memory, u8 has no alignment.
+    unsafe { core::slice::from_raw_parts(w.as_ptr().cast::<u8>(), w.len() * 4) }
+}
+
+/// Partition and extent of an eMMC fetch target: `emmc` (user area),
+/// `emmc-boot0`/`emmc-boot1` (boot partitions 1/2), `emmcp<N>` (user-area
+/// GPT entry N), `emmc-extcsd` (the 512-byte EXT_CSD).
+fn emmc_extent(d: &Emmc, name: &str) -> Result<(Option<Part>, u64, u64), &'static str> {
+    let b = emmc::BLOCK as u64;
+    match name {
+        "emmc" => Ok((Some(Part::User), 0, d.card.user_blocks * b)),
+        "emmc-boot0" if d.card.boot_blocks > 0 => {
+            Ok((Some(Part::Boot1), 0, d.card.boot_blocks * b))
+        }
+        "emmc-boot1" if d.card.boot_blocks > 0 => {
+            Ok((Some(Part::Boot2), 0, d.card.boot_blocks * b))
+        }
+        "emmc-extcsd" => Ok((None, 0, b)),
+        _ => {
+            let i = name
+                .strip_prefix("emmcp")
+                .and_then(|n| n.parse::<usize>().ok())
+                .ok_or("unknown eMMC partition")?;
+            let p = i
+                .checked_sub(1)
+                .and_then(|i| d.parts.get(i).copied().flatten())
+                .ok_or("no such GPT partition on the eMMC")?;
+            Ok((Some(Part::User), p.first * b, (p.last - p.first + 1) * b))
+        }
+    }
+}
+
+#[inline(never)]
+pub fn emmc_size(d: &Emmc, name: &str) -> Result<u64, &'static str> {
+    emmc_extent(d, name).map(|(_, _, size)| size)
+}
+
+/// `fetch` of an eMMC target (window, offset, size as the other devices).
+#[inline(never)]
+pub fn emmc_fetch(
+    d: &mut Emmc,
+    name: &str,
+    window: fetch::Window,
+    offset: u64,
+    size: Option<u64>,
+    max: u64,
+    buf: &mut [u8],
+) -> Result<Range<usize>, &'static str> {
+    let (part, at, part_size) = emmc_extent(d, name)?;
+    let (start, len) = fetch::resolve(part_size, window, offset, size, max)?;
+    let Some(part) = part else {
+        // EXT_CSD, read fresh.
+        d.card
+            .refresh(&mut d.host, &mut d.ext)
+            .map_err(|e| e.message())?;
+        buf[..len as usize]
+            .copy_from_slice(&words_as_bytes(&d.ext)[start as usize..(start + len) as usize]);
+        return Ok(0..len as usize);
+    };
+    let (lba, count, skip) = fetch::blocks(at + start, len, emmc::BLOCK as u32);
+    let words = count as usize * emmc::WORDS;
+    if words * 4 > buf.len() || !(buf.as_ptr() as usize).is_multiple_of(4) {
+        return Err("fetch too large for the buffer");
+    }
+    // SAFETY: 4-byte aligned (the download buffer), in bounds.
+    let w = unsafe { core::slice::from_raw_parts_mut(buf.as_mut_ptr().cast::<u32>(), words) };
+    d.card.read(&mut d.host, part, lba, w).map_err(|e| {
+        println!("[fastboot] emmc {part:?} read at block {lba}: {e:?}");
+        e.message()
+    })?;
+    Ok(skip..skip + len as usize)
+}
+
+/// `oem emmc`: identity, sizes, the boot-relevant EXT_CSD fields, GPT.
+#[inline(never)]
+pub fn emmc_info(d: &Emmc, info: &mut dyn Info) {
+    let c = &d.card;
+    let f = &c.fields;
+    info.info(format_args!(
+        "CID {:08x}{:08x}{:08x}{:08x}",
+        c.cid[0], c.cid[1], c.cid[2], c.cid[3]
+    ));
+    info.info(format_args!(
+        "CSD {:08x}{:08x}{:08x}{:08x}",
+        c.csd[0], c.csd[1], c.csd[2], c.csd[3]
+    ));
+    info.info(format_args!(
+        "OCR {:08x}, {} MiB user, boot 2 x {} KiB, {}-bit",
+        c.ocr,
+        c.user_blocks >> 11,
+        c.boot_blocks / 2,
+        c.width
+    ));
+    info.info(format_args!(
+        "EXT_CSD rev {} type {:#04x} PART_CFG {:#04x} BOOT_BUS {:#04x} BOOT_INFO {:#04x}",
+        f.rev, f.device_type, f.part_config, f.boot_bus, f.boot_info
+    ));
+    info.info(format_args!(
+        "BOOT_WP {:#04x}/{:#04x} USER_WP {:#04x} CFG_PROT {:#04x} RST_n {:#04x} PART_DONE {:#04x}",
+        f.boot_wp,
+        f.boot_wp_status,
+        f.user_wp,
+        f.boot_config_prot,
+        f.rst_n,
+        f.partition_setting_completed
+    ));
+    for (i, p) in d.parts.iter().enumerate() {
+        if let Some(p) = p {
+            info.info(format_args!(
+                "emmcp{}: blocks {}..={}",
+                i + 1,
+                p.first,
+                p.last
+            ));
+        }
+    }
+}
+
+/// The layout check of a `firmware.bin` for `emmc-fw`: the frame decodes
+/// and fits this board's DRAM (cubie_a7a_fastboot::emmc checks the rest).
+#[cfg(feature = "fastboot-emmc-write")]
+fn emmc_layout_check(image: &[u8], dram_end: u64) -> Result<(), &'static str> {
+    use cubie_a7a_common::layout;
+    let at = (layout::TABLE_OFFSET as u64 - cubie_a7a_fastboot::emmcarm::FW_START) as usize;
+    let frame = image.get(at..at + emmc::BLOCK).ok_or("no layout frame")?;
+    let t = layout::decode(frame).map_err(|_| "not a valid A7ABOOT1 layout frame")?;
+    layout::validate(&t, dram_end).map_err(|_| "layout table does not fit this board")
+}
+
+/// `flash` of an armed eMMC target (the arm already used up).
+#[cfg(feature = "fastboot-emmc-write")]
+#[inline(never)]
+pub fn emmc_flash(
+    d: &mut Emmc,
+    t: &cubie_a7a_fastboot::emmcarm::Target,
+    image: &[u8],
+    dram_end: u64,
+    scratch: &mut [u32],
+    info: &mut dyn Info,
+) -> Result<(), &'static str> {
+    let r = d.card.refresh(&mut d.host, &mut d.ext).and_then(|()| {
+        d.card.program(
+            &mut d.host,
+            t,
+            image,
+            &mut |i| emmc_layout_check(i, dram_end),
+            scratch,
+            info,
+        )
+    });
+    r.map_err(|e| {
+        println!("[fastboot] emmc flash at block {}: {e:?}", t.first);
+        e.message()
+    })
+}
+
+/// `erase` (zeros) of an armed eMMC target.
+#[cfg(feature = "fastboot-emmc-write")]
+#[inline(never)]
+pub fn emmc_erase(
+    d: &mut Emmc,
+    t: &cubie_a7a_fastboot::emmcarm::Target,
+    scratch: &mut [u32],
+    info: &mut dyn Info,
+) -> Result<(), &'static str> {
+    let r = d
+        .card
+        .refresh(&mut d.host, &mut d.ext)
+        .and_then(|()| d.card.erase(&mut d.host, t, scratch, info));
+    r.map_err(|e| {
+        println!("[fastboot] emmc erase at block {}: {e:?}", t.first);
+        e.message()
+    })
+}
+
+/// `oem emmc-bootcfg`, armed: PARTITION_CONFIG bits 6:3 and
+/// BOOT_BUS_CONDITIONS, read back.
+#[cfg(feature = "fastboot-emmc-write")]
+#[inline(never)]
+pub fn emmc_boot_config(
+    d: &mut Emmc,
+    part_config: u8,
+    boot_bus: u8,
+    info: &mut dyn Info,
+) -> Result<(), &'static str> {
+    d.card
+        .boot_config(&mut d.host, part_config, boot_bus, &mut d.ext)
+        .map_err(|e| {
+            println!("[fastboot] emmc bootcfg: {e:?}");
+            e.message()
+        })?;
+    info.info(format_args!(
+        "PARTITION_CONFIG {:#04x}, BOOT_BUS_CONDITIONS {:#04x} (read back)",
+        d.card.fields.part_config, d.card.fields.boot_bus
+    ));
+    Ok(())
 }
