@@ -1275,6 +1275,16 @@ pub fn mission_handover_relock<H: Hw>(
             }
         }
         hw.clrset32(ddrc(ch, 0x008), 0x1f, pstate);
+        if let Some(on) = HO_WCKON {
+            // FEL lab: MSTR4.wck_on [0] (quasi-dynamic, written with
+            // sw_done clear while the controller still holds the DRAM in
+            // its start-up self-refresh state).
+            hw.clrset32(ddrc(ch, crate::ctrl::MSTR4), 1, on);
+        }
+        if let Some(v) = HO_DBICTL {
+            // FEL lab: DBICTL rd_dbi_en [2], wr_dbi_en [1], dm_en [0].
+            hw.write32(ddrc(ch, DBICTL), v);
+        }
         sw_done(hw, ch)?;
         hw.clr32(ddrc(ch, DDRC_B84), 1);
     }
@@ -1331,7 +1341,79 @@ pub fn mission_handover_relock<H: Hw>(
             }
         }
     }
+    if HO_SRCYCLE {
+        sr_cycle(hw, channels)?;
+    }
     Ok(rden)
+}
+
+/// DDRCTL DBICTL (DM/DBI control), main block +0xc94.
+pub const DBICTL: usize = 0xc94;
+
+/// FEL lab `A7A_HO_WCKON=0|1`: the controller's MSTR4.wck_on (WCK always on)
+/// written by the lean hand-over before the DFI init. `com_init` sets 1
+/// (the vendor's value). wck_on 1 makes the controller sync WCK once
+/// (CAS-WS_FS to all ranks) and expects the DRAM's MR18 OP[4] (WCK always
+/// on) = 1 (public: DDRCTL MSTR4); our end of initialization and read
+/// training leave MR18 OP[4] = 0 (0x0c). Unset: unchanged.
+pub const HO_WCKON: Option<u32> = match option_env!("A7A_HO_WCKON") {
+    Some(s) => match s.as_bytes() {
+        [b'0'] => Some(0),
+        [b'1'] => Some(1),
+        _ => panic!("A7A_HO_WCKON is 0 or 1"),
+    },
+    None => None,
+};
+
+/// FEL lab `A7A_HO_DBICTL=<hex>`: DBICTL of both controllers, written with
+/// [`HO_WCKON`] before the DFI init (rd_dbi_en must equal MR3 OP[6],
+/// wr_dbi_en MR3 OP[7], dm_en the inverse of MR13 OP[5]; public: DDRCTL
+/// DBICTL). Our code never writes it (reset 0x1). Unset: unchanged.
+pub const HO_DBICTL: Option<u32> = match option_env!("A7A_HO_DBICTL") {
+    Some(s) => match u32::from_str_radix(s, 16) {
+        Ok(v) if v <= 7 => Some(v),
+        _ => panic!("A7A_HO_DBICTL is a hex value up to 7"),
+    },
+    None => None,
+};
+
+/// FEL lab `A7A_HO_SRCYCLE=1`: at the end of the lean hand-over (after
+/// `A7A_HO_MRS`/`A7A_HO_MR2`), one software self-refresh entry and exit per
+/// controller ([`sr_cycle`]): the controller's own SRE, then SRX followed by
+/// its WCK re-sync (with wck_on: CAS-WS_FS to all ranks), so MR18 changes
+/// made through `A7A_HO_MRS` start from a fresh WCK2CK sync. Unset: none.
+pub const HO_SRCYCLE: bool = option_env!("A7A_HO_SRCYCLE").is_some();
+
+/// One software self-refresh cycle per channel (public DDRCTL procedure,
+/// "Clock Removal and Recovery"): PWRCTL.selfref_sw = 1, STAT.selfref_type
+/// = 2'b10 (software self-refresh), then selfref_sw = 0, selfref_type = 0
+/// and operating_mode normal.
+pub fn sr_cycle<H: Hw>(hw: &mut H, channels: usize) -> Result<(), Error> {
+    use crate::ctrl::ddrc;
+    use crate::hw::wait;
+    use dwc_ddrctl::regs::{
+        OPERATING_MODE_NORMAL, PWRCTL, PWRCTL_SELFREF_SW, STAT, STAT_OPERATING_MODE,
+        STAT_SELFREF_TYPE,
+    };
+    const T: u64 = 100_000;
+    for ch in 0..channels {
+        hw.set32(ddrc(ch, PWRCTL), PWRCTL_SELFREF_SW);
+        wait(hw, "STAT.selfref_type software (SR cycle)", T, |hw| {
+            hw.read32(ddrc(ch, STAT)) & STAT_SELFREF_TYPE == 0x20
+        })?;
+    }
+    hw.udelay(10);
+    for ch in 0..channels {
+        hw.clr32(ddrc(ch, PWRCTL), PWRCTL_SELFREF_SW);
+        wait(hw, "STAT.selfref_type clear (SR cycle)", T, |hw| {
+            hw.read32(ddrc(ch, STAT)) & STAT_SELFREF_TYPE == 0
+        })?;
+        wait(hw, "STAT.operating_mode (SR cycle)", T, |hw| {
+            hw.read32(ddrc(ch, STAT)) & STAT_OPERATING_MODE == OPERATING_MODE_NORMAL
+        })?;
+    }
+    hw.udelay(2);
+    Ok(())
 }
 
 /// FEL lab `A7A_HO_RDDATA_EN=<hex>`: the controller's dfi_t_rddata_en
@@ -1404,6 +1486,14 @@ mod tests {
             crate::rdtrain::EXIT_MRS,
             crate::phy::rxen::ModeMrs::EXIT_PSTATE1
         );
+    }
+
+    #[test]
+    fn mission_switch_knobs_default_off() {
+        assert_eq!(super::HO_WCKON, None);
+        assert_eq!(super::HO_DBICTL, None);
+        assert!(!super::HO_SRCYCLE);
+        assert_eq!(super::DBICTL, 0xc94);
     }
 
     #[test]

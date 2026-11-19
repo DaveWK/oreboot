@@ -1061,6 +1061,14 @@ fn print_ho_knobs() {
     if let Some(s) = option_env!("A7A_HO_MRS") {
         println!("[dram] HO knobs: operating-set MRWs after the hand-over {s}");
     }
+    if blobless::HO_WCKON.is_some() || blobless::HO_DBICTL.is_some() || blobless::HO_SRCYCLE {
+        println!(
+            "[dram] HO knobs: MSTR4.wck_on {:x?}, DBICTL {:x?} before the DFI init; self-refresh cycle at the end {}",
+            blobless::HO_WCKON,
+            blobless::HO_DBICTL,
+            blobless::HO_SRCYCLE
+        );
+    }
 }
 
 /// Feature `bl-mission`, FEL lab knob `A7A_BL_BOOT`: when the lean
