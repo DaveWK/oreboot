@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! The fastboot protocol: command parsing, replies and the serve loop.
 //!
 //! The host sends one command per bulk OUT packet (printable ASCII, at most

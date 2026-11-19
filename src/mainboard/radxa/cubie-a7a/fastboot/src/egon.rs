@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! The eGON.BT0 header the mask ROM checks before it runs a boot0 from a
 //! medium: magic at 4, checksum at 12, length at 16 (a multiple of 4: the
 //! sum runs over 32-bit words), run address at 32. The checksum is the

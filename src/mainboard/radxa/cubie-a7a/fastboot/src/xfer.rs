@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! Bulk data phases (download, fetch upload) over a device FIFO endpoint,
 //! with as few register round trips per packet as the protocol allows.
 //!

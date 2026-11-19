@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! The Cubie A7A's SPI NOR (W25Q64FW, 8 MiB) as fastboot partitions, and
 //! the guards every erase and program passes.
 //!

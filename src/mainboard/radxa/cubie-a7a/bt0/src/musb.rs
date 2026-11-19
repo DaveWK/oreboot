@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! USB0 device controller of the A733 (feature `fastboot`): the Mentor
 //! MUSB OTG controller at 0x04100000 in Allwinner's register layout, run
 //! polled (CPU interrupts stay masked), PIO only, as the fastboot

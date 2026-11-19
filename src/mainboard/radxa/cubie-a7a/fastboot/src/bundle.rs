@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! A `fastboot boot` bundle: a copy of the boot medium from some offset
 //! on, holding the boot layout table frame and the images it names, as on
 //! the SD card or SPI NOR. Any such cut works:

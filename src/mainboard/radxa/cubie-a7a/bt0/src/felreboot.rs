@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! Back to the mask ROM's FEL from a medium boot: on the "reboot efex"
 //! flag, and after a failed boot from the SD card.
 //!

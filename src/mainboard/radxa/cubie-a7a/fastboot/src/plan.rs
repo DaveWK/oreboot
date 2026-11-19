@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! `fastboot boot` of a bundle on the Cubie A7A: everything checked before
 //! the OKAY ([`check`]), and the copies after it ([`for_each_image`]).
 //!

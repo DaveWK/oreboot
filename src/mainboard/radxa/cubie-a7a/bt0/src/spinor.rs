@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! SPI NOR boot (feature `spinor`): read the boot layout table and the
 //! images it names from the board's SPI NOR instead of the SD card.
 //!

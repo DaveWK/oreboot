@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! fastboot for the Cubie A7A bt0, the parts that know no hardware:
 //!
 //! - [`proto`]: the protocol loop over two seams, the USB device controller

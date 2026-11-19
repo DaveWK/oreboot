@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! eMMC write targets and the arming rules every eMMC flash, erase and
 //! boot-configuration change passes (`fastboot-emmc-write` builds only).
 //!

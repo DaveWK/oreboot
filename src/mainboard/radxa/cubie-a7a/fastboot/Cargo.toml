@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: GPL-2.0-only
+
 [package]
 name = "cubie-a7a-fastboot"
 version = "0.1.0"

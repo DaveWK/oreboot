@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! DRAM lab mode over fastboot (feature `dram-lab`; the host-side scripts
 //! are not part of this tree).
 //!

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! Warm-reset research probes (FEL lab). Build-time knobs, all off by
 //! default; with none set this module does nothing.
 //!

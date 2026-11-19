@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! fastboot over FEL (feature `fastboot`): after DRAM is up, bt0 leaves the
 //! mask ROM's FEL session on the USB-C port (USB0) and enumerates as a
 //! standard fastboot device (18d1:4ee0), so the host uses the stock

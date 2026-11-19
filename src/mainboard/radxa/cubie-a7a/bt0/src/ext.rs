@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! The DRAM part of the fastboot bt0 (feature `fastboot`): the block
 //! device dumps (`fetch:usb0`, `usb0p<N>`, `sd`, `emmc*`) and the guarded
 //! eMMC writer (`fastboot-emmc-write`), which do not fit the FEL

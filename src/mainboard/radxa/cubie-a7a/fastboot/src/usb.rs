@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! USB 2.0 chapter 9 for a one-interface bulk function (fastboot): SETUP
 //! packets, the standard requests and the descriptors.
 //!

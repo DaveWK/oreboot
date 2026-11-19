@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! `fetch` targets and their range arithmetic.
 //!
 //! A fetch names a partition of a read-only device (`nor`, a NOR partition,

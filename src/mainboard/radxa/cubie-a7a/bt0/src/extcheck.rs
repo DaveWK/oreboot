@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! The SRAM side of the fastboot DRAM extension (`ext.rs`): where it is,
 //! the load check entry 4 runs, and the gate every use passes. This module
 //! must stay in SRAM (build.rs links only `ext`, `ehci`, `smhc` and the

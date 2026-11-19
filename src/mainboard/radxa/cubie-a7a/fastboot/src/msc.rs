@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! USB mass storage, Bulk-Only Transport with SCSI, read-only, over an
 //! abstract pair of bulk pipes ([`Pipe`]): for `fetch:usb0`.
 //!

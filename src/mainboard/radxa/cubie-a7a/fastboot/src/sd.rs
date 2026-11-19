@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! Read-only SD card access over an abstract host controller ([`SdBus`]):
 //! card detect, identification, capacity and block reads, for `fetch:sd`.
 //!

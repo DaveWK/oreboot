@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! FEL lab knobs: the build-time `A7A_*` environment knobs of the open
 //! driver and the hybrid/blobless lab stages, as one runtime value.
 //!

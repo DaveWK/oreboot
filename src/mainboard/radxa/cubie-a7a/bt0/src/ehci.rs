@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! EHCI1 host for `fetch:usb0` (feature `fastboot`): the blue USB-A port's
 //! high-speed pair, one mass storage disk, polled, read-only.
 //!

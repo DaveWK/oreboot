@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! FEL lab observation of the PHY's read path around the lean hand-over
 //! (`A7A_OBS_ARM`), for the blob-free read-capture question: does a
 //! controller (DFI) read put strobes into the DBYTE RX FIFO, and do the

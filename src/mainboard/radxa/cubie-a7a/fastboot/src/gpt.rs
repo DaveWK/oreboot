@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! GUID partition table, read-only: the primary header at LBA 1 and its
 //! entry array, both CRC-checked, for `fetch:usb0p<N>` (N as Linux numbers
 //! them: the entry's index + 1).

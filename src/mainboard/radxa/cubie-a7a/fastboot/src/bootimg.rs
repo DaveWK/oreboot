@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! The Android boot image around a `fastboot boot` download.
 //!
 //! `fastboot boot <file>` sends the file as it is when it starts with the

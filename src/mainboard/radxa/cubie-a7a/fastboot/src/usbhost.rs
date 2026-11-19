@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! The host side of USB enumeration for one mass storage device: the
 //! control requests bt0's host controller driver may send, and finding the
 //! Bulk-Only interface in a configuration descriptor.

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! MMU and D-cache while fastboot runs (feature `fastboot`, not the DRAM
 //! lab mode): the identity map of `cubie_a7a_fastboot::mmu::FASTBOOT_MAP`
 //! (SRAM and DRAM write-back, peripherals device, the EHCI schedule's MiB

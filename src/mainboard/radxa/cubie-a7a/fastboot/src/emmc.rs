@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! eMMC (JEDEC 4.4 to 5.1) over an abstract host controller ([`MmcBus`]):
 //! module detect, identification, EXT_CSD, partition selection, block
 //! reads, and (write builds only) guarded block writes and the two

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! The identity map bt0 runs fastboot with (AArch32 short descriptors,
 //! 1 MiB sections), and cache-line arithmetic for DMA maintenance.
 //!
