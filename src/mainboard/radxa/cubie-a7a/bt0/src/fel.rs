@@ -309,6 +309,20 @@ pub fn halt_to_fel() -> ! {
     unsafe { fel_return() }
 }
 
+/// The DRAM lab's reboot (labfb.rs): everything a return to FEL puts back
+/// ([`give_back_to_rom`]: cache off, the ROM's USB0 set-up, the watchdog
+/// stopped) and the ROM's bus clock, before its WDT0 reset, so the reset
+/// starts from the state entry 1's return leaves for the host's felreset
+/// script.
+#[cfg(feature = "dram-lab")]
+pub(crate) fn lab_prepare_reset() {
+    give_back_to_rom();
+    let rom_ahb = unsafe { *core::ptr::addr_of!(ROM_AHB) };
+    if rom_ahb != 0 {
+        write32(AHB, rom_ahb);
+    }
+}
+
 /// What every return to FEL puts back: the ROM's USB0 set-up if fastboot
 /// took it over, the ROM's AHB clock; the watchdog stops.
 fn give_back_to_rom() {

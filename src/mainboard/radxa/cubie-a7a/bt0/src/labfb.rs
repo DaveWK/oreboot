@@ -127,9 +127,46 @@ labfb_reenter:
     "#
 );
 
+// The run itself on a fresh stack too: `dram-run` is served from
+// deep inside the fastboot protocol loop, and the blob-free flow's frames
+// (WL, read training, write stage) on top of it overran bt0's 16 KiB stack;
+// the first lab run hung in WCK2CK leveling, mid-println. Nothing below the
+// run is needed again: it always ends in `resume` (a fresh stack as well).
+global_asm!(
+    r#"
+    .section .text.labfb, "ax"
+    .arm
+    .global labfb_fresh_run
+labfb_fresh_run:
+    ldr     sp, =_stack_top
+    bl      labfb_run_body
+1:  b       1b
+    .ltorg
+    "#
+);
+
 unsafe extern "C" {
     fn labfb_reenter() -> !;
+    fn labfb_fresh_run() -> !;
 }
+
+#[unsafe(no_mangle)]
+extern "C" fn labfb_run_body() -> ! {
+    // SAFETY: dram_run stored it right before switching stacks.
+    let Some(pre) = (unsafe { (*core::ptr::addr_of_mut!(RUN_PRE)).take() }) else {
+        resume(State::Halted)
+    };
+    // WDT0 freshly armed (16 s, the whole system) for the run: a hang that
+    // stops the kicks resets the board into FEL. The run's own waits and,
+    // after the run, the fastboot loop (musb) keep kicking it.
+    crate::recovery::arm_watchdog();
+    let b = crate::bring_up_dram(pre);
+    unsafe { *core::ptr::addr_of_mut!(DRAM) = Some((b.dram_mb, b.dram_mhz)) };
+    resume(State::Done)
+}
+
+/// The pre-DRAM state handed across the stack switch.
+static mut RUN_PRE: Option<Pre> = None;
 
 /// End the run (bt0's halt, or the init returned) and serve again.
 pub fn resume(end: State) -> ! {
@@ -188,7 +225,7 @@ fn serve(after_run: bool) -> ! {
                 println!("[lab] reboot: watchdog reset (back into FEL)");
                 musb::release();
                 cubie_a7a_common::uart::Uart::attach(crate::UART0_BASE).drain();
-                soc::watchdog_reset()
+                fel_style_reset()
             }
             Err(e) => {
                 println!(
@@ -198,7 +235,28 @@ fn serve(after_run: bool) -> ! {
             }
         }
     }
-    soc::watchdog_reset()
+    fel_style_reset()
+}
+
+/// WDT0 whole-system reset with exactly the writes the host's felreset
+/// script (scripts/felreset.sh in radxa-a7a-workspace) makes from FEL
+/// (CFG = key | 1 whole system, MODE = key | 1 enable 0.5 s, CTRL
+/// restart), which has brought the board back into FEL after every
+/// blob-free run. `soc::watchdog_reset` also writes WDT0 +0x08 (key | 1)
+/// first; after a lab DRAM run that path left the board out of FEL twice,
+/// while without a run it came back in 2.3 s.
+fn fel_style_reset() -> ! {
+    // Measured: felreset's writes alone did not help either; first leave
+    // the state entry 1's return to FEL leaves (USB0 to the ROM, its bus
+    // clock, watchdog stopped, caches off), then the reset.
+    crate::fel::lab_prepare_reset();
+    const WDT0: usize = soc::WDT0_BASE;
+    write32(WDT0 + 0x10, 0x16aa_0001);
+    write32(WDT0 + 0x14, 0x16aa_0001);
+    write32(WDT0 + 0x0c, 0x0000_14af);
+    loop {
+        unsafe { core::arch::asm!("wfi") };
+    }
 }
 
 struct Lab;
@@ -210,7 +268,9 @@ fn verdict(info: &mut dyn Info) -> Result<(), &'static str> {
     if state() == State::Idle {
         return Err("no DRAM run yet");
     }
-    let mut cmd = [0u32; 64];
+    // 8 MRRs, 3 memtests and 12 MRRs: 92 words with the END (the 64 of the
+    // first board run panicked).
+    let mut cmd = [0u32; 128];
     let mut n = 0;
     let mut push = |w: &[u32]| {
         cmd[n..n + w.len()].copy_from_slice(w);
@@ -304,6 +364,23 @@ const SUMMARY: &[&str] = &[
     "[lab] run ",
 ];
 
+/// A fetch target's length without reading it (`getvar partition-size`).
+fn target_size(name: &str) -> Option<usize> {
+    let ran = state() != State::Idle;
+    match name {
+        "runlog" => Some(log_bytes().len()),
+        "labout" => Some(4 * unsafe { OPS.1 } as usize),
+        "phycsr" if ran => Some(
+            cubie_a7a_dram::dump::RANGES
+                .iter()
+                .map(|&(a, b)| 2 * (b - a) as usize)
+                .sum(),
+        ),
+        "ctlregs" if ran => Some(2 * 4 * (0x200 / 4 + 0xa0 / 4 + 11)),
+        _ => None,
+    }
+}
+
 /// Fill `buf` with a fetch target's bytes; its length.
 fn target(name: &str, buf: &mut [u8]) -> Result<usize, &'static str> {
     let ran = state() != State::Idle;
@@ -377,7 +454,12 @@ impl Device for Lab {
                 let (o, n, e) = unsafe { OPS };
                 write!(out, "{o} {n} {e:#x}")
             }
-            _ => return false,
+            // The stock fastboot tool sizes a fetch with partition-size
+            // first (measured: `fetch runlog` failed without it).
+            _ => match name.strip_prefix("partition-size:").and_then(target_size) {
+                Some(n) => write!(out, "0x{n:x}"),
+                None => return false,
+            },
         }
         .is_ok()
     }
@@ -535,7 +617,8 @@ fn dram_run(text: &str) -> Result<(), &'static str> {
     );
     set_state(State::Running);
     unsafe { T0 = soc::ticks() };
-    let b = crate::bring_up_dram(pre);
-    unsafe { *core::ptr::addr_of_mut!(DRAM) = Some((b.dram_mb, b.dram_mhz)) };
-    resume(State::Done)
+    unsafe {
+        *core::ptr::addr_of_mut!(RUN_PRE) = Some(pre);
+        labfb_fresh_run()
+    }
 }
