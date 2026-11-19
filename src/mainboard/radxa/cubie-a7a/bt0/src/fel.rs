@@ -293,6 +293,12 @@ unsafe extern "C" {
 /// abandoned; fel_return restores everything from fel_save), so the host
 /// can still inspect the hardware after a failed init.
 pub fn halt_to_fel() -> ! {
+    // The DRAM lab mode never returns to FEL (its buffers are the ROM's
+    // FEL SRAM): a halt ends the run and fastboot goes on.
+    #[cfg(feature = "dram-lab")]
+    if crate::labfb::active() {
+        crate::labfb::resume(crate::labfb::State::Halted)
+    }
     println!(
         "[bt0] FEL: halted; back to FEL (state {:#x})",
         state::HALTED
@@ -457,6 +463,21 @@ pub fn hand_over(b: &Bringup, handoff: cubie_a7a_common::Handoff, main_entry: u3
 #[cfg(feature = "fastboot")]
 #[unsafe(no_mangle)]
 extern "C" fn fel_fastboot() {
+    // DRAM lab mode: clocks, UART and PMIC only; DRAM on the host's
+    // `oem dram-run` (labfb.rs). The log stays in SRAM from here on.
+    #[cfg(feature = "dram-lab")]
+    {
+        cubie_a7a_common::fwlog::start_sram(crate::labfb::LOG, crate::labfb::LOG_LEN);
+        write32(MB_MAGIC, MAGIC);
+        write32(MB_STATE, state::FASTBOOT);
+        let rom_ahb = read32(AHB);
+        unsafe { *core::ptr::addr_of_mut!(ROM_AHB) = rom_ahb };
+        let pre = crate::bring_up_pre();
+        // The ROM's AHB for USB0 (as entry 1 leaves it for FEL).
+        write32(AHB, rom_ahb);
+        crate::labfb::run(pre)
+    }
+    #[allow(unreachable_code)]
     let done = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(fel_init_done)) };
     let b = match unsafe { *core::ptr::addr_of!(BRINGUP) } {
         Some(b) if done == FEL_INIT_DONE => b,

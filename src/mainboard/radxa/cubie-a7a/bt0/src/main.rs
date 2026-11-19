@@ -67,6 +67,8 @@ mod gpadc;
 mod gpio;
 #[cfg(feature = "fel")]
 mod lab;
+#[cfg(feature = "dram-lab")]
+mod labfb;
 #[cfg(feature = "fastboot")]
 mod musb;
 mod probe;
@@ -434,6 +436,20 @@ struct Bringup {
 /// Halts (watchdog reset) when DRAM does not come up.
 #[allow(unreachable_code)]
 fn bring_up() -> Bringup {
+    bring_up_dram(bring_up_pre())
+}
+
+/// What [`bring_up_pre`] leaves for [`bring_up_dram`].
+pub struct Pre {
+    t_start: u64,
+    version: u32,
+    hosc: u32,
+    pmic: Option<axp::Axp<'static>>,
+}
+
+/// Everything up to DRAM: clocks, UART, PMIC (the DRAM lab mode stops
+/// here and runs [`bring_up_dram`] on the host's command).
+fn bring_up_pre() -> Pre {
     soc::set_cntfrq();
     soc::stage(1);
     soc::diag(1, ccu::apb_uart_clk());
@@ -503,7 +519,22 @@ fn bring_up() -> Bringup {
     // After the PMIC switched CLDO5 (VCC-PC) on.
     gpio::eeprom_write_protect();
     ccu::dump();
+    Pre {
+        t_start,
+        version,
+        hosc,
+        pmic,
+    }
+}
 
+/// DRAM init and tests, then the CPU clock boost.
+fn bring_up_dram(pre: Pre) -> Bringup {
+    let Pre {
+        t_start,
+        version,
+        hosc,
+        pmic,
+    } = pre;
     soc::stage(6);
     let set = dram::select();
     #[cfg(not(feature = "av3g"))]
@@ -520,8 +551,9 @@ fn bring_up() -> Bringup {
         halt();
     }
     // Before anything else writes DRAM: keep the last boot's log, then move
-    // the SRAM log into this boot's (cubie_a7a_common::fwlog).
-    if !dram::SKIP_TESTS {
+    // the SRAM log into this boot's (cubie_a7a_common::fwlog). Not in the
+    // DRAM lab mode, whose log stays in SRAM.
+    if !dram::skip_tests() && !cfg!(feature = "dram-lab") {
         cubie_a7a_common::fwlog::start_dram();
     }
     soc::stage(7);
@@ -530,7 +562,7 @@ fn bring_up() -> Bringup {
     println!("[bt0] DRAM: {dram_mb} MiB");
     // Only test what fits the 32-bit address space for now.
     let test_size = dram_size.min((0xc000_0000 - mem::DRAM_BASE) as u64) as usize;
-    if dram::SKIP_TESTS {
+    if dram::skip_tests() {
         println!("[bt0] DRAM: tests skipped (FEL lab build)");
     } else if let Err((a, want, got)) = dram::test(mem::DRAM_BASE, test_size) {
         println!("[bt0] DRAM test failed at {a:08x}: wrote {want:08x}, read {got:08x}");

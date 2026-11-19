@@ -163,13 +163,10 @@ pub fn message_block(p: &mut Para, pstate: u32) -> [u16; crate::phy::msgblock::W
 /// MR18 = base in the DRAM's FSP-WR set; after our end of initialization
 /// FSP-WR is the operating set (MR16 0x45), in the PMU-trained state
 /// without it possibly not.
-const WL_MR18: Option<u8> = match option_env!("A7A_HYBRID_WL_MR18") {
-    Some(s) => match u8::from_str_radix(s, 16) {
-        Ok(v) => Some(v),
-        Err(_) => panic!("A7A_HYBRID_WL_MR18 is not a hex byte"),
-    },
-    None => None,
-};
+/// (`crate::knobs`: runtime in the bt0 DRAM lab mode, else the build's.)
+fn wl_mr18() -> Option<u8> {
+    crate::knobs::get().wl_mr18
+}
 
 /// WCK2CK leveling MR18 bases per [`crate::wl::BLOCKS`] entry, from the
 /// message block (`wcklevel::Mr18Base::from_message_block`), or the FEL
@@ -178,7 +175,7 @@ pub fn wl_mr18_bases(p: &mut Para, pstate: u32) -> [Option<crate::phy::wcklevel:
     let m = message_block(p, pstate);
     let mut out = [None; 4];
     for (o, &(ch, rank)) in out.iter_mut().zip(crate::wl::BLOCKS.iter()) {
-        *o = match WL_MR18 {
+        *o = match wl_mr18() {
             Some(v) => crate::phy::wcklevel::Mr18Base::new(v),
             None => crate::phy::wcklevel::Mr18Base::from_message_block(&m, ch, rank),
         };
@@ -193,17 +190,10 @@ pub fn wl_mr18_bases(p: &mut Para, pstate: u32) -> [Option<crate::phy::wcklevel:
 /// firmware programs 0x00 at pstate 1 (read back on hardware, and MR2 0x88
 /// at pstate 1 breaks the controller's reads in the PMU-trained state).
 fn mission_mr_overrides(f: &mut crate::phy::endinit::FspMrs) {
-    let Some(spec) = option_env!("A7A_BL_MRS") else {
+    let Some(list) = crate::knobs::get().bl_mrs else {
         return;
     };
-    for pair in spec.split(',') {
-        let mut it = pair.split('=');
-        let (Some(a), Some(v)) = (it.next(), it.next()) else {
-            continue;
-        };
-        let (Ok(a), Ok(v)) = (a.parse::<u8>(), u8::from_str_radix(v, 16)) else {
-            continue;
-        };
+    for &(a, v) in list.iter() {
         for slot in f.mr.iter_mut() {
             if slot.0 == a {
                 slot.1 = v;
@@ -223,20 +213,9 @@ fn mission_mr_overrides(f: &mut crate::phy::endinit::FspMrs) {
 /// stage with FSP-WR 0 (`endinit::MR16_SWITCH_FSPWR0[_VRCG]`), as the
 /// training firmware leaves it; it cannot be combined with a switch value
 /// from `A7A_HYBRID_EI_MR16`.
-pub const END_OF_INIT_VARIANT: crate::phy::endinit::Variant =
-    match crate::phy::endinit::Variant::parse(
-        option_env!("A7A_HYBRID_EI_SKIP"),
-        option_env!("A7A_HYBRID_EI_NO_MRW"),
-        option_env!("A7A_HYBRID_EI_MR16"),
-    ) {
-        Some(v) => match v.with_fspwr0(option_env!("A7A_EI_FSPWR0")) {
-            Some(v) => v,
-            None => panic!(
-                "A7A_EI_FSPWR0 must be 04 or 44, without a switch value in A7A_HYBRID_EI_MR16"
-            ),
-        },
-        None => panic!("A7A_HYBRID_EI_SKIP/_NO_MRW/_MR16 malformed"),
-    };
+/// The build's variant (`crate::knobs::BUILD`); the stage runs
+/// `crate::knobs::get().ei` (the bt0 DRAM lab mode can override it).
+pub const END_OF_INIT_VARIANT: crate::phy::endinit::Variant = crate::knobs::BUILD.ei;
 
 /// MRW MR16 = `mr16` to both channels and ranks at once, through the end
 /// of initialization's own switch launch (`endinit::run_with` with the
@@ -319,6 +298,7 @@ pub struct EndInitReport {
 pub fn end_of_init<H: Hw>(hw: &mut H, p: &mut Para, pstate: u32) -> EndInitReport {
     use crate::phy::endinit::{self, FspMrs};
     use crate::phy::wcklevel::Channel;
+    let variant = crate::knobs::get().ei;
     let m = message_block(p, pstate);
     let mut mrs = [FspMrs { mr: [(0, 0); 20] }; 4];
     for (o, &(ch, rank)) in mrs.iter_mut().zip(endinit::BLOCKS.iter()) {
@@ -336,11 +316,11 @@ pub fn end_of_init<H: Hw>(hw: &mut H, p: &mut Para, pstate: u32) -> EndInitRepor
             mission_mr_overrides(&mut f);
             f
         },
-        &END_OF_INIT_VARIANT,
+        &variant,
         &mut |s| ex.step(s),
     );
     let r = EndInitReport {
-        variant: END_OF_INIT_VARIANT,
+        variant,
         mrs,
         launches: ex.launches,
         writes: ex.writes,
@@ -1192,10 +1172,9 @@ pub fn mission_handover<H: Hw>(hw: &mut H, p: &Para, pstate: u32) -> Result<u32,
 
 /// FEL lab: INIT0.skip_dram_init for the hand-over (env `A7A_BL_INIT0` at
 /// build time, 0..3; unset: as `ctrl::com_init` left it).
-const INIT0_SKIP: Option<u32> = match option_env!("A7A_BL_INIT0") {
-    Some(s) => Some((s.as_bytes()[0] - b'0') as u32 & 3),
-    None => None,
-};
+fn init0_skip() -> Option<u32> {
+    crate::knobs::get().init0
+}
 
 /// [`mission_handover`]; with `relock`, first the training firmware's end
 /// state (PLL powered down, ClockingCtrl 1, TxRdPtrInit 1) and then our
@@ -1321,7 +1300,7 @@ pub fn mission_handover_relock<H: Hw>(
         sw_done(hw, ch)?;
         hw.clr32(ddrc(ch, DDRC_B84), 1);
     }
-    if let Some(skip) = INIT0_SKIP {
+    if let Some(skip) = init0_skip() {
         // INIT0.skip_dram_init [31:30]: 3 (the vendor's) starts the
         // controller in self-refresh, so leaving selfref_sw issues SRX; our
         // training leaves the DRAM idle, not in self-refresh.

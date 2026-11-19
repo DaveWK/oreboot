@@ -146,9 +146,10 @@ fn wck_level(p: &mut Para) {
     use cubie_a7a_dram::wl::{self, SNAP_NAMES, WL_POINTS, WL_STEP};
     let bases = blobless::wl_mr18_bases(p, PROBE_PSTATE);
     {
-        use cubie_a7a_dram::phy::wcklevel::{Mr18Op, MR18_OPS};
-        if MR18_OPS != [Mr18Op::Reference; 4] {
-            println!("[dram] WL: MR18 ops (entry, level, restore, cleanup) {MR18_OPS:x?}");
+        use cubie_a7a_dram::phy::wcklevel::Mr18Op;
+        let ops = cubie_a7a_dram::knobs::get().wl_mr18_ops;
+        if ops != [Mr18Op::Reference; 4] {
+            println!("[dram] WL: MR18 ops (entry, level, restore, cleanup) {ops:x?}");
         }
     }
     let saved = wl::begin(&mut Bt0Hw);
@@ -273,7 +274,7 @@ fn wck_level(p: &mut Para) {
         );
     }
     #[cfg(feature = "hybrid")]
-    if option_env!("A7A_HYBRID_SKIP_RD").is_some() {
+    if cubie_a7a_dram::knobs::get().hybrid_skip_rd {
         let r = blobless::mission_handover(&mut Bt0Hw, p, PROBE_PSTATE);
         println!("[dram] MISSION (hybrid, no read training): {r:?}");
         if r.is_ok() {
@@ -304,7 +305,7 @@ fn wck_level(p: &mut Para) {
             }
             #[cfg(any(feature = "bl-mission", feature = "hybrid"))]
             if applied {
-                let relock = option_env!("A7A_BL_RELOCK").is_some();
+                let relock = cubie_a7a_dram::knobs::get().bl_relock;
                 let r = blobless::mission_handover_relock(&mut Bt0Hw, p, PROBE_PSTATE, relock);
                 println!("[dram] MISSION: PLL/DLL relock before the DFI init: {relock}");
                 println!("[dram] MISSION: lean hand-over at pstate {PROBE_PSTATE}: {r:?}");
@@ -718,7 +719,7 @@ fn read_training(bases: [Option<cubie_a7a_dram::phy::wcklevel::Mr18Base>; 4]) ->
     let runs: &[(Channel, Rank)] = if TRAIN_ONLY { &ALL } else { &ALL[..4] };
     let base_cfg = TrainConfig {
         apply: !TRAIN_ONLY,
-        mrl_override: RD_MRL,
+        mrl_override: cubie_a7a_dram::knobs::get().rd_mrl,
         ..TrainConfig::PSTATE1
     };
     println!(
@@ -1005,17 +1006,6 @@ fn handover_stage(p: &cubie_a7a_dram::Para) {
         );
     }
 }
-
-/// `RD_MRL=<n>` at build time (env `A7A_RD_MRL`): the read latency applied
-/// instead of the formula (measurement images).
-#[cfg(all(not(feature = "wck-alias-probe"), not(feature = "rd-measure")))]
-const RD_MRL: Option<u16> = match option_env!("A7A_RD_MRL") {
-    Some(s) => match u16::from_str_radix(s, 10) {
-        Ok(v) => Some(v),
-        Err(_) => panic!("A7A_RD_MRL is not a number"),
-    },
-    None => None,
-};
 
 /// The end-of-initialization stage, printed (kept out of `init_one`'s
 /// frame).
@@ -1332,7 +1322,8 @@ const DCA_CONFIG: cubie_a7a_dram::dca::Config = {
             Some(m) => m,
             None => Mode::Mrr,
         },
-        pstate: match super::open::OPTS.only_pstate {
+        // The build's A7A_OPEN_OPTS (a const; the DCA stage is not a lab knob).
+        pstate: match super::open::opts(cubie_a7a_dram::knobs::BUILD.open_opts).only_pstate {
             Some(ps) => ps,
             None => PROBE_PSTATE,
         },
@@ -1457,8 +1448,8 @@ fn acsm_field_probe(v: cubie_a7a_dram::acsm_probe::Variant) {
 /// The pstate the hybrid trained and hands over (A7A_OPEN_OPTS bits 3-5;
 /// our WL and read training run at pstate 1 only).
 #[cfg(feature = "hybrid")]
-const fn hybrid_pstate() -> u32 {
-    match super::open::OPTS.only_pstate {
+fn hybrid_pstate() -> u32 {
+    match super::open::opts(cubie_a7a_dram::knobs::get().open_opts).only_pstate {
         Some(ps) => ps,
         None => PROBE_PSTATE,
     }
@@ -1501,7 +1492,8 @@ pub fn hybrid_after_pmu(p: &mut Para) -> ! {
         let f = blobless::fsp0_mrs(&mut Bt0Hw, p, PROBE_PSTATE);
         println!("[dram] FSP0 MRs {spec} written (MR16 40 .. 00): failure {f:?}");
     }
-    if option_env!("A7A_HYBRID_ENDINIT").is_some() {
+    let k = cubie_a7a_dram::knobs::get();
+    if k.hybrid_endinit {
         let e = end_of_init(p);
         println!(
             "[dram] HYBRID: our end of initialization: failure {:?}",
@@ -1514,13 +1506,13 @@ pub fn hybrid_after_pmu(p: &mut Para) -> ! {
     if DCA_MODE.is_some() {
         dca_stage();
     }
-    if option_env!("A7A_HYBRID_NO_WL").is_some() {
+    if k.hybrid_no_wl {
         let r = blobless::mission_handover(&mut Bt0Hw, p, hybrid_pstate());
         println!("[dram] MISSION (hybrid, no leveling, no read training): {r:?}");
         if r.is_ok() {
             let _ = super::wrstage::run();
         }
-    } else if option_env!("A7A_HYBRID_SKIP_WL").is_some() {
+    } else if k.hybrid_skip_wl {
         let bases = blobless::wl_mr18_bases(p, PROBE_PSTATE);
         if let Some((before, _)) = blobless::RD_FSPWR {
             let f = blobless::mr16_all(&mut Bt0Hw, before);

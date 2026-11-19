@@ -184,18 +184,23 @@ pub const fn parse_mr18_ops(s: Option<&str>) -> Option<[Mr18Op; 4]> {
     Some(out)
 }
 
-/// The build's WL MR18 operations (env `A7A_HYBRID_WL_MR18_OPS`).
-pub const MR18_OPS: [Mr18Op; 4] = match parse_mr18_ops(option_env!("A7A_HYBRID_WL_MR18_OPS")) {
-    Some(o) => o,
-    None => panic!("A7A_HYBRID_WL_MR18_OPS malformed (four fields: empty, -, or hex)"),
-};
+/// The build's WL MR18 operations (env `A7A_HYBRID_WL_MR18_OPS`); the
+/// leveling uses `crate::knobs::get().wl_mr18_ops` (the bt0 DRAM lab mode
+/// can override it).
+pub const MR18_OPS: [Mr18Op; 4] = crate::knobs::BUILD.wl_mr18_ops;
 
 /// MR18 in the observed two-edge encoding, with explicit rank control on
 /// both rows. `base` is an input, not a guessed derivation from a parameter
 /// set; the independent reference currently covers base=0x0c only.
 /// `site` selects the [`MR18_OPS`] entry (FEL lab).
 fn mr18_rows(rank: Rank, value: u8, long_tail: bool, first_clock: bool, site: usize) -> [Row; 6] {
-    mr18_rows_op(rank, value, long_tail, first_clock, MR18_OPS[site])
+    mr18_rows_op(
+        rank,
+        value,
+        long_tail,
+        first_clock,
+        crate::knobs::get().wl_mr18_ops[site],
+    )
 }
 
 fn mr18_rows_op(rank: Rank, value: u8, long_tail: bool, first_clock: bool, op: Mr18Op) -> [Row; 6] {

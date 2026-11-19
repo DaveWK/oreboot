@@ -22,7 +22,7 @@ mod blobless;
 #[cfg(any(not(feature = "dramlib"), feature = "av3g", feature = "av3h"))]
 mod bt0hw;
 #[cfg(not(any(feature = "dramlib", feature = "blobless")))]
-mod open;
+pub mod open;
 #[cfg(feature = "dramlib")]
 mod vendor;
 #[cfg(any(feature = "bl-mission", feature = "hybrid"))]
@@ -40,9 +40,13 @@ pub use vendor::report_previous_trace;
 
 /// No DRAM test in bt0 after the init (FEL lab builds of the open backend).
 #[cfg(not(any(feature = "dramlib", feature = "blobless")))]
-pub const SKIP_TESTS: bool = open::SKIP_TESTS;
+pub fn skip_tests() -> bool {
+    open::skip_tests()
+}
 #[cfg(any(feature = "dramlib", feature = "blobless"))]
-pub const SKIP_TESTS: bool = false;
+pub fn skip_tests() -> bool {
+    false
+}
 
 #[cfg(not(feature = "dramlib"))]
 pub fn report_previous_trace() {}

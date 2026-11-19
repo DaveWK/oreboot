@@ -63,6 +63,9 @@ enum Sink {
     /// Linear buffer at EARLY_BASE; the length is kept in the first word.
     Early,
     Ring,
+    /// A linear buffer of the given size at the given SRAM address (bt0's
+    /// DRAM lab mode: DRAM is the device under test).
+    Sram(usize, usize),
 }
 
 static mut SINK: Sink = Sink::None;
@@ -94,6 +97,7 @@ pub fn putc(c: u8) {
         Sink::None => {}
         Sink::Early => ring::early_putc(&mut Mem(EARLY_BASE), EARLY_SIZE, c),
         Sink::Ring => ring::putc(&mut Mem(CUR_BASE), &ring::A7A, c),
+        Sink::Sram(base, size) => ring::early_putc(&mut Mem(base), size, c),
     }
 }
 
@@ -101,6 +105,13 @@ pub fn putc(c: u8) {
 pub fn start_early() {
     Mem(EARLY_BASE).write32(0, 0);
     unsafe { SINK = Sink::Early };
+}
+
+/// bt0's DRAM lab mode: log into `size` bytes of SRAM at `base` (the
+/// length in the first word, as the early buffer), never DRAM.
+pub fn start_sram(base: usize, size: usize) {
+    Mem(base).write32(0, 0);
+    unsafe { SINK = Sink::Sram(base, size) };
 }
 
 /// bt0, once DRAM is trained: keep the previous boot's log if it survived,

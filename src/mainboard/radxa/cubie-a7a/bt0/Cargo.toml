@@ -89,6 +89,14 @@ fastboot = ["fel"]
 # length and CRC-32, JEDEC ID, no protection bits, erase/program/read-back
 # inside the partition, never at or above 0x700000). Bench builds only.
 fastboot-nor-write = ["fastboot"]
+# DRAM lab mode over fastboot (src/labfb.rs): FEL
+# entry 4 brings up clocks, UART and PMIC but not DRAM; `oem dram-run
+# <A7A_* knobs>` then runs the DRAM init once per session with runtime
+# knobs (cubie_a7a_dram::knobs), the results stay in SRAM (run log, lab
+# op output, PHY CSR and controller register dumps) for `getvar`, `oem`
+# and `fetch`; `reboot` ends every run. Combine with the open driver and
+# `hybrid` or `bl-mission`.
+dram-lab = ["fastboot"]
 # eMMC flash/erase and the boot configuration (PARTITION_CONFIG bits 6:3,
 # BOOT_BUS_CONDITIONS) behind arming and content checks.
 fastboot-emmc-write = ["fastboot"]

@@ -13,6 +13,7 @@ pub mod dca;
 pub mod dump;
 pub mod handover;
 pub mod hw;
+pub mod knobs;
 pub mod mr;
 pub mod obs;
 pub mod para;

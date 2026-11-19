@@ -411,6 +411,17 @@ impl<'a> Musb<'a> {
         )
     }
 
+    /// The controller as fastboot left it, configured, after the stack
+    /// was reset (the DRAM lab mode resumes after a run this way).
+    pub fn resume(desc: Descriptors<'a>) -> Self {
+        Musb {
+            desc,
+            configured: true,
+            high_speed: read8(POWER) & POWER_HSMODE != 0,
+            pending_address: None,
+        }
+    }
+
     pub fn high_speed(&self) -> bool {
         self.high_speed
     }
