@@ -153,12 +153,14 @@ pub fn run() -> bool {
     let (mut p, mut mp) = ports();
     let mut seed = 0x5eed_0001u32;
     println!("[dram] WR: stage bits {BITS:x}, probe blocks {PROBE:08x?} x {BLOCK_BYTES} B");
+    let mut blind_clean = false;
     if BITS & 0x10 != 0 {
         match wrtrain::blind_baseline(&mut p, &mut seed) {
             Ok((v, left)) => {
                 println!(
                     "[dram] WR: blind start: TxDqDly per DBYTE {v:03x?}, error bits left {left}"
                 );
+                blind_clean = left == 0;
             }
             Err(e) => {
                 println!("[dram] WR: blind start failed: {e:?}; stopping");
@@ -168,6 +170,13 @@ pub fn run() -> bool {
     }
     let m = match wrtrain::discover(&mut p, &mut seed) {
         Ok(m) => m,
+        Err(e) if blind_clean => {
+            // Measured: with the blind start already clean the lane
+            // discovery has nothing to separate (LaneOverlap); keep the
+            // blind start and let the final probe check decide.
+            println!("[dram] WR: discovery failed: {e:?}; the blind start is clean, keeping it");
+            return final_check(&mut p, &mut seed);
+        }
         Err(e) => {
             println!("[dram] WR: discovery failed: {e:?}; stopping");
             return false;
@@ -332,10 +341,16 @@ pub fn run() -> bool {
         }
         println!("[dram] WR: measurement only; the delays found before are back");
     }
+    final_check(&mut p, &mut seed)
+}
+
+/// Four compares of every probe block with fresh seeds; true when all are
+/// clean.
+fn final_check(p: &mut Port, seed: &mut u32) -> bool {
     let mut bad = 0u32;
     for _ in 0..4 {
-        seed = seed.wrapping_add(0x9e37_79b9);
-        if let Ok(f) = p.check(seed) {
+        *seed = seed.wrapping_add(0x9e37_79b9);
+        if let Ok(f) = p.check(*seed) {
             for (b, v) in f.iter().enumerate() {
                 if *v != 0 {
                     bad |= 1 << b;

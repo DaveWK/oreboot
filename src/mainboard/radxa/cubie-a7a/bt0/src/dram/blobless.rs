@@ -290,6 +290,13 @@ fn wck_level(p: &mut Para) {
                 let f = blobless::mr16_all(&mut Bt0Hw, before);
                 println!("[dram] RD: MR16 {before:02x} to all ranks before the read training: failure {f:?}");
             }
+            if blobless::RD_PULSE_RESTORE {
+                let v = blobless::acsm_pulse_restore(&mut Bt0Hw);
+                println!(
+                    "[dram] RD: ACSM read pulses -{} before the read training: {v:03x?}",
+                    blobless::ACSM_PULSE_ADJUST
+                );
+            }
             let applied = read_training(bases);
             if let Some((_, after)) = blobless::RD_FSPWR {
                 let f = blobless::mr16_all(&mut Bt0Hw, after);

@@ -1572,6 +1572,29 @@ pub const ACSM_READ_PULSES: [u32; 7] = [
 ];
 pub const ACSM_PULSE_ADJUST: u16 = 4;
 
+/// `A7A_RD_PULSE_RESTORE=1`: the ACSM read pulse timings back by
+/// [`ACSM_PULSE_ADJUST`] right before the read training instead of at the
+/// hand-over ([`acsm_pulse_restore`]). Measured: with the pulses at our
+/// DevInit's +4 our read training finds the gate exactly 0x200 earlier
+/// (0x170-0x174) than with the training firmware's values
+/// (0x36c-0x374, the PMU's own 0x36d), and the mission reads
+/// then fail; the mission path does not use the ACSM pulses.
+pub const RD_PULSE_RESTORE: bool = option_env!("A7A_RD_PULSE_RESTORE").is_some();
+
+/// The ACSM read pulse timings ([`ACSM_READ_PULSES`]) lowered by
+/// [`ACSM_PULSE_ADJUST`]; returns the values written.
+pub fn acsm_pulse_restore<H: Hw>(hw: &mut H) -> [u16; 7] {
+    let mut out = [0u16; 7];
+    csr_access(hw, true);
+    for (k, c) in ACSM_READ_PULSES.into_iter().enumerate() {
+        let v = hw.read16(csr(c)).wrapping_sub(ACSM_PULSE_ADJUST);
+        hw.write16(csr(c), v);
+        out[k] = v;
+    }
+    csr_access(hw, false);
+    out
+}
+
 /// Delay CSRs written in mission mode applied: controller self-refresh (DFI
 /// idle, DES only), ForceInternalUpdate held 5 µs (TRM: DFI offline, at
 /// least 32 DFICLKs), self-refresh exit with the controller's WCK re-sync.
