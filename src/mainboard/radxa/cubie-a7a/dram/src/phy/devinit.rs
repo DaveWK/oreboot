@@ -99,7 +99,7 @@ const UI_CAL_WAIT: u16 = 0x9c;
 /// [`crate::pstate::ACTIVE_DLL_GAIN`] (0x7353 at pstate 0, REFERENCE-DERIVED).
 pub const DLL_GAIN: u16 = 0x7342;
 const _: () = assert!(crate::pstate::ACTIVE != 1 || crate::pstate::ACTIVE_DLL_GAIN == DLL_GAIN);
-const RX_REPLICA_DLL_GAIN: u16 = 0x73;
+const RX_REPLICA_DLL_GAIN: u16 = crate::pstate::ACTIVE_RX_REPLICA_DLL_GAIN; // 0x73; 0x53 at pstates 2, 3
 /// PllCtrl3 written between the POR latch pulses.
 const PLL_CTRL3_VALUE: u16 = 0x1f0;
 /// PclkGateControl override during DLL lock.

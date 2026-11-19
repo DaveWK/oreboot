@@ -223,7 +223,7 @@ pub const ACTIVE_LOW_SPEED: LowSpeed = if ACTIVE == 1 {
         delay: 1,
     }
 } else {
-    low_speed(ACTIVE_DFI_MHZ)
+    low_speed_any(ACTIVE_DFI_MHZ)
 };
 
 /// DllGainCtl (0x20012) DevInit writes, per DfiClk. REFERENCE-DERIVED
@@ -240,9 +240,9 @@ pub const fn dll_gain(dfi_mhz: u32) -> Option<u16> {
 
 /// DllGainCtl at [`ACTIVE`] (0x7342, the pstate-1 value, where the reference
 /// has none).
-pub const ACTIVE_DLL_GAIN: u16 = match dll_gain(ACTIVE_DFI_MHZ) {
-    Some(v) if ACTIVE != 3 => v,
-    _ => 0x7342,
+pub const ACTIVE_DLL_GAIN: u16 = match dll_gain_any(ACTIVE_DFI_MHZ) {
+    Some(v) => v,
+    None => 0x7342,
 };
 
 // ---------------------------------------------------------------------------
@@ -433,6 +433,43 @@ pub const fn dq_vref_code_max(wck_mhz: u32, vddq_mv: u32) -> u8 {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Pstates 2 and 3 (DfiClk 200 and 100 MHz). The functions above keep the
+// rules found at 600, 300 and 200 MHz; these add what the reference does
+// at 100 MHz, and are what the `ACTIVE_*` values are taken from.
+
+/// [`low_speed`] for any DfiClk: the reference never divides by less than
+/// 2, so below 200 MHz it keeps 200 MHz's values (0x102/0x182 with delay 0
+/// at pstate 3, 100 MHz, as at pstate 2) and the slow CK is 80 ns there.
+/// REFERENCE-DERIVED.
+#[inline]
+pub const fn low_speed_any(dfi_mhz: u32) -> LowSpeed {
+    low_speed(if dfi_mhz < 200 { 200 } else { dfi_mhz })
+}
+
+/// [`dll_gain`] with the reference's value at 100 MHz, 0x5331 as at
+/// 200 MHz. REFERENCE-DERIVED, and MEASURED like the other three: the
+/// PHY's saved per-pstate copies read 0x7353, 0x7342, 0x5331 and 0x5331 on
+/// the board after the training firmware had trained all four pstates.
+#[inline]
+pub const fn dll_gain_any(dfi_mhz: u32) -> Option<u16> {
+    match dfi_mhz {
+        100 => Some(0x5331),
+        _ => dll_gain(dfi_mhz),
+    }
+}
+
+/// RxReplicaDllGainCtl (0x20186) for a DllGainCtl value: its upper byte.
+/// REFERENCE-DERIVED (0x73 at pstates 0 and 1, 0x53 at pstates 2 and 3) and
+/// MEASURED the same way as [`dll_gain_any`].
+#[inline]
+pub const fn rx_replica_dll_gain(dll_gain: u16) -> u16 {
+    dll_gain >> 8
+}
+
+/// RxReplicaDllGainCtl at [`ACTIVE`].
+pub const ACTIVE_RX_REPLICA_DLL_GAIN: u16 = rx_replica_dll_gain(ACTIVE_DLL_GAIN);
+
 #[cfg(test)]
 mod tests {
     extern crate std;
@@ -523,8 +560,15 @@ mod tests {
         assert_eq!(t(600), (0x106, 0x186, 4));
         assert_eq!(t(300), (0x103, 0x183, 1));
         assert_eq!(t(200), (0x102, 0x182, 0));
+        // Pstate 3: the reference keeps pstate 2's divider.
+        assert_eq!(low_speed_any(100), low_speed(200));
+        assert_eq!(slow_ck_ps(low_speed_any(200), 200), 40_000);
+        assert_eq!(slow_ck_ps(low_speed_any(100), 100), 80_000);
+        for mhz in [200, 300, 450, 600, 800] {
+            assert_eq!(low_speed_any(mhz), low_speed(mhz));
+        }
         for mhz in [100, 200, 300, 450, 600, 800] {
-            let ps = slow_ck_ps(low_speed(mhz), mhz);
+            let ps = slow_ck_ps(low_speed_any(mhz), mhz);
             assert!(ps >= jt::INIT.t_ckb_min_ns * 1000, "{mhz}: {ps}");
         }
         assert_eq!(slow_ck_ps(low_speed(600), 600), 40_000);
@@ -538,7 +582,16 @@ mod tests {
     fn dll_gain_per_clock() {
         assert_eq!(dll_gain(300), Some(0x7342));
         assert_eq!(dll_gain(600), Some(0x7353));
+        assert_eq!(dll_gain(200), Some(0x5331));
         assert_eq!(dll_gain(100), None);
+        assert_eq!(dll_gain_any(100), Some(0x5331));
+        assert_eq!(dll_gain_any(450), None);
+        for mhz in [200, 300, 600] {
+            assert_eq!(dll_gain_any(mhz), dll_gain(mhz));
+        }
+        // RxReplicaDllGainCtl per pstate 0..3.
+        let rx = BOARD_DFI_MHZ.map(|mhz| rx_replica_dll_gain(dll_gain_any(mhz).unwrap()));
+        assert_eq!(rx, [0x73, 0x73, 0x53, 0x53]);
     }
 
     #[test]
