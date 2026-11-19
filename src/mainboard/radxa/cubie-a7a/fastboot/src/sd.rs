@@ -20,6 +20,16 @@ pub fn command_allowed(idx: u32) -> bool {
     ALLOWED.contains(&idx)
 }
 
+/// The application commands (sent right after CMD55) a host may send:
+/// ACMD41 (SD_SEND_OP_COND) and ACMD6 SET_BUS_WIDTH with 0 (1-bit) or 2
+/// (4-bit), which bt0's SD boot uses for its 4-bit bus. SET_BUS_WIDTH is
+/// volatile (a power cycle or CMD0 puts the card back on 1 bit); CMD6 as a
+/// plain command (SWITCH_FUNC) stays refused, and so does every other ACMD.
+/// This module itself never sends ACMD6.
+pub fn app_command_allowed(idx: u32, arg: u32) -> bool {
+    matches!((idx, arg), (41, _) | (6, 0) | (6, 2))
+}
+
 pub const BLOCK: usize = 512;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -374,6 +384,13 @@ mod tests {
         }
         for idx in ALLOWED {
             assert!(!matches!(idx, 6 | 24 | 25 | 32 | 33 | 38 | 42 | 56));
+        }
+        // Application commands: ACMD41 and ACMD6 1/4-bit only.
+        for idx in 0..64 {
+            for arg in [0, 1, 2, 3, 0xffff_ffff] {
+                let want = idx == 41 || (idx == 6 && (arg == 0 || arg == 2));
+                assert_eq!(app_command_allowed(idx, arg), want, "ACMD{idx} {arg:#x}");
+            }
         }
         // A refused command never reaches the bus.
         let mut m = SdModel::sdhc(1 << 20);

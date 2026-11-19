@@ -3,17 +3,11 @@
 //! SMHC0 (read-only) and the eMMC module in SMHC2.
 //!
 //! SD: just enough to read the boot layout and images from the card: SD v2
-//! identification, 1-bit bus, default speed. The module clock
+//! identification, 4-bit bus (ACMD6), default speed. The module clock
 //! comes straight from the 24 MHz oscillator; in "new timing" mode the
-//! controller halves it, so data transfers run at 12 MHz.
-//!
-//! Board workaround (2026-11-11): SDC0-D3 (PF4) leaks to ground on the A7A
-//! under test. With PF4 as an input and the internal pull-up the data
-//! register reads PF4 low with or without a card; driven as an output high
-//! it reads back high. A card that sees DAT3 (CD/DAT3) low at CMD0 enters
-//! SPI mode and never answers CMD55. PF4 is therefore never muxed to SMHC0:
-//! it is a GPIO output held high (the card's DAT3 pull-up) and the bus runs
-//! 1-bit on D0 only (no ACMD6, CTYPE stays 0).
+//! controller halves it, so data transfers run at 12 MHz. PF0..PF5 are all
+//! SMHC0 (the earlier PF4/DAT3 workaround, a GPIO held high and a 1-bit
+//! bus for one board, is gone).
 //!
 //! eMMC (SMHC2, `new_smhc2`): the controller side of
 //! `cubie_a7a_fastboot::emmc` (identification, EXT_CSD, partition access,
@@ -23,7 +17,9 @@
 //! Read-only by construction for SD: `cmd_data`, the only writer of the
 //! command register for reads, refuses every command index outside
 //! `cubie_a7a_fastboot::sd::ALLOWED` (identification and read commands;
-//! no write, erase, lock, switch or programming command), in every build.
+//! no write, erase, lock, switch or programming command), and after CMD55
+//! everything but ACMD41 and ACMD6 1/4-bit
+//! (`cubie_a7a_fastboot::sd::app_command_allowed`), in every build.
 //! For the eMMC it applies `cubie_a7a_fastboot::emmc::command_allowed`
 //! (index and argument: CMD6 only to PARTITION_ACCESS and BUS_WIDTH), and
 //! the block write path (`cmd_write`, CMD24/25 only) exists only in
@@ -112,9 +108,6 @@ const NTSR_MODE_NEW: u32 = 1 << 31;
 /// Enable sample-delay calibration with zero delay (as U-Boot on A733).
 const SAMP_DL_CAL_SW_EN: u32 = 1 << 7;
 
-/// PF4 = SDC0-D3, kept off the controller (see the module comment).
-const SD_DAT3_PIN: u32 = 4;
-
 pub const BLOCK_SIZE: usize = 512;
 /// Blocks per CMD18, bounding the time a single transfer can take.
 const MAX_BLOCKS_PER_CMD: u32 = 128;
@@ -145,6 +138,8 @@ pub struct Smhc {
     base: usize,
     rca: u32,
     high_capacity: bool,
+    /// The next command is an application command (CMD55 just went out).
+    app: core::cell::Cell<bool>,
     /// SMHC2 with an eMMC: the eMMC allow-list applies.
     #[cfg(any(medium, feature = "fastboot"))]
     emmc: bool,
@@ -164,24 +159,14 @@ const EMMC_WRITE: bool = cfg!(feature = "fastboot-emmc-write");
 const SDC2_PINS: [u32; 12] = [0, 1, 5, 6, 8, 9, 10, 11, 13, 14, 15, 16];
 
 impl Smhc {
-    /// Clock, reset and pin setup for SMHC0 on PF0..PF3 and PF5; PF4 (D3)
-    /// is held high as a GPIO output (see the module comment).
+    /// Clock, reset and pin setup for SMHC0 on PF0..PF5.
     pub fn new_smhc0(base: usize) -> Self {
-        // PF0 D1, PF1 D0, PF2 CLK, PF3 CMD, PF5 D2: function 2.
-        // PF4 D3: output high, data bit set before the switch to output.
+        // PF0 D1, PF1 D0, PF2 CLK, PF3 CMD, PF4 D3, PF5 D2: function 2.
         for pin in 0..6 {
+            gpio::set_function(Port::F, pin, 2);
             gpio::set_pull(Port::F, pin, if pin == 2 { Pull::None } else { Pull::Up });
             gpio::set_drive(Port::F, pin, 2);
-            if pin == SD_DAT3_PIN {
-                gpio::set_output(Port::F, pin, true);
-            } else {
-                gpio::set_function(Port::F, pin, 2);
-            }
         }
-        println!(
-            "[bt0] SD: PF4 (DAT3) held high as GPIO output, reads {}; 1-bit bus",
-            gpio::read(Port::F, SD_DAT3_PIN) as u32
-        );
         // Module clock: gate on, source OSC24M, N = M = 1.
         write32(ccu::SMHC0_CLK, 1 << 31);
         ccu::bus_enable(ccu::SMHC0_BGR).unwrap_or_else(|error| crate::clock_failure(error));
@@ -189,6 +174,7 @@ impl Smhc {
             base,
             rca: 0,
             high_capacity: false,
+            app: core::cell::Cell::new(false),
             #[cfg(any(medium, feature = "fastboot"))]
             emmc: false,
             #[cfg(any(medium, feature = "fastboot"))]
@@ -223,6 +209,7 @@ impl Smhc {
             base,
             rca: 0,
             high_capacity: false,
+            app: core::cell::Cell::new(false),
             emmc: true,
             detect,
         };
@@ -291,8 +278,13 @@ impl Smhc {
         resp: Resp,
         data: Option<&mut [u32]>,
     ) -> Result<[u32; 4], Error> {
+        let sd_allowed = if self.app.get() {
+            cubie_a7a_fastboot::sd::app_command_allowed(idx, arg)
+        } else {
+            cubie_a7a_fastboot::sd::command_allowed(idx)
+        };
         #[cfg(not(any(medium, feature = "fastboot")))]
-        if !cubie_a7a_fastboot::sd::command_allowed(idx) {
+        if !sd_allowed {
             return Err(Error::Unsupported("SD command not allowed (read-only)"));
         }
         #[cfg(any(medium, feature = "fastboot"))]
@@ -302,7 +294,7 @@ impl Smhc {
             {
                 return Err(Error::Unsupported("eMMC command not allowed"));
             }
-        } else if !cubie_a7a_fastboot::sd::command_allowed(idx) {
+        } else if !sd_allowed {
             return Err(Error::Unsupported("SD command not allowed (read-only)"));
         }
         let mut c = CMD_START | idx;
@@ -395,10 +387,13 @@ impl Smhc {
 
     fn app_cmd(&self, idx: u32, arg: u32, resp: Resp) -> Result<[u32; 4], Error> {
         self.cmd(55, self.rca << 16, Resp::R1)?;
-        self.cmd(idx, arg, resp)
+        self.app.set(true);
+        let r = self.cmd(idx, arg, resp);
+        self.app.set(false);
+        r
     }
 
-    /// Identify the card and put it into 1-bit transfer state.
+    /// Identify the card and put it into 4-bit transfer state.
     pub fn init_card(&mut self) -> Result<(), Error> {
         self.reset_controller()?;
         self.w(NTSR, self.r(NTSR) | NTSR_MODE_NEW);
@@ -438,14 +433,15 @@ impl Smhc {
         self.cmd(2, 0, Resp::R2)?;
         self.rca = self.cmd(3, 0, Resp::R6)?[0] >> 16;
         self.cmd(7, self.rca << 16, Resp::R1b)?;
-        // Stay on the power-on 1-bit bus: no ACMD6, CTYPE stays 0 (D3 is
-        // not connected to the controller).
+        // ACMD6 SET_BUS_WIDTH 4-bit, then the controller.
+        self.app_cmd(6, 2, Resp::R1)?;
+        self.w(CTYPE, 1);
         if !self.high_capacity {
             self.cmd(16, BLOCK_SIZE as u32, Resp::R1)?;
         }
         self.set_card_clock(0)?;
         println!(
-            "[bt0] SD: {} card, RCA {:04x}, OCR {ocr:08x}, 1-bit bus",
+            "[bt0] SD: {} card, RCA {:04x}, OCR {ocr:08x}, 4-bit bus",
             if self.high_capacity {
                 "SDHC/SDXC"
             } else {
