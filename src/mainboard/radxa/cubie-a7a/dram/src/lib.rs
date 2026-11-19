@@ -10,6 +10,8 @@ pub mod blobless;
 pub mod ccu;
 pub mod ctrl;
 pub mod dca;
+#[cfg(any(test, feature = "drift-log"))]
+pub mod drift;
 pub mod dump;
 pub mod handover;
 pub mod hw;
