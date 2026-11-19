@@ -197,3 +197,136 @@ fn set_freq_timing<H: Hw>(
     hw.write32(f(0xb80), 0x17_0000);
     Ok(rl)
 }
+
+#[cfg(test)]
+mod tests {
+    extern crate std;
+    use super::*;
+    use crate::hw::{Rail, RegIo};
+    use crate::sets::{CXMT_4G, CXMT_6G, PARAM_SETS};
+    use core::fmt;
+    use std::collections::HashMap;
+    use std::vec::Vec;
+
+    /// Records writes; reads return the last value written (0 before).
+    #[derive(Default)]
+    struct Rec {
+        writes: Vec<(usize, u32)>,
+        mem: HashMap<usize, u32>,
+    }
+    impl RegIo for Rec {
+        fn read32(&mut self, addr: usize) -> u32 {
+            *self.mem.get(&addr).unwrap_or(&0)
+        }
+        fn write32(&mut self, addr: usize, val: u32) {
+            self.writes.push((addr, val));
+            self.mem.insert(addr, val);
+        }
+        fn read16(&mut self, _: usize) -> u16 {
+            panic!("no PHY access in the controller timing")
+        }
+        fn write16(&mut self, _: usize, _: u16) {
+            panic!("no PHY access in the controller timing")
+        }
+        fn udelay(&mut self, _: u32) {}
+        fn now_us(&mut self) -> u64 {
+            0
+        }
+        fn log(&mut self, _: fmt::Arguments) {}
+    }
+    impl Hw for Rec {
+        fn set_voltage(&mut self, _: Rail, _: u32) -> bool {
+            true
+        }
+    }
+
+    fn set(i: usize) -> Para {
+        Para::from_sysconfig(&PARAM_SETS[i].para)
+    }
+
+    /// Density of one die in Gb: 2^(row + col + bank + bank group) 16-bit
+    /// words, three quarters of that for the non-binary densities.
+    fn die_gb(p: &Para) -> u32 {
+        let words_log2 = p.row_bits() + p.col_bits() + p.bank_bits() + p.bg_bits();
+        let gb = ((16u64 << words_log2) >> 30) as u32;
+        if p.tpr13() & (7 << 16) != 0 {
+            gb * 3 / 4
+        } else {
+            gb
+        }
+    }
+
+    #[test]
+    fn the_6gb_set_gets_the_4gb_sets_controller_timing() {
+        // Clock, pstate dividers and speed bin are the same, and no timing
+        // here depends on the density: every write of every frequency set
+        // is identical, on both channels.
+        for ch in 0..2 {
+            let (mut a, mut b) = (Rec::default(), Rec::default());
+            let (mut pa, mut pb) = (set(CXMT_4G), set(CXMT_6G));
+            let rl_a = set_channel_timing(&mut a, &mut pa, ch).unwrap();
+            let rl_b = set_channel_timing(&mut b, &mut pb, ch).unwrap();
+            assert_eq!(rl_a, rl_b);
+            assert!(a.writes.len() > 100);
+            assert_eq!(a.writes, b.writes, "channel {ch}");
+            // The MR fix-up for the message block is the same too.
+            assert_eq!(pa.w[8..22], pb.w[8..22]);
+        }
+    }
+
+    #[test]
+    fn refresh_timing_covers_the_8gb_and_12gb_dies() {
+        use jedec_lpddr::lp5::timing::{refresh, T_RFCAB, T_RTP, T_XSR_EXTRA};
+        // 4 GB board: 8 Gb dies; 6 GB board: 12 Gb dies (16 rows at three
+        // quarters).
+        assert_eq!((die_gb(&set(CXMT_4G)), die_gb(&set(CXMT_6G))), (8, 12));
+        for i in [CXMT_4G, CXMT_6G] {
+            let p = set(i);
+            let r = refresh(die_gb(&p) as u8).unwrap();
+            // The driver programs one density-independent tRFCab (the
+            // vendor's, 380 ns: the 24/32 Gb value) for tRFCab and tRFCpb,
+            // tXSR = tRFCab + tRTP, and 90 ns for tpbR2pbR.
+            assert!(T_RFCAB >= r.t_rfc_ab_ns && T_RFCAB >= r.t_rfc_pb_ns);
+            assert!(T_XSR_EXTRA >= r.t_pbr2pbr_ns);
+            // JEDEC tXSR = tRFCab + 7.5 ns (max with 2 nCK).
+            assert!(T_RFCAB + T_RTP >= r.t_rfc_ab_ns + 8);
+        }
+        assert_eq!(refresh(12).unwrap().t_rfc_ab_ns, 280);
+        assert_eq!(refresh(8).unwrap().t_rfc_ab_ns, 210);
+
+        // In controller cycles at every pstate of the 6 GB set: the
+        // refresh register fields (+0x604 [11:0] and [27:16]) and tXSR
+        // (+0x38 [11:0]) hold at least the 12 Gb die's times.
+        let mut h = Rec::default();
+        let mut p = set(CXMT_6G);
+        set_channel_timing(&mut h, &mut p, 0).unwrap();
+        for ps in 0..4usize {
+            let mhz = p.clk() / (((p.tpr2() >> (8 * ps)) & 0x1f) + 1);
+            let rfc = h.mem[&freq(0, ps, 0x604)];
+            let xsr = h.mem[&freq(0, ps, 0x38)] & 0xfff;
+            assert!((rfc & 0xfff) >= ns(280, mhz), "pstate {ps}");
+            assert!(((rfc >> 16) & 0xfff) >= ns(280, mhz), "pstate {ps}");
+            assert!(xsr >= ns(288, mhz), "pstate {ps}");
+        }
+    }
+
+    #[test]
+    fn the_6gb_set_gets_the_4gb_sets_message_block_and_mode_registers() {
+        use crate::phy::coldinit::{Mrs, Mrs2};
+        for ps in 0..4u32 {
+            let (mut pa, mut pb) = (set(CXMT_4G), set(CXMT_6G));
+            mr_fixup(&mut pa);
+            mr_fixup(&mut pb);
+            let a = crate::blobless::message_block(&mut pa, ps);
+            let b = crate::blobless::message_block(&mut pb, ps);
+            assert!(a == b, "pstate {ps}");
+        }
+        // The blob-free flow's mode registers at pstate 1 are the oracle's
+        // (recorded for the 4 GB set) for the 6 GB set as well.
+        let mut p = set(CXMT_6G);
+        mr_fixup(&mut p);
+        let (m1, m2) = crate::blobless::mode_registers(&mut p, 1);
+        assert_eq!(m1, Mrs::ORACLE_PSTATE1_CXMT_4G);
+        assert_eq!(m2, Mrs2::ORACLE_PSTATE1_CXMT_4G);
+    }
+}

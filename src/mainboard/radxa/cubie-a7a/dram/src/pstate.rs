@@ -437,7 +437,7 @@ pub const fn dq_vref_code_max(wck_mhz: u32, vddq_mv: u32) -> u8 {
 mod tests {
     extern crate std;
     use super::*;
-    use crate::sets::{CXMT_4G, HYNIX_4G, PARAM_SETS};
+    use crate::sets::{CXMT_4G, CXMT_6G, HYNIX_4G, PARAM_SETS};
     use jedec_lpddr::lp5::timing as jt;
     use std::collections::HashMap;
 
@@ -447,7 +447,7 @@ mod tests {
 
     #[test]
     fn board_dfi_clocks_follow_the_4gb_sets() {
-        for i in [CXMT_4G, HYNIX_4G] {
+        for i in [CXMT_4G, CXMT_6G, HYNIX_4G] {
             let p = set(i);
             for ps in 0..4u32 {
                 assert_eq!(Point::of(&p, ps), Point::board(ps), "set {i} ps {ps}");
@@ -543,7 +543,7 @@ mod tests {
 
     #[test]
     fn mode_registers_and_latencies_at_pstates_0_and_1() {
-        for i in [CXMT_4G, HYNIX_4G] {
+        for i in [CXMT_4G, CXMT_6G, HYNIX_4G] {
             let mut p = set(i);
             let m0 = Params::of(&mut p, 0).unwrap();
             let m1 = Params::of(&mut p, 1).unwrap();
