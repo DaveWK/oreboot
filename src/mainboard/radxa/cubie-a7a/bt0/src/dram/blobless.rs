@@ -1023,6 +1023,18 @@ fn end_of_init(p: &mut Para) -> blobless::EndInitReport {
     e
 }
 
+/// FEL lab: print the hand-over knobs (`blobless::HO_RDDATA_EN`,
+/// `blobless::HO_MR2`) when set.
+fn print_ho_knobs() {
+    if blobless::HO_RDDATA_EN.is_some() || blobless::HO_MR2.is_some() {
+        println!(
+            "[dram] HO knobs: dfi_t_rddata_en {:x?}, MR2 after the hand-over {:x?}",
+            blobless::HO_RDDATA_EN,
+            blobless::HO_MR2
+        );
+    }
+}
+
 /// Feature `bl-mission`, FEL lab knob `A7A_BL_BOOT`: when the lean
 /// hand-over succeeded and the write stage (`A7A_WR_STAGE`) left the probe
 /// blocks writing cleanly, [`init_one`] returns the size instead of
@@ -1036,6 +1048,7 @@ static mut MISSION_OK: bool = false;
 /// Probe the PHY with `para`, print the result and stop (or, with
 /// `A7A_BL_BOOT`, return the size after a clean blobless bring-up).
 pub fn init_one(para: &[u32; 32]) -> Option<u32> {
+    print_ho_knobs();
     let mut p = Para::from_sysconfig(para);
     let mut rb = [Readback::default(); 2];
     let t0 = soc::ticks();
@@ -1406,6 +1419,7 @@ pub fn hybrid_after_pmu(p: &mut Para) -> ! {
         "[dram] HYBRID: PMU trained pstate {}; PUBMODE 1; our stages follow",
         hybrid_pstate()
     );
+    print_ho_knobs();
     if option_env!("A7A_HYBRID_ENDINIT").is_some() {
         let e = end_of_init(p);
         println!(

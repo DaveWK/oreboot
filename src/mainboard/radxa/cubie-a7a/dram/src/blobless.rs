@@ -1078,6 +1078,13 @@ pub fn mission_handover_relock<H: Hw>(
         })?;
         for set in [0, pstate as usize] {
             hw.modify32(freq(ch, set, 0x588), |v| (v & !0x3f_0000) | (rden << 16));
+            if let Some(en) = HO_RDDATA_EN {
+                // FEL lab: dfi_t_rddata_en (+0x580 [22:16]) of the set.
+                hw.modify32(freq(ch, set, crate::handover::DFITMG0), |v| {
+                    (v & !crate::handover::RDDATA_EN_MASK)
+                        | (en << crate::handover::RDDATA_EN_SHIFT)
+                });
+            }
         }
         hw.clrset32(ddrc(ch, 0x008), 0x1f, pstate);
         sw_done(hw, ch)?;
@@ -1104,8 +1111,46 @@ pub fn mission_handover_relock<H: Hw>(
     }
     crate::post::dfi_init_cpu(hw, channels)?;
     crate::post::controller_after_phy(hw, p)?;
+    if let Some(mr2) = HO_MR2 {
+        // FEL lab: MR2 of the operating set-point through the controller,
+        // inside an FSP-WR = FSP-OP window (MR16 0x05 .. 0x04: the state
+        // after the PMU and after the FSP-WR 0 end of initialization).
+        for ch in 0..channels {
+            for rank in 0..2 {
+                crate::mr::write_rank(hw, ch, rank, 16, 0x05)?;
+                crate::mr::write_rank(hw, ch, rank, 2, mr2 as u32)?;
+                crate::mr::write_rank(hw, ch, rank, 16, 0x04)?;
+            }
+        }
+    }
     Ok(rden)
 }
+
+/// FEL lab `A7A_HO_RDDATA_EN=<hex>`: the controller's dfi_t_rddata_en
+/// (+0x580 [22:16]) in set 0 and the active set, written by the lean
+/// hand-over before the DFI init. The timing code leaves 0x2f, which reads
+/// correctly on the PMU-trained state (MR2 0x00, RL 3); MR2 0x88 (RL 13,
+/// what our read training needs) is expected to need about 0x2f + 10.
+/// Unset: unchanged.
+pub const HO_RDDATA_EN: Option<u32> = match option_env!("A7A_HO_RDDATA_EN") {
+    Some(s) => match u32::from_str_radix(s, 16) {
+        Ok(v) if v <= 0x7f => Some(v),
+        _ => panic!("A7A_HO_RDDATA_EN is a hex value up to 0x7f"),
+    },
+    None => None,
+};
+
+/// FEL lab `A7A_HO_MR2=<hex>`: after the lean hand-over, MR2 of every
+/// channel and rank's operating set through the controller (MR16 0x05,
+/// MR2, MR16 0x04), before any read: the hybrid test of the read latency
+/// (the PMU leaves MR2 0x00). Unset: nothing.
+pub const HO_MR2: Option<u8> = match option_env!("A7A_HO_MR2") {
+    Some(s) => match u8::from_str_radix(s, 16) {
+        Ok(v) => Some(v),
+        Err(_) => panic!("A7A_HO_MR2 is a hex byte"),
+    },
+    None => None,
+};
 
 #[cfg(test)]
 mod tests {

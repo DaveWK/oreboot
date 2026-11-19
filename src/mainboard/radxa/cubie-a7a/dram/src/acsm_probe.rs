@@ -138,7 +138,7 @@ const fn h1(v: u16) -> [Row; 2] {
 }
 
 /// The DRAM-free cases in run order.
-pub const CASES: [Case; 63] = [
+pub const CASES: [Case; 66] = [
     // REPEATCNT position and width.
     t("T00-empty", 0, 0),
     t("T01-n0", 0x0b00, 0),
@@ -226,6 +226,12 @@ pub const CASES: [Case; 63] = [
     // One execution (outer loop 0): the per-launch overhead.
     outer(t("T40-n64-once", N64.0, N64.1), 0),
     outer(t("T41-n255-once", 0x7b00, 0x7c00), 0),
+    // Outer loop 0 with a timed (F10) pair, against outer 1 and 3: the
+    // public TRM says 0 executes the program twice. With the override of
+    // 200 one execution is 805 DfiClk (T38), 8 us at pstate 3.
+    outer(with_pre(t("T42-ovr-F10-outer0", 0x0f00, N64.1), &OVR), 0),
+    outer(with_pre(t("T43-ovr-F10-outer1", 0x0f00, N64.1), &OVR), 1),
+    outer(with_pre(t("T44-ovr-F10-outer3", 0x0f00, N64.1), &OVR), 3),
     // CKE field: ACSMCkeStatus after a pair with one candidate bit.
     o("S00-cke-none", h3(0), Obs::Cke, &CKE),
     o("S01-cke-F7", h3(hw3::F7), Obs::Cke, &CKE),
