@@ -1255,6 +1255,12 @@ pub fn mission_handover_relock<H: Hw>(
         // dfi_init_start check and every later read are covered.
         crate::obs::arm(hw);
     }
+    if HO_PULSE_RESTORE {
+        for c in ACSM_READ_PULSES {
+            let v = hw.read16(csr(c));
+            hw.write16(csr(c), v.wrapping_sub(ACSM_PULSE_ADJUST));
+        }
+    }
     for (c, v) in [(0x2006e, 0u16), (0x20060, 1), (0x20054, 1), (0x2002a, 0)] {
         hw.write16(csr(c), v);
     }
@@ -1361,8 +1367,13 @@ pub fn mission_handover_relock<H: Hw>(
             }
         }
     }
-    if HO_SRCYCLE {
+    if let Some(mr16_open) = HO_EPILOGUE {
+        epilogue(hw, channels, mr16_open)?;
+    } else if HO_SRCYCLE {
         sr_cycle(hw, channels)?;
+    }
+    if HO_FIFOINIT {
+        fifo_init(hw, channels)?;
     }
     Ok(rden)
 }
@@ -1409,6 +1420,31 @@ pub const HO_SRCYCLE: bool = option_env!("A7A_HO_SRCYCLE").is_some();
 /// = 2'b10 (software self-refresh), then selfref_sw = 0, selfref_type = 0
 /// and operating_mode normal.
 pub fn sr_cycle<H: Hw>(hw: &mut H, channels: usize) -> Result<(), Error> {
+    sr_enter(hw, channels)?;
+    hw.udelay(10);
+    sr_exit(hw, channels)
+}
+
+/// Software self-refresh entry on every controller (PWRCTL.selfref_sw = 1,
+/// STAT.selfref_type = 2'b10). While it lasts the controller sends no
+/// commands to the DRAM (DES only on the DFI), the state the TRM requires
+/// for ForceInternalUpdate and for an RX FIFO pointer reset.
+pub fn sr_enter<H: Hw>(hw: &mut H, channels: usize) -> Result<(), Error> {
+    use crate::ctrl::ddrc;
+    use crate::hw::wait;
+    use dwc_ddrctl::regs::{PWRCTL, PWRCTL_SELFREF_SW, STAT, STAT_SELFREF_TYPE};
+    for ch in 0..channels {
+        hw.set32(ddrc(ch, PWRCTL), PWRCTL_SELFREF_SW);
+        wait(hw, "STAT.selfref_type software (SR entry)", 100_000, |hw| {
+            hw.read32(ddrc(ch, STAT)) & STAT_SELFREF_TYPE == 0x20
+        })?;
+    }
+    Ok(())
+}
+
+/// Software self-refresh exit on every controller: SRX, then (with
+/// MSTR4.wck_on) the controller's CAS-WS_FS WCK re-sync, back to normal.
+pub fn sr_exit<H: Hw>(hw: &mut H, channels: usize) -> Result<(), Error> {
     use crate::ctrl::ddrc;
     use crate::hw::wait;
     use dwc_ddrctl::regs::{
@@ -1417,23 +1453,139 @@ pub fn sr_cycle<H: Hw>(hw: &mut H, channels: usize) -> Result<(), Error> {
     };
     const T: u64 = 100_000;
     for ch in 0..channels {
-        hw.set32(ddrc(ch, PWRCTL), PWRCTL_SELFREF_SW);
-        wait(hw, "STAT.selfref_type software (SR cycle)", T, |hw| {
-            hw.read32(ddrc(ch, STAT)) & STAT_SELFREF_TYPE == 0x20
-        })?;
-    }
-    hw.udelay(10);
-    for ch in 0..channels {
         hw.clr32(ddrc(ch, PWRCTL), PWRCTL_SELFREF_SW);
-        wait(hw, "STAT.selfref_type clear (SR cycle)", T, |hw| {
+        wait(hw, "STAT.selfref_type clear (SR exit)", T, |hw| {
             hw.read32(ddrc(ch, STAT)) & STAT_SELFREF_TYPE == 0
         })?;
-        wait(hw, "STAT.operating_mode (SR cycle)", T, |hw| {
+        wait(hw, "STAT.operating_mode (SR exit)", T, |hw| {
             hw.read32(ddrc(ch, STAT)) & STAT_OPERATING_MODE == OPERATING_MODE_NORMAL
         })?;
     }
     hw.udelay(2);
     Ok(())
+}
+
+/// FEL lab `A7A_HO_EPILOGUE=1` (MR16 0x45, the PMU's) or `=05` (MR16 0x05,
+/// the window `A7A_HO_MRS` used on the board): the training
+/// firmware's final-stage DRAM state, made by the controller after the
+/// lean hand-over ([`epilogue`]). Unset: nothing (defaults unchanged).
+pub const HO_EPILOGUE: Option<u32> = match option_env!("A7A_HO_EPILOGUE") {
+    Some(s) => match s.as_bytes() {
+        [b'1'] => Some(0x45),
+        [b'0', b'5'] => Some(0x05),
+        _ => panic!("A7A_HO_EPILOGUE is 1 (MR16 0x45) or 05 (MR16 0x05)"),
+    },
+    None => None,
+};
+
+/// The operating-set MRs where the PMU's final stage differs from our end
+/// of initialization (MA, OP). Measured: MR18 OP[4] (WCK always on) is
+/// what the controller's MSTR4.wck_on = 1 needs (MR18 0x0c fails with
+/// the blobless signature, 0x1c passes); MR3 0x06 (read/write DBI
+/// off, DBICTL rd/wr_dbi_en 0) and MR13 0x00 (data mask on, DBICTL dm_en 1)
+/// are the PMU's values read back on the board (MR3/MR13 MRR). Every other
+/// MR of the PMU's final program equals our end of initialization's
+/// (MR1 0x80, MR2 0x88, MR10 0x54, MR11/MR17 per rank, MR12, MR14/15
+/// trained, MR19 0x10, MR20 0x02, MR22, MR24, MR25, MR28 0x04, MR30, MR41,
+/// MR46) and is not rewritten.
+pub const EPILOGUE_MRS: [(u32, u32); 3] = [(18, 0x1c), (3, 0x06), (13, 0x00)];
+
+/// DDRCTL OPCTRLCMD (+0xb8c) and OPCTRLSTAT (+0xb90): bit 16
+/// zq_calib_short / zq_calib_short_busy (public DDRCTL; for LPDDR5 the MPC
+/// ZQ calibration, allowed with ZQCTL0.dis_auto_zq = 1, which `com_init`
+/// sets).
+pub const OPCTRLCMD: usize = 0xb8c;
+pub const OPCTRLSTAT: usize = 0xb90;
+pub const ZQ_CALIB_SHORT: u32 = 1 << 16;
+
+/// The training firmware's final stage, re-made through the controller
+/// after the lean hand-over (`A7A_HO_EPILOGUE`):
+/// 1. per channel and rank, MR16 = `mr16_open` (FSP-WR = FSP-OP = 1), the
+///    [`EPILOGUE_MRS`], MR16 0x04;
+/// 2. per channel, ZQ calibration latch (OPCTRLCMD.zq_calib_short);
+/// 3. one software self-refresh cycle ([`sr_cycle`]): the controller's
+///    SRE and SRX, then its CAS-WS_FS (WCK always on) to every rank.
+///
+/// Why the controller and not an ACSM program before the DFI init (the
+/// PMU's own way: the MRWs, ZQ latch, SRE, MR28 ZQ stop, PDE, then the
+/// controller's SRX at start with INITTMG0.skip_dram_init = 3): every step
+/// here is a public DDRCTL operation, and the result (MR18 0x1c + SR cycle)
+/// read correctly on the board. The ACSM route
+/// needs new row programs whose command spacing would come from the reference
+/// (SRE/PDE timing), and its one earlier attempt (with the SRX
+/// row mis-labelled SRE) timed out. The controller's start-up SRX to an
+/// idle DRAM, which this leaves in place, read correctly in every board
+/// run. REFab: the controller's own refresh runs from the hand-over on.
+pub fn epilogue<H: Hw>(hw: &mut H, channels: usize, mr16_open: u32) -> Result<(), Error> {
+    use crate::ctrl::ddrc;
+    use crate::hw::wait;
+    for ch in 0..channels {
+        for rank in 0..2 {
+            crate::mr::write_rank(hw, ch, rank, 16, mr16_open)?;
+            for (ma, op) in EPILOGUE_MRS {
+                crate::mr::write_rank(hw, ch, rank, ma, op)?;
+            }
+            crate::mr::write_rank(hw, ch, rank, 16, 0x04)?;
+        }
+    }
+    for ch in 0..channels {
+        hw.set32(ddrc(ch, OPCTRLCMD), ZQ_CALIB_SHORT);
+        wait(
+            hw,
+            "OPCTRLSTAT.zq_calib_short_busy (epilogue)",
+            100_000,
+            |hw| hw.read32(ddrc(ch, OPCTRLSTAT)) & ZQ_CALIB_SHORT == 0,
+        )?;
+    }
+    sr_cycle(hw, channels)
+}
+
+/// FEL lab `A7A_HO_FIFOINIT=1`: at the very end of the hand-over, before
+/// any read, the RX FIFO pointers of every DBYTE reset (RxFifoInit
+/// RxFifoInitPtr, broadcast 0x2f0a0, pulse held 2 µs) inside a controller
+/// self-refresh (DFI idle). Measured: without it DBYTE 2's write pointers
+/// start misaligned (the PHY's own FIFO check fires
+/// on DBYTE 2). Unset: nothing.
+pub const HO_FIFOINIT: bool = option_env!("A7A_HO_FIFOINIT").is_some();
+
+/// RX FIFO pointer reset inside a controller self-refresh ([`HO_FIFOINIT`]).
+pub fn fifo_init<H: Hw>(hw: &mut H, channels: usize) -> Result<(), Error> {
+    sr_enter(hw, channels)?;
+    csr_access(hw, true);
+    hw.write16(csr(0x2f0a0), 1);
+    hw.udelay(2);
+    hw.write16(csr(0x2f0a0), 0);
+    hw.udelay(2);
+    csr_access(hw, false);
+    sr_exit(hw, channels)
+}
+
+/// FEL lab `A7A_HO_PULSE_RESTORE=1`: before the DFI init, the ACSM read
+/// pulse timings our DevInit raised by 4 (`phy::devinit` PULSE_ADJUST:
+/// AcsmRxEnPulse, RxValPulse, RdcsPulse, WckReadStaticLo/Hi, WckReadToggle,
+/// WckReadFastToggle) put back by 4, as the training firmware does at the
+/// end of its read latency stage (PMU state 0x82f/0xc10/0x41c/0x2920 against
+/// our 0x833/0xc14/0x420/0x2924). Unset: unchanged.
+pub const HO_PULSE_RESTORE: bool = option_env!("A7A_HO_PULSE_RESTORE").is_some();
+pub const ACSM_READ_PULSES: [u32; 7] = [
+    0x2002c, 0x2002d, 0x20030, 0x20039, 0x2003a, 0x2003b, 0x2003c,
+];
+pub const ACSM_PULSE_ADJUST: u16 = 4;
+
+/// Delay CSRs written in mission mode applied: controller self-refresh (DFI
+/// idle, DES only), ForceInternalUpdate held 5 µs (TRM: DFI offline, at
+/// least 32 DFICLKs), self-refresh exit with the controller's WCK re-sync.
+/// Measured: delay writes in mission mode alone do not take effect. Used
+/// by the write stage per sweep point (`A7A_WR_APPLY`).
+pub fn apply_delays<H: Hw>(hw: &mut H, channels: usize) -> Result<(), Error> {
+    sr_enter(hw, channels)?;
+    csr_access(hw, true);
+    hw.write16(csr(0x200a3), 1);
+    hw.udelay(5);
+    hw.write16(csr(0x200a3), 0);
+    hw.udelay(2);
+    csr_access(hw, false);
+    sr_exit(hw, channels)
 }
 
 /// FEL lab `A7A_HO_RDDATA_EN=<hex>`: the controller's dfi_t_rddata_en

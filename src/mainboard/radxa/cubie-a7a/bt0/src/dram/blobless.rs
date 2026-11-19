@@ -1068,6 +1068,17 @@ fn print_ho_knobs() {
     if let Some(s) = option_env!("A7A_HO_MRS") {
         println!("[dram] HO knobs: operating-set MRWs after the hand-over {s}");
     }
+    if blobless::HO_EPILOGUE.is_some() || blobless::HO_FIFOINIT || blobless::HO_PULSE_RESTORE {
+        println!(
+            "[dram] HO knobs: epilogue MR16 {:x?} MRs {:x?} + ZQ latch + SR cycle, RX FIFO init {}, ACSM read pulses -{} {} {:05x?}",
+            blobless::HO_EPILOGUE,
+            blobless::EPILOGUE_MRS,
+            blobless::HO_FIFOINIT,
+            blobless::ACSM_PULSE_ADJUST,
+            blobless::HO_PULSE_RESTORE,
+            blobless::ACSM_READ_PULSES
+        );
+    }
     if blobless::HO_WCKON.is_some() || blobless::HO_DBICTL.is_some() || blobless::HO_SRCYCLE {
         println!(
             "[dram] HO knobs: MSTR4.wck_on {:x?}, DBICTL {:x?} before the DFI init; self-refresh cycle at the end {}",

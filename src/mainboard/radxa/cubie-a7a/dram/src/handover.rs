@@ -123,10 +123,14 @@ pub const MISSION_LATE: [(u32, u16); 8] = [
     (0x20009, 0),
 ];
 /// Self-refresh entry to both ranks: the firmware's SRE row shape (CA
-/// first edge 0x28, both chip selects, four empty rows, the timing row
-/// 0x7a00, the end row 0x0400).
+/// first edge 0x68, both chip selects, four empty rows, the timing row
+/// 0x7a00, the end row 0x0400). Public LPDDR5 command table (LiteDRAM's
+/// transcription): SRE is `L L L H L H H` = 0x68, SRX `L L L H L H L` =
+/// 0x28. An earlier version of this row carried 0x28 (an SRX, which its
+/// launch issued to a DRAM not in self-refresh); the training firmware's
+/// last launch uses 0x68 (`c068`, both chip selects).
 pub const SRE: [Row; 6] = [
-    Row::raw(0xc028, 0, 0, 0),
+    Row::raw(0xc068, 0, 0, 0),
     Row::EMPTY,
     Row::EMPTY,
     Row::EMPTY,

@@ -11,6 +11,13 @@
 //! | 0x8 | measurement only: the delays and Vref codes found before go back at the end |
 //! | 0x10 | before discovery, a blind clean start ([`wrtrain::blind_baseline`]: per DBYTE the delay with the fewest errors; for the blobless state, where nothing writes cleanly yet) |
 //!
+//! Env `A7A_WR_APPLY=1`: every compare first applies the TxDqDly writes
+//! made since the last one (`cubie_a7a_dram::blobless::apply_delays`:
+//! controller self-refresh so the DFI is idle, ForceInternalUpdate held,
+//! self-refresh exit). On the board, delay CSR writes in mission
+//! mode alone do not take effect, so without it the sweep measures
+//! nothing. Unset: the writes are made as before (defaults unchanged).
+//!
 //! The compare is through the controller: the CPU writes and reads back
 //! [`PROBE`] blocks. The verdict is the host's check afterwards (MRR,
 //! then 3 x 16 MiB memtest), plus the printed delays against the ones found
@@ -63,12 +70,18 @@ fn pattern(addr: usize, seed: u32) -> u32 {
 
 struct Port(Bt0Hw);
 
+/// `A7A_WR_APPLY` (module docs).
+const APPLY: bool = option_env!("A7A_WR_APPLY").is_some();
+/// TxDqDly written since the last compare (applied by the next one).
+static DIRTY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 impl WritePort for Port {
     type Error = Error;
     fn set_tx_dq(&mut self, db: usize, lane: usize, tg: usize, v: u16) -> Result<(), Error> {
         csr_access(&mut self.0, true);
         self.0.write16(csr(wrtrain::tx_dq_csr(db, lane, tg)), v);
         csr_access(&mut self.0, false);
+        DIRTY.store(true, core::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
     fn tx_dq(&mut self, db: usize, lane: usize, tg: usize) -> Result<u16, Error> {
@@ -78,6 +91,12 @@ impl WritePort for Port {
         Ok(v)
     }
     fn check(&mut self, seed: u32) -> Result<Folds, Error> {
+        // Plain load and store: bt0 runs with the MMU off, where the
+        // exclusive accesses of an atomic read-modify-write (swap) abort.
+        if APPLY && DIRTY.load(core::sync::atomic::Ordering::Relaxed) {
+            DIRTY.store(false, core::sync::atomic::Ordering::Relaxed);
+            cubie_a7a_dram::blobless::apply_delays(&mut self.0, DBYTES / 2)?;
+        }
         for &b in PROBE.iter() {
             for a in (b..b + BLOCK_BYTES).step_by(4) {
                 // SAFETY: DRAM in mission mode; bt0 runs from SRAM and
