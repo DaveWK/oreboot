@@ -103,6 +103,7 @@ fn clock_matches(p: &Para) -> bool {
 /// operating one (measured: WL must not run with FSP-WR = FSP-OP). The PMU
 /// leaves 0x04 at pstate 1; what it leaves at pstate 0 is read by the
 /// pstate-0 control run. Unset: nothing.
+#[cfg(not(feature = "wck-alias-probe"))]
 const WL_MR16: Option<u8> = match crate::knob!("A7A_WL_MR16") {
     Some(s) => match u8::from_str_radix(s, 16) {
         Ok(v) => Some(v),

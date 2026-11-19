@@ -559,7 +559,7 @@ pub fn locate(scan: &Scan, want: u8) -> Option<Loc> {
             while hit(p + len) {
                 len += 1;
             }
-            if best.map_or(true, |(l, _)| len > l) {
+            if best.is_none_or(|(l, _)| len > l) {
                 let ptr = ((p + (len - 1) / 2) % FIFO_UI) as u8;
                 best = Some((len, Loc { port, ptr }));
             }
@@ -967,14 +967,14 @@ fn mrr_at<H: Hw>(
         }
         if let Some(sc) = scan.as_deref_mut() {
             for (k, port) in [Port::Dfe0, Port::Both].into_iter().enumerate() {
-                for ptr in 0..FIFO_UI {
+                for (ptr, value) in sc[i][k].iter_mut().enumerate() {
                     let at = Loc {
                         port,
                         ptr: ptr as u8,
                     };
                     let raw: [u16; 8] =
                         core::array::from_fn(|lane| contents(ex, db, lane as u32, at));
-                    sc[i][k][ptr] = decode(&raw, &sel);
+                    *value = decode(&raw, &sel);
                 }
                 ex.hw.kick_watchdog();
             }
@@ -1853,10 +1853,9 @@ mod sim {
             };
             // The lower byte's DQ on the channel's second DBYTE.
             for (i, db) in [2 * ch as u32, 2 * ch as u32 + 1].into_iter().enumerate() {
-                for dq in 0..8 {
-                    let lane = LANE_SEL[db as usize][dq] as u32;
+                for (dq, &lane) in LANE_SEL[db as usize].iter().enumerate() {
                     let bit = i == 1 && v >> dq & 1 != 0;
-                    self.burst.insert((db, lane), bit);
+                    self.burst.insert((db, lane as u32), bit);
                 }
             }
         }

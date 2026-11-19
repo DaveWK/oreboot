@@ -77,6 +77,9 @@ pub mod mem {
             && entry.checked_add(4).is_some_and(|end| end <= base + size)
     }
 
+    /// Where the EDK2 FD is loaded and entered (its PcdFdBaseAddress).
+    pub const PAYLOAD_BASE: usize = 0x4100_0000;
+
     #[cfg(test)]
     mod region_tests {
         use super::*;
@@ -116,9 +119,6 @@ pub mod mem {
             assert_eq!(payload_region(BASE - 4, SIZE), None);
         }
     }
-
-    /// Where the EDK2 FD is loaded and entered (its PcdFdBaseAddress).
-    pub const PAYLOAD_BASE: usize = 0x4100_0000;
 }
 
 /// Boot media layout table, written by the image tool at a fixed offset on
