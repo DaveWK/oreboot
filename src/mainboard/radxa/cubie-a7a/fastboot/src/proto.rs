@@ -58,6 +58,14 @@ pub enum Command<'a> {
     Getvar(&'a str),
     /// `download:<hex size>`; None if the size is not 1 to 8 hex digits.
     Download(Option<u32>),
+    /// `fetch:<part>[:<hex offset>[:<hex size>]]` (the stock tool always
+    /// sends both, `0x%08lx`); None for a field that is present but not
+    /// 1 to 16 hex digits.
+    Fetch {
+        part: &'a str,
+        offset: Option<Option<u64>>,
+        size: Option<Option<u64>>,
+    },
     Flash(&'a str),
     Erase(&'a str),
     Boot,
@@ -106,6 +114,16 @@ pub fn parse(packet: &[u8]) -> Result<Command<'_>, Malformed> {
         Command::Getvar(v)
     } else if let Some(size) = c.strip_prefix("download:") {
         Command::Download(hex_u32(size))
+    } else if let Some(rest) = c.strip_prefix("fetch:") {
+        let mut f = rest.split(':');
+        let part = f.next().unwrap_or("");
+        let offset = f.next().map(hex_u64);
+        let size = f.next().map(hex_u64);
+        if f.next().is_some() {
+            Command::Unknown(c)
+        } else {
+            Command::Fetch { part, offset, size }
+        }
     } else if let Some(p) = c.strip_prefix("flash:") {
         Command::Flash(p)
     } else if let Some(p) = c.strip_prefix("erase:") {
@@ -127,6 +145,28 @@ pub fn parse(packet: &[u8]) -> Result<Command<'_>, Malformed> {
     } else {
         Command::Unknown(c)
     })
+}
+
+/// 1 to 16 hex digits with an optional `0x`; no sign, space or prefix.
+pub fn hex_u64(s: &str) -> Option<u64> {
+    let d = s
+        .strip_prefix("0x")
+        .or_else(|| s.strip_prefix("0X"))
+        .unwrap_or(s);
+    if d.is_empty() || d.len() > 16 {
+        return None;
+    }
+    let mut v = 0u64;
+    for b in d.bytes() {
+        let n = match b {
+            b'0'..=b'9' => b - b'0',
+            b'a'..=b'f' => b - b'a' + 10,
+            b'A'..=b'F' => b - b'A' + 10,
+            _ => return None,
+        };
+        v = (v << 4) | n as u64;
+    }
+    Some(v)
 }
 
 /// 1 to 8 hex digits with an optional `0x`; no sign, space or other
@@ -174,6 +214,10 @@ pub trait Transport {
     /// Exactly `out.len()` bytes of download data, no more.
     fn recv_exact(&mut self, out: &mut [u8]) -> Result<(), Self::Error>;
     fn send(&mut self, data: &[u8]) -> Result<(), Self::Error>;
+    /// The data phase of an upload (`fetch`): exactly `data`, as full
+    /// packets and a short last one; no zero-length packet (the host reads
+    /// exactly the size `DATA` announced).
+    fn send_data(&mut self, data: &[u8]) -> Result<(), Self::Error>;
     /// Wait until the host took the last reply, then leave the bus.
     fn disconnect(&mut self) -> Result<(), Self::Error>;
     /// The error is a bus reset: wait for configuration again and go on.
@@ -230,6 +274,18 @@ pub trait Device {
     ) -> Result<Self::Boot, &'static str>;
     /// May `reboot` (false) or `reboot-bootloader` (true) go ahead?
     fn reboot(&mut self, bootloader: bool) -> Result<(), &'static str>;
+    /// `fetch`: read `size` bytes (None: to the end of the partition) at
+    /// `offset` of `part` into `buf` (the download buffer, which the read
+    /// overwrites) and return where they are in it. Every read error is a
+    /// `FAIL` before any data moves.
+    fn fetch(
+        &mut self,
+        part: &str,
+        offset: u64,
+        size: Option<u64>,
+        buf: &mut [u8],
+        info: &mut dyn Info,
+    ) -> Result<core::ops::Range<usize>, &'static str>;
     /// `oem <args>`: Ok(None) answers `OKAY` and goes on; Ok(Some(exit))
     /// leaves fastboot like the standard commands.
     fn oem(
@@ -264,12 +320,24 @@ fn finish<T: Transport, B>(t: &mut T, exit: Exit<B>) -> Result<Exit<B>, T::Error
 }
 
 /// Variables the protocol layer answers.
-const PROTOCOL_VARS: [&str; 3] = ["version", "max-download-size", "is-userspace"];
+const PROTOCOL_VARS: [&str; 4] = [
+    "version",
+    "max-download-size",
+    "max-fetch-size",
+    "is-userspace",
+];
+
+/// The largest `fetch` chunk: one read into the download buffer, then one
+/// data phase. Small enough that the slowest medium (the SPI NOR at
+/// ~0.7 MB/s) answers within a couple of seconds; the stock tool loops
+/// over the partition in chunks of this size.
+pub const MAX_FETCH: usize = 0x10_0000;
 
 fn protocol_var(name: &str, max: usize, out: &mut Line) -> bool {
     match name {
         "version" => write!(out, "{PROTOCOL_VERSION}").is_ok(),
         "max-download-size" => write!(out, "0x{max:08x}").is_ok(),
+        "max-fetch-size" => write!(out, "0x{:08x}", MAX_FETCH.min(max)).is_ok(),
         "is-userspace" => write!(out, "no").is_ok(),
         _ if name.starts_with("has-slot:") || name.starts_with("is-logical:") => {
             write!(out, "no").is_ok()
@@ -399,6 +467,39 @@ pub fn serve<T: Transport, D: Device>(
                     Err(e) => reply(t, "FAIL", format_args!("{e}")),
                 }
             }
+            Command::Fetch { part, offset, size } => {
+                // The read lands in the download buffer.
+                downloaded = 0;
+                let (Some(offset), Some(size)) = (
+                    offset.unwrap_or(Some(0)),
+                    size.map_or(Some(None), |s| s.map(Some)),
+                ) else {
+                    reply(t, "FAIL", format_args!("bad fetch offset or size"));
+                    continue;
+                };
+                let room = MAX_FETCH.min(max);
+                if size.is_some_and(|s| s == 0 || s > room as u64) {
+                    reply(
+                        t,
+                        "FAIL",
+                        format_args!("fetch size must be 1..=max-fetch-size"),
+                    );
+                    continue;
+                }
+                match d.fetch(part, offset, size, buf, &mut Sink(t)) {
+                    Ok(r) if r.is_empty() || r.len() > room || r.end > buf.len() => reply(
+                        t,
+                        "FAIL",
+                        format_args!("fetch: nothing to send or too large"),
+                    ),
+                    Ok(r) => {
+                        send_line(t, "DATA", format_args!("{:08x}", r.len()))?;
+                        t.send_data(&buf[r])?;
+                        send_line(t, "OKAY", format_args!(""))?;
+                    }
+                    Err(e) => reply(t, "FAIL", format_args!("{e}")),
+                }
+            }
             Command::Unknown(_) => reply(t, "FAIL", format_args!("unknown command")),
         }
     }
@@ -504,6 +605,8 @@ mod tests {
         ack_fail: bool,
         flush_fail: bool,
         disconnected: usize,
+        upload_fail: bool,
+        uploaded: Vec<u8>,
     }
 
     impl Host {
@@ -536,6 +639,13 @@ mod tests {
             for (i, b) in out.iter_mut().enumerate() {
                 *b = i as u8;
             }
+            Ok(())
+        }
+        fn send_data(&mut self, data: &[u8]) -> Result<(), E> {
+            if self.upload_fail {
+                return Err(E::Timeout);
+            }
+            self.uploaded.extend_from_slice(data);
             Ok(())
         }
         fn send(&mut self, data: &[u8]) -> Result<(), E> {
@@ -624,6 +734,33 @@ mod tests {
                 Err("no reset")
             }
         }
+        fn fetch(
+            &mut self,
+            part: &str,
+            offset: u64,
+            size: Option<u64>,
+            buf: &mut [u8],
+            _info: &mut dyn Info,
+        ) -> Result<core::ops::Range<usize>, &'static str> {
+            // A 0x3000-byte device whose bytes are their offset's low byte.
+            if part != "dev" {
+                return Err("unknown partition");
+            }
+            let len = size.unwrap_or(0x3000u64.saturating_sub(offset));
+            if offset.checked_add(len).is_none_or(|e| e > 0x3000) {
+                return Err("past the end");
+            }
+            let len = len as usize;
+            if len > buf.len() {
+                // Claims more than fits: serve() must refuse it.
+                return Ok(0..len);
+            }
+            let start = 16.min(buf.len() - len);
+            for i in 0..len {
+                buf[start + i] = (offset as usize + i) as u8;
+            }
+            Ok(start..start + len)
+        }
         fn oem(
             &mut self,
             args: &str,
@@ -673,6 +810,7 @@ mod tests {
                 "FAILunknown variable",
                 "INFOversion:0.4",
                 "INFOmax-download-size:0x00001000",
+                "INFOmax-fetch-size:0x00001000",
                 "INFOis-userspace:no",
                 "INFOproduct:model",
                 "OKAY",
@@ -810,6 +948,108 @@ mod tests {
                 "OKAY"
             ]
         );
+    }
+
+    #[test]
+    fn parse_fetch_forms() {
+        fn p(s: &str) -> Command<'_> {
+            parse(s.as_bytes()).unwrap()
+        }
+        assert_eq!(
+            p("fetch:nor"),
+            Command::Fetch {
+                part: "nor",
+                offset: None,
+                size: None
+            }
+        );
+        assert_eq!(
+            p("fetch:usb0:0x00000000:0x00100000"),
+            Command::Fetch {
+                part: "usb0",
+                offset: Some(Some(0)),
+                size: Some(Some(0x100000))
+            }
+        );
+        assert_eq!(
+            p("fetch:usb0:0x1d00000000:0x00100000"),
+            Command::Fetch {
+                part: "usb0",
+                offset: Some(Some(0x1d_0000_0000)),
+                size: Some(Some(0x100000))
+            }
+        );
+        assert_eq!(
+            p("fetch:sd:zz"),
+            Command::Fetch {
+                part: "sd",
+                offset: Some(None),
+                size: None
+            }
+        );
+        assert_eq!(p("fetch:a:1:2:3"), Command::Unknown("fetch:a:1:2:3"));
+        assert_eq!(hex_u64("ffffffffffffffff"), Some(u64::MAX));
+        assert_eq!(hex_u64("10000000000000000"), None);
+        assert_eq!(hex_u64("+1"), None);
+    }
+
+    #[test]
+    fn fetch_chunks_like_the_stock_tool() {
+        // getvar max-fetch-size, then the partition in max-fetch-size chunks
+        // (the board's buffer here is 0x1000, so chunks of 0x1000).
+        let mut h = Host::new(&[
+            "getvar:max-fetch-size",
+            "fetch:dev:0x00000000:0x00001000",
+            "fetch:dev:0x00001000:0x00001000",
+            "fetch:dev:0x00002000:0x00001000",
+            "reboot-bootloader",
+        ]);
+        let mut b = Board::default();
+        assert_eq!(run(&mut h, &mut b), Ok(Exit::Bootloader));
+        assert_eq!(h.replies[0], "OKAY0x00001000");
+        assert_eq!(&h.replies[1..4], ["DATA00001000", "OKAY", "DATA00001000"]);
+        assert_eq!(h.uploaded.len(), 0x3000);
+        assert!(h.uploaded.iter().enumerate().all(|(i, &b)| b == i as u8));
+    }
+
+    #[test]
+    fn fetch_refusals_and_abort() {
+        let mut h = Host::new(&[
+            "fetch:dev:0x0:0x0",
+            "fetch:dev:0x0:0x1001",
+            "fetch:dev",
+            "fetch:dev:0x2f00:0x200",
+            "fetch:nope:0x0:0x10",
+            "fetch:dev:0xg:0x10",
+            "fetch:dev:0x2f00",
+            "reboot-bootloader",
+        ]);
+        assert_eq!(run(&mut h, &mut Board::default()), Ok(Exit::Bootloader));
+        assert_eq!(
+            h.replies,
+            [
+                "FAILfetch size must be 1..=max-fetch-size",
+                "FAILfetch size must be 1..=max-fetch-size",
+                "FAILfetch: nothing to send or too large",
+                "FAILpast the end",
+                "FAILunknown partition",
+                "FAILbad fetch offset or size",
+                "DATA00000100",
+                "OKAY",
+                "OKAY",
+            ]
+        );
+        // A transfer that breaks during the data phase ends the session.
+        let mut h = Host::new(&["fetch:dev:0x0:0x100", "reboot-bootloader"]);
+        h.upload_fail = true;
+        assert_eq!(run(&mut h, &mut Board::default()), Err(E::Timeout));
+        assert_eq!(h.replies, ["DATA00000100"]);
+        // A fetch drops the staged download.
+        let mut h = Host::new(&["download:10", "fetch:dev:0x0:0x10", "continue"]);
+        let mut b = Board::default();
+        // The model's continue boots "nothing" (0) when no image is staged.
+        assert_eq!(run(&mut h, &mut b), Ok(Exit::Boot(0)));
+        assert_eq!(b.booted_len, None);
     }
 
     #[test]

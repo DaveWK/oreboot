@@ -24,11 +24,12 @@
 //! after it the images are copied, checked again in place and bt0 hands
 //! over exactly as FEL entry 2 does.
 use core::fmt::Write;
+use core::ops::Range;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use cubie_a7a_common::{crc32, fwlog};
 use cubie_a7a_fastboot::proto::{self, Command, Device, Exit, Info, Line};
-use cubie_a7a_fastboot::{nor, plan, usb};
+use cubie_a7a_fastboot::{fetch, nor, plan, usb};
 use util::mmio::{read32, read64le, read8};
 
 use crate::musb::{self, Musb};
@@ -125,18 +126,21 @@ const NAMES: &[&str] = &[
     "partition-size:main",
     "partition-type:edk2",
     "partition-size:edk2",
+    "partition-type:nor",
+    "partition-size:nor",
 ];
 
 const HELP: &[&str] = &[
     "oem log [hex bytes]: tail of the bt0 console log",
     "oem read32 <hex addr>: one 32-bit register read",
     "oem fel: back to the mask ROM's FEL (as reboot-bootloader)",
+    "oem nor-id: SPI NOR JEDEC ID and status register 1",
+    "oem usb0: open the blue-port USB disk, show it and its GPT",
+    "oem sd: identify the SD card",
+    "fetch: nor bt0 layout main edk2 usb0 usb0p<N> sd [@hexoff+hexlen]",
 ];
 #[cfg(feature = "fastboot-nor-write")]
-const HELP_NOR: &[&str] = &[
-    "oem nor-id: SPI NOR JEDEC ID and status register 1",
-    "oem nor-arm <part> flash <hex len> <hex crc32> | <part> erase",
-];
+const HELP_NOR: &[&str] = &["oem nor-arm <part> flash <hex len> <hex crc32> | <part> erase"];
 #[cfg(not(feature = "fastboot-nor-write"))]
 const HELP_NOR: &[&str] = &[];
 
@@ -147,8 +151,17 @@ struct A7a<'b> {
     b: &'b Bringup,
     serial: &'b str,
     guard: nor::Guard,
-    #[cfg(feature = "fastboot-nor-write")]
     nor: Option<crate::spinor::SpiNor>,
+    usb: Option<crate::ext::UsbDisk>,
+    sd: Option<crate::ext::SdCard>,
+}
+
+/// A read-only device behind a fetch target.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Dev {
+    Nor,
+    Usb,
+    Sd,
 }
 
 fn now_ms() -> u64 {
@@ -208,19 +221,100 @@ fn oem_read32(arg: &str, info: &mut dyn Info) -> Result<(), &'static str> {
     Ok(())
 }
 
-#[cfg(feature = "fastboot-nor-write")]
 impl A7a<'_> {
     fn nor(&mut self) -> Result<&mut crate::spinor::SpiNor, &'static str> {
         if self.nor.is_none() {
             match crate::spinor::SpiNor::new() {
                 Ok(n) => self.nor = Some(n),
                 Err(e) => {
-                    println!("[fastboot] SPI NOR controller init failed: {e:?}");
+                    let _ = e;
+                    println!("[fastboot] SPI NOR controller init failed");
                     return Err("SPI NOR controller init failed");
                 }
             }
         }
         Ok(self.nor.as_mut().unwrap())
+    }
+
+    /// The device, base offset and size in bytes of a target name (no
+    /// window).
+    fn target(&mut self, name: &str) -> Result<(Dev, u64, u64), &'static str> {
+        if name == "nor" {
+            return Ok((Dev::Nor, 0, nor::NOR_SIZE as u64));
+        }
+        if let Some(p) = nor::partition(name) {
+            return Ok((Dev::Nor, p.offset as u64, p.size as u64));
+        }
+        if name == "usb0" || name.starts_with("usb0p") {
+            let i = match name.strip_prefix("usb0p") {
+                Some(n) => Some(n.parse::<usize>().map_err(|_| "unknown partition")?),
+                None => None,
+            };
+            let u = self.usb()?;
+            let (at, size) = crate::ext::usb_extent(u, i)?;
+            return Ok((Dev::Usb, at, size));
+        }
+        if name == "sd" {
+            let c = self.sd()?;
+            return Ok((Dev::Sd, 0, crate::ext::sd_size(c)));
+        }
+        Err("unknown partition")
+    }
+
+    /// Read [start, start + len) of `dev` into `buf`; where the bytes are.
+    fn read(
+        &mut self,
+        dev: Dev,
+        start: u64,
+        len: u64,
+        buf: &mut [u8],
+    ) -> Result<Range<usize>, &'static str> {
+        let len = len as usize;
+        match dev {
+            Dev::Nor => {
+                let f = self.nor()?;
+                f.read(start as u32, &mut buf[..len]).map_err(|_| {
+                    println!("[fastboot] nor read at {start:#x} failed");
+                    "SPI NOR read failed"
+                })?;
+                Ok(0..len)
+            }
+            Dev::Usb => {
+                let u = self.usb()?;
+                crate::ext::usb_read(u, start, len as u64, buf)
+            }
+            Dev::Sd => {
+                let c = self.sd()?;
+                crate::ext::sd_read(c, start, len as u64, buf)
+            }
+        }
+    }
+
+    /// The blue-port disk, opened on first use (needs the DRAM part).
+    fn usb(&mut self) -> Result<&mut crate::ext::UsbDisk, &'static str> {
+        if self.usb.is_none() {
+            crate::extcheck::ready()?;
+            self.usb = Some(crate::ext::usb_open()?);
+        }
+        Ok(self.usb.as_mut().unwrap())
+    }
+
+    /// The SD card, identified on first use (needs the DRAM part).
+    fn sd(&mut self) -> Result<&mut crate::ext::SdCard, &'static str> {
+        if self.sd.is_none() {
+            crate::extcheck::ready()?;
+            self.sd = Some(crate::ext::sd_open()?);
+        }
+        Ok(self.sd.as_mut().unwrap())
+    }
+
+    /// Stop what fastboot started besides USB0 (before the hand-over or
+    /// the return to FEL).
+    fn quiesce(&mut self) {
+        if let Some(u) = self.usb.as_mut() {
+            crate::ext::usb_close(u);
+        }
+        self.usb = None;
     }
 }
 
@@ -298,10 +392,17 @@ impl Device for A7a<'_> {
                 } else {
                     return false;
                 };
-                match nor::partition(p) {
-                    Some(p) if size => write!(out, "0x{:x}", p.size),
-                    Some(_) => write!(out, "raw"),
-                    None => return false,
+                let Ok((base, window)) = fetch::split_window(p) else {
+                    return false;
+                };
+                // Sizes open usb0/sd on first use (seconds).
+                let Ok((_, _, part)) = self.target(base) else {
+                    return false;
+                };
+                match fetch::target_size(part, window) {
+                    Ok(n) if size => write!(out, "0x{n:x}"),
+                    Ok(_) => write!(out, "raw"),
+                    Err(_) => return false,
                 }
             }
         }
@@ -401,6 +502,31 @@ impl Device for A7a<'_> {
         Ok(())
     }
 
+    fn fetch(
+        &mut self,
+        part: &str,
+        offset: u64,
+        size: Option<u64>,
+        buf: &mut [u8],
+        _info: &mut dyn Info,
+    ) -> Result<Range<usize>, &'static str> {
+        let (base, window) = fetch::split_window(part)?;
+        let (dev, at, part_size) = self.target(base)?;
+        let max = proto::MAX_FETCH.min(buf.len()) as u64;
+        let (start, len) = fetch::resolve(part_size, window, offset, size, max)?;
+        let t0 = soc::time_us();
+        let r = self.read(dev, at + start, len, buf)?;
+        let us = (soc::time_us() - t0).max(1);
+        if offset == 0 || (offset & 0xfff_ffff) == 0 {
+            println!(
+                "[fastboot] fetch {part} +{offset:#x}: {len} bytes in {} ms ({} KiB/s)",
+                us / 1000,
+                len * 1_000_000 / 1024 / us
+            );
+        }
+        Ok(r)
+    }
+
     fn oem(
         &mut self,
         args: &str,
@@ -425,16 +551,24 @@ impl Device for A7a<'_> {
             }
             "read32" => oem_read32(rest, info).map(|()| None),
             "fel" => Ok(Some(Exit::Bootloader)),
-            #[cfg(feature = "fastboot-nor-write")]
             "nor-id" => {
-                use nor::NorFlash;
                 let f = self.nor()?;
-                let id = f.jedec_id().map_err(|_| "RDID failed")?;
-                let sr = f.status().map_err(|_| "RDSR failed")?;
+                let id = f.id().map_err(|_| "RDID failed")?;
+                let sr = f.status1().map_err(|_| "RDSR failed")?;
                 info.info(format_args!(
                     "JEDEC ID {:02x} {:02x} {:02x}, SR1 0x{sr:02x}",
                     id[0], id[1], id[2]
                 ));
+                Ok(None)
+            }
+            "usb0" => {
+                let u = self.usb()?;
+                crate::ext::usb_info(u, info);
+                Ok(None)
+            }
+            "sd" => {
+                let c = self.sd()?;
+                crate::ext::sd_info(c, info);
                 Ok(None)
             }
             #[cfg(feature = "fastboot-nor-write")]
@@ -492,10 +626,12 @@ pub fn run(b: &Bringup) -> Back {
             b,
             serial,
             guard: nor::Guard::new(cfg!(feature = "fastboot-nor-write")),
-            #[cfg(feature = "fastboot-nor-write")]
             nor: None,
+            usb: None,
+            sd: None,
         };
-        let r = proto::serve(&mut Speed(&mut usb), &mut dev, buf);
+        let r = proto::serve(&mut Speed(&mut usb, 0), &mut dev, buf);
+        dev.quiesce();
         match r {
             Ok(Exit::Boot(plan)) => {
                 musb::release();
@@ -513,7 +649,10 @@ pub fn run(b: &Bringup) -> Back {
                 return Back::Asked;
             }
             Err(e) => {
-                println!("[fastboot] USB session {session} ended: {e:?}; enumerating again");
+                println!(
+                    "[fastboot] USB session {session} ended: {}; enumerating again",
+                    e.message()
+                );
             }
         }
     }
@@ -522,8 +661,10 @@ pub fn run(b: &Bringup) -> Back {
 }
 
 /// The controller, with the negotiated speed noted for `getvar` and the
-/// download rate on the console.
-struct Speed<'u, 'a>(&'u mut Musb<'a>);
+/// download rate on the console. The second field counts consecutive
+/// `fetch` commands: their command lines are logged one in 64 (a disk
+/// dump is thousands of them, and the UART is slow).
+struct Speed<'u, 'a>(&'u mut Musb<'a>, u32);
 
 impl proto::Transport for Speed<'_, '_> {
     type Error = musb::Error;
@@ -549,13 +690,16 @@ impl proto::Transport for Speed<'_, '_> {
                 );
             }
             Err(e) => {
-                println!("[fastboot] download failed: {e:?}");
+                println!("[fastboot] download failed: {}", e.message());
             }
         }
         r
     }
     fn send(&mut self, data: &[u8]) -> Result<(), musb::Error> {
         self.0.send(data)
+    }
+    fn send_data(&mut self, data: &[u8]) -> Result<(), musb::Error> {
+        self.0.send_data(data)
     }
     fn disconnect(&mut self) -> Result<(), musb::Error> {
         self.0.disconnect()
@@ -564,6 +708,15 @@ impl proto::Transport for Speed<'_, '_> {
         <Musb as proto::Transport>::is_reset(e)
     }
     fn log(&mut self, dir: &str, line: &[u8]) {
-        self.0.log(dir, line)
+        if dir == "<" {
+            self.1 = if line.starts_with(b"fetch:") {
+                self.1 + 1
+            } else {
+                0
+            };
+        }
+        if self.1 <= 1 || self.1.is_multiple_of(64) {
+            self.0.log(dir, line)
+        }
     }
 }

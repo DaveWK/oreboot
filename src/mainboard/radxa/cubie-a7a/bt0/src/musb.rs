@@ -186,6 +186,16 @@ pub enum Error {
     Overrun,
 }
 
+impl Error {
+    pub fn message(&self) -> &'static str {
+        match self {
+            Error::Reset => "bus reset",
+            Error::Timeout(w) => w,
+            Error::Overrun => "overrun",
+        }
+    }
+}
+
 /// What [`Musb::take_over`] found.
 #[derive(Clone, Copy, Debug)]
 pub struct TakeOver {
@@ -642,6 +652,16 @@ impl Transport for Musb<'_> {
         let maxp = self.maxp();
         let data = &data[..data.len().min(maxp - 1)];
         self.write_packet(data)
+    }
+
+    /// Upload data: full packets and a short last one, no zero-length
+    /// packet (the host reads exactly the announced size).
+    fn send_data(&mut self, data: &[u8]) -> Result<(), Error> {
+        let maxp = self.maxp();
+        for chunk in data.chunks(maxp) {
+            self.write_packet(chunk)?;
+        }
+        Ok(())
     }
 
     fn disconnect(&mut self) -> Result<(), Error> {

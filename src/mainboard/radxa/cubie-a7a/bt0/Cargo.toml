@@ -76,8 +76,11 @@ spinor = ["cubie-a7a-dram/vendor-vdd2l"]
 # entry 1 did), takes USB0 over from the mask ROM and serves the stock
 # fastboot tool (18d1:4ee0): getvar, download, boot/continue of a layout
 # bundle (the FEL entry 2 hand-over), reboot, reboot-bootloader (back to
-# FEL), oem log/read32/fel. No SPI NOR code is built in.
-fastboot = ["fel", "dep:cubie-a7a-fastboot"]
+# FEL), oem log/read32/fel, and read-only dumps with `fastboot fetch`: the
+# SPI NOR (READ/RDID/RDSR only), the USB disk on the blue port (EHCI1,
+# Bulk-Only, SCSI reads only), the SD card (identification and reads
+# only). No NOR erase/program code is built in.
+fastboot = ["fel"]
 # fastboot flash/erase of the SPI NOR partitions (bt0, layout, main, edk2)
 # behind cubie_a7a_fastboot::nor's guards (oem nor-arm with the image's
 # length and CRC-32, JEDEC ID, no protection bits, erase/program/read-back
@@ -92,7 +95,9 @@ log = { path = "../../../../lib/log" }
 util = { path = "../../../../lib/util" }
 cubie-a7a-common = { path = "../common" }
 cubie-a7a-dram = { path = "../dram" }
-cubie-a7a-fastboot = { path = "../fastboot", optional = true }
+# Protocol, guards and the read-only allow-lists (smhc.rs uses the SD one
+# in every build).
+cubie-a7a-fastboot = { path = "../fastboot" }
 
 [build-dependencies]
 sha256 = { path = "../../../../lib/sha256" }

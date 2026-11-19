@@ -45,6 +45,17 @@ pub const JEDEC_ID: [u8; 3] = [0xef, 0x60, 0x17];
 pub const SR1_BUSY: u8 = 0x01;
 pub const SR1_WEL: u8 = 0x02;
 pub const SR1_PROTECT: u8 = 0xfc;
+/// The opcodes a read-only NOR access may send: READ, RDID, RDSR1. The
+/// read path of bt0's driver refuses every other byte as an opcode at
+/// run time (and sends no data bytes at all), so `fetch:nor` is in the
+/// default fastboot build; WREN and every erase/program/status-write
+/// opcode exist only in the `fastboot-nor-write` driver.
+pub const READ_OPCODES: [u8; 3] = [0x03, 0x9f, 0x05];
+
+pub fn read_opcode_allowed(op: u8) -> bool {
+    READ_OPCODES.contains(&op)
+}
+
 /// How long an `oem nor-arm` stays valid.
 pub const ARM_TTL_MS: u64 = 60_000;
 
@@ -585,6 +596,18 @@ mod tests {
         );
         assert!(holding(0x0, 0x100, Content::Raw).is_none());
         assert!(holding(0x6ff000, 0x2000, Content::Raw).is_none());
+    }
+
+    #[test]
+    fn read_only_opcodes() {
+        let ok: Vec<u8> = (0..=255u8).filter(|&o| read_opcode_allowed(o)).collect();
+        assert_eq!(ok, [0x03, 0x05, 0x9f]);
+        // Notably not: WREN, erase, program, status writes, reset, unlock.
+        for op in [
+            0x06, 0x20, 0x52, 0xd8, 0xc7, 0x60, 0x02, 0x01, 0x31, 0x11, 0x66, 0x99, 0x98,
+        ] {
+            assert!(!read_opcode_allowed(op), "{op:#x}");
+        }
     }
 
     #[test]

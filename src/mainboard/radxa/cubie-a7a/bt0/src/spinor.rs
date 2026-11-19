@@ -11,8 +11,9 @@
 //! main at 0x200000, the EDK2 FD at 0x300000, all below the 8 MiB end.
 //!
 //! Read-only by construction unless built with `fastboot-nor-write`: the
-//! only opcodes the read path ever puts in the TX FIFO are READ (0x03) and
-//! RDID (0x9f). Each command is loaded after a FIFO reset, and the data
+//! only opcodes the read path ever puts in the TX FIFO are READ (0x03),
+//! RDID (0x9f) and RDSR1 (0x05), checked at run time against
+//! `cubie_a7a_fastboot::nor::READ_OPCODES`. Each command is loaded after a FIFO reset, and the data
 //! phase sends no TX bytes (MTC = command length), so no other byte can
 //! reach the flash as an opcode. The erase/program part at the end of this
 //! file exists only in `fastboot-nor-write` builds (fastboot `flash` and
@@ -64,6 +65,7 @@ const CLK_GATE: u32 = 1 << 31;
 pub const NOR_SIZE: u32 = 0x0080_0000;
 const OP_READ: u8 = 0x03;
 const OP_RDID: u8 = 0x9f;
+const OP_RDSR1_RO: u8 = 0x05;
 
 /// Bytes per READ command; the watchdog is restarted after each.
 const CHUNK: usize = 0x1_0000;
@@ -77,8 +79,7 @@ pub enum Error {
     Timeout { what: &'static str, fsr: u32 },
     Range { offset: u32, len: usize },
     Fifo(u32),
-    /// A write-side guard in this driver refused (never sent).
-    #[cfg(feature = "fastboot-nor-write")]
+    /// A guard in this driver refused (never sent).
     Refused(&'static str),
     /// Status register 1 after WREN or a busy timeout.
     #[cfg(feature = "fastboot-nor-write")]
@@ -131,7 +132,11 @@ impl SpiNor {
     /// One command: `cmd` (opcode and address) from the TX FIFO, then
     /// `out.len()` bytes clocked in with no TX bytes, CS low throughout.
     fn command(&self, cmd: &[u8], out: &mut [u8]) -> Result<(), Error> {
-        debug_assert!(matches!(cmd[0], OP_READ | OP_RDID) && cmd.len() <= 4);
+        // READ, RDID and RDSR1 only (cubie_a7a_fastboot::nor::READ_OPCODES),
+        // checked at run time: no other byte goes out as an opcode here.
+        if cmd.is_empty() || cmd.len() > 4 || !cubie_a7a_fastboot::nor::read_opcode_allowed(cmd[0]) {
+            return Err(Error::Refused("opcode not allowed on the read path"));
+        }
         write32(FCR, FCR_RF_RST | FCR_TF_RST);
         wait_clear(FCR, FCR_RF_RST | FCR_TF_RST, "FIFO reset")?;
         let fsr = read32(FSR);
@@ -172,6 +177,13 @@ impl SpiNor {
         let done = wait_clear(TCR, TCR_XCH, "burst end");
         cs(true);
         done
+    }
+
+    /// Status register 1 (RDSR1), read only.
+    pub fn status1(&self) -> Result<u8, Error> {
+        let mut sr = [0u8];
+        self.command(&[OP_RDSR1_RO], &mut sr)?;
+        Ok(sr[0])
     }
 
     /// JEDEC ID (manufacturer, type, capacity), for the boot log.

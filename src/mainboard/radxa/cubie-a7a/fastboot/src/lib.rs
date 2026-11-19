@@ -10,7 +10,11 @@
 //!   (the board's layout table contract from `cubie-a7a-common`);
 //! - [`nor`]: the SPI NOR partitions and the guards every NOR erase and
 //!   program passes, over an abstract flash ([`nor::NorFlash`]);
-//! - [`usb`]: chapter 9 descriptors and requests of the fastboot function.
+//! - [`usb`]: chapter 9 descriptors and requests of the fastboot function;
+//! - read-only dumps (`fetch`): [`fetch`] (targets and ranges), [`sd`]
+//!   (SD identification and reads), [`msc`] (Bulk-Only/SCSI reads),
+//!   [`usbhost`] (enumeration requests), [`gpt`] (partitions), each with
+//!   its command allow-list.
 //!
 //! The structure follows the shared `fastboot` crate of the SpacemiT K1 bt0
 //! (kept outside this tree:
@@ -25,10 +29,15 @@ extern crate std;
 pub mod bootimg;
 pub mod bundle;
 pub mod egon;
+pub mod fetch;
+pub mod gpt;
+pub mod msc;
 pub mod nor;
 pub mod plan;
 pub mod proto;
+pub mod sd;
 pub mod usb;
+pub mod usbhost;
 
 /// CRC-32 (IEEE 802.3, as zlib's `crc32`), bitwise and table-free (bt0's
 /// SRAM is tight): the NOR arm token, over at most one partition.

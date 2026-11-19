@@ -13,6 +13,11 @@
 //! SPI mode and never answers CMD55. PF4 is therefore never muxed to SMHC0:
 //! it is a GPIO output held high (the card's DAT3 pull-up) and the bus runs
 //! 1-bit on D0 only (no ACMD6, CTYPE stays 0).
+//!
+//! Read-only by construction: `cmd_data`, the only writer of the command
+//! register, refuses every command index outside
+//! `cubie_a7a_fastboot::sd::ALLOWED` (identification and read commands;
+//! no write, erase, lock, switch or programming command), in every build.
 
 use util::mmio::{read32, write32};
 
@@ -210,6 +215,9 @@ impl Smhc {
         resp: Resp,
         data: Option<&mut [u32]>,
     ) -> Result<[u32; 4], Error> {
+        if !cubie_a7a_fastboot::sd::command_allowed(idx) {
+            return Err(Error::Unsupported("SD command not allowed (read-only)"));
+        }
         let mut c = CMD_START | idx;
         if idx == 0 {
             c |= CMD_SEND_INIT_SEQ;
@@ -377,5 +385,87 @@ impl Smhc {
             lba += blocks;
         }
         Ok(())
+    }
+}
+
+/// The controller for fastboot's `fetch:sd` (cubie_a7a_fastboot::sd runs
+/// identification and reads over it; the same gate in `cmd_data` applies).
+#[cfg(feature = "fastboot")]
+impl cubie_a7a_fastboot::sd::SdBus for Smhc {
+    fn card_present(&mut self) -> Option<bool> {
+        // PF6, the card-detect switch: low with a card in (board DT
+        // cd-gpios, active low, pull-up).
+        gpio::set_function(Port::F, SD_CD_PIN, 0);
+        gpio::set_pull(Port::F, SD_CD_PIN, Pull::Up);
+        udelay(100);
+        Some(!gpio::read(Port::F, SD_CD_PIN))
+    }
+
+    fn clock(&mut self, ident: bool) -> Result<(), cubie_a7a_fastboot::sd::BusError> {
+        use cubie_a7a_fastboot::sd::BusError;
+        let r = if ident {
+            self.reset_controller().and_then(|()| {
+                self.w(NTSR, self.r(NTSR) | NTSR_MODE_NEW);
+                self.w(TMOUT, 0xffff_ff40);
+                self.w(IMASK, 0);
+                self.w(RINT, 0xffff_ffff);
+                self.w(CTYPE, 0);
+                self.set_card_clock(30)
+            })
+        } else {
+            self.set_card_clock(0)
+        };
+        udelay(1000);
+        r.map_err(|_| BusError::Error)
+    }
+
+    fn cmd(
+        &mut self,
+        idx: u32,
+        arg: u32,
+        resp: cubie_a7a_fastboot::sd::Resp,
+    ) -> Result<[u32; 4], cubie_a7a_fastboot::sd::BusError> {
+        let r = self.cmd_data(idx, arg, map_resp(resp), None).map_err(bus_error);
+        if idx == 3 {
+            if let Ok(v) = r {
+                self.rca = v[0] >> 16;
+            }
+        }
+        r
+    }
+
+    fn read(&mut self, idx: u32, arg: u32, buf: &mut [u32]) -> Result<(), cubie_a7a_fastboot::sd::BusError> {
+        self.cmd_data(idx, arg, Resp::R1, Some(buf)).map(|_| ()).map_err(bus_error)
+    }
+
+    fn delay_ms(&mut self, ms: u32) {
+        udelay(ms as u64 * 1000);
+    }
+}
+
+#[cfg(feature = "fastboot")]
+const SD_CD_PIN: u32 = 6;
+
+#[cfg(feature = "fastboot")]
+fn map_resp(r: cubie_a7a_fastboot::sd::Resp) -> Resp {
+    use cubie_a7a_fastboot::sd::Resp as R;
+    match r {
+        R::None => Resp::None,
+        R::R1 => Resp::R1,
+        R::R1b => Resp::R1b,
+        R::R2 => Resp::R2,
+        R::R3 => Resp::R3,
+        R::R6 => Resp::R6,
+        R::R7 => Resp::R7,
+    }
+}
+
+#[cfg(feature = "fastboot")]
+fn bus_error(e: Error) -> cubie_a7a_fastboot::sd::BusError {
+    use cubie_a7a_fastboot::sd::BusError;
+    match e {
+        Error::Cmd { rint, .. } if rint & RINT_RESP_TIMEOUT != 0 => BusError::Timeout,
+        Error::Timeout(_) | Error::NoCard => BusError::Timeout,
+        _ => BusError::Error,
     }
 }

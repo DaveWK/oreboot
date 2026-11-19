@@ -21,6 +21,38 @@ const LINKERSCRIPT_FILENAME: &str = "link-cubie-a7a-bt0.ld";
 const MEMORY_SD: &str = "SRAM : ORIGIN = 0x00047000, LENGTH = 0x49000";
 const MEMORY_FEL: &str = "SRAM : ORIGIN = 0x00090000, LENGTH = 0x4f000";
 
+// Feature `fastboot` (src/ext.rs): the block-device dump code (bt0's ext,
+// ehci and smhc modules (smhc only serves `fetch:sd` in FEL builds), and the msc, gpt, usbhost and sd modules of
+// cubie-a7a-fastboot, matched by their v0-mangled paths) is linked into
+// `.dram` at 0x59000000, which the host loads after DRAM is up. These rules
+// come first so they win over `.text`; the extension's exception index
+// entries are discarded (no unwinding; PREL31 cannot reach DRAM from SRAM).
+const MEMORY_DRAM_EXT: &str = "DRAMX : ORIGIN = 0x59000000, LENGTH = 0x100000";
+const DRAM_EXT: &str = "
+    .dram : ALIGN(64) {
+        _dram_start = .;
+        KEEP(*(.dram.head))
+        *(.text.*21oreboot_cubie_a7a_bt03ext*)
+        *(.text.*21oreboot_cubie_a7a_bt04ehci*)
+        *(.text.*21oreboot_cubie_a7a_bt04smhc*)
+        *(.text.*18cubie_a7a_fastboot3msc*)
+        *(.text.*18cubie_a7a_fastboot3gpt*)
+        *(.text.*18cubie_a7a_fastboot7usbhost*)
+        *(.text.*18cubie_a7a_fastboot2sd*)
+        . = ALIGN(4);
+        _dram_end = .;
+    } > DRAMX
+    /DISCARD/ : {
+        *(.ARM.exidx.text.*21oreboot_cubie_a7a_bt03ext*)
+        *(.ARM.exidx.text.*21oreboot_cubie_a7a_bt04ehci*)
+        *(.ARM.exidx.text.*21oreboot_cubie_a7a_bt04smhc*)
+        *(.ARM.exidx.text.*18cubie_a7a_fastboot3msc*)
+        *(.ARM.exidx.text.*18cubie_a7a_fastboot3gpt*)
+        *(.ARM.exidx.text.*18cubie_a7a_fastboot7usbhost*)
+        *(.ARM.exidx.text.*18cubie_a7a_fastboot2sd*)
+    }
+";
+
 const LINKERSCRIPT: &str = "
 OUTPUT_ARCH(arm)
 ENTRY(start)
@@ -28,6 +60,7 @@ MEMORY {
     @MEMORY@
 }
 SECTIONS {
+    @DRAM@
     .head : {
         KEEP(*(.head.egon))
         . = ALIGN(64);
@@ -69,14 +102,23 @@ SECTIONS {
 
 fn main() {
     let out = &PathBuf::from(env::var_os("OUT_DIR").unwrap());
+    let fastboot = env::var_os("CARGO_FEATURE_FASTBOOT").is_some();
     let memory = if env::var_os("CARGO_FEATURE_FEL").is_some() {
         MEMORY_FEL
     } else {
         MEMORY_SD
     };
+    let memory = if fastboot {
+        format!("{memory}\n    {MEMORY_DRAM_EXT}")
+    } else {
+        memory.to_string()
+    };
+    let script = LINKERSCRIPT
+        .replace("@MEMORY@", &memory)
+        .replace("@DRAM@", if fastboot { DRAM_EXT } else { "" });
     File::create(out.join(LINKERSCRIPT_FILENAME))
         .unwrap()
-        .write_all(LINKERSCRIPT.replace("@MEMORY@", memory).as_bytes())
+        .write_all(script.as_bytes())
         .unwrap();
     println!("cargo:rustc-link-search={}", out.display());
 

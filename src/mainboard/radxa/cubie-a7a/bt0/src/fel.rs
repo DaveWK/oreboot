@@ -57,6 +57,8 @@ pub const LINK_BASE: usize = 0x0009_0000;
 /// | 0x018  | bt0        | the ROM's VBAR at entry                        |
 /// | 0x020  | bt0        | lab: ops, output words, error (entry 3)        |
 /// | 0x030  | bt0        | fastboot: why it gave FEL back (entry 4)       |
+/// | 0x040  | host       | fastboot DRAM extension length (entry 4)       |
+/// | 0x044  | host       | fastboot DRAM extension CRC-32 (entry 4)       |
 /// | 0x200  | host       | the image's 512-byte layout table frame        |
 pub const MAILBOX: usize = 0x000d_f000;
 const MB_MAGIC: usize = MAILBOX;
@@ -97,6 +99,9 @@ pub mod state {
 
 /// Mailbox word: why entry 4 returned (fastboot.rs `Back`: 1 asked, 2 USB).
 const MB_FASTBOOT_BACK: usize = MAILBOX + 0x30;
+/// Mailbox words the host writes with the fastboot DRAM extension (ext.rs).
+const MB_EXT_LEN: usize = MAILBOX + 0x40;
+const MB_EXT_CRC: usize = MAILBOX + 0x44;
 
 /// CCU+0x518, the bus clock register bt0's clock setup (ccu_control.rs
 /// `init`) sets to source 0, divider 1.
@@ -453,6 +458,17 @@ extern "C" fn fel_fastboot() {
     write32(MB_STATE, state::FASTBOOT);
     recovery::arm_watchdog();
     println!("[bt0] FEL: entry 4: fastboot on USB0 (the USB-C port)");
+    match crate::extcheck::check(read32(MB_EXT_LEN), read32(MB_EXT_CRC)) {
+        Ok(n) => {
+            println!(
+                "[bt0] FEL: DRAM extension ok ({n} bytes at {:#x}): usb0 and sd dumps",
+                crate::extcheck::BASE
+            );
+        }
+        Err(e) => {
+            println!("[bt0] FEL: {e}; usb0 and sd dumps off");
+        }
+    }
     let back = crate::fastboot::run(&b);
     Uart::attach(UART0_BASE).drain();
     give_back_to_rom();

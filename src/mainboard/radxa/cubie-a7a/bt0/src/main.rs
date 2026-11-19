@@ -52,11 +52,17 @@ mod gpio;
 #[cfg(feature = "fel")]
 mod lab;
 #[cfg(feature = "fastboot")]
+mod ehci;
+#[cfg(feature = "fastboot")]
+mod ext;
+#[cfg(feature = "fastboot")]
+mod extcheck;
+#[cfg(feature = "fastboot")]
 mod musb;
 mod recovery;
 mod smhc;
 mod soc;
-#[cfg(any(feature = "spinor", feature = "fastboot-nor-write"))]
+#[cfg(any(feature = "spinor", feature = "fastboot"))]
 mod spinor;
 
 use gpio::{Port, Pull};
