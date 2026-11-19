@@ -111,19 +111,112 @@ pub fn clear_counts(out: &mut impl FnMut(Step<'_>)) {
     }
 }
 
+/// FEL lab, measurement only: the MR18 MRWs of WCK2CK leveling per
+/// write site, from env `A7A_HYBRID_WL_MR18_OPS` at build time: four
+/// comma-separated fields for the sites in [`mr18_site`] order (entry
+/// base | 0x80, leveling base | 0xc8, restore base | 0x80, cleanup base).
+/// An empty field keeps the reference value, `-` leaves that MRW out (its
+/// rows keep their control words, with no command), a hex byte replaces the
+/// value. Unset: the reference.
+pub mod mr18_site {
+    /// [`super::calibration_entry`]: base | 0x80.
+    pub const ENTRY: usize = 0;
+    /// [`super::calibration_loops`], leveling entry: base | 0xc8.
+    pub const LEVEL: usize = 1;
+    /// [`super::calibration_loops`], restore: base | 0x80.
+    pub const RESTORE: usize = 2;
+    /// [`super::cleanup_sequence`]: base.
+    pub const CLEANUP: usize = 3;
+}
+
+/// One site's MR18 MRW as [`MR18_OPS`] gives it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Mr18Op {
+    Reference,
+    Skip,
+    Value(u8),
+}
+
+/// [`mr18_site`] operations: `None` for malformed text.
+pub const fn parse_mr18_ops(s: Option<&str>) -> Option<[Mr18Op; 4]> {
+    let mut out = [Mr18Op::Reference; 4];
+    let Some(s) = s else {
+        return Some(out);
+    };
+    let b = s.as_bytes();
+    let mut field = 0;
+    let mut from = 0;
+    while from <= b.len() {
+        let mut to = from;
+        while to < b.len() && b[to] != b',' {
+            to += 1;
+        }
+        if field >= 4 {
+            return None;
+        }
+        out[field] = if to == from {
+            Mr18Op::Reference
+        } else if to == from + 1 && b[from] == b'-' {
+            Mr18Op::Skip
+        } else if to - from > 2 {
+            return None;
+        } else {
+            let mut v = 0u8;
+            let mut i = from;
+            while i < to {
+                let d = match b[i] {
+                    c @ b'0'..=b'9' => c - b'0',
+                    c @ b'a'..=b'f' => c - b'a' + 10,
+                    c @ b'A'..=b'F' => c - b'A' + 10,
+                    _ => return None,
+                };
+                v = v * 16 + d;
+                i += 1;
+            }
+            Mr18Op::Value(v)
+        };
+        field += 1;
+        from = to + 1;
+    }
+    if field != 4 {
+        return None;
+    }
+    Some(out)
+}
+
+/// The build's WL MR18 operations (env `A7A_HYBRID_WL_MR18_OPS`).
+pub const MR18_OPS: [Mr18Op; 4] = match parse_mr18_ops(option_env!("A7A_HYBRID_WL_MR18_OPS")) {
+    Some(o) => o,
+    None => panic!("A7A_HYBRID_WL_MR18_OPS malformed (four fields: empty, -, or hex)"),
+};
+
 /// MR18 in the observed two-edge encoding, with explicit rank control on
 /// both rows. `base` is an input, not a guessed derivation from a parameter
 /// set; the independent reference currently covers base=0x0c only.
-fn mr18_rows(rank: Rank, value: u8, long_tail: bool, first_clock: bool) -> [Row; 6] {
+/// `site` selects the [`MR18_OPS`] entry (FEL lab).
+fn mr18_rows(rank: Rank, value: u8, long_tail: bool, first_clock: bool, site: usize) -> [Row; 6] {
+    mr18_rows_op(rank, value, long_tail, first_clock, MR18_OPS[site])
+}
+
+fn mr18_rows_op(rank: Rank, value: u8, long_tail: bool, first_clock: bool, op: Mr18Op) -> [Row; 6] {
     let mut rows = [Row::EMPTY; 6];
+    let value = match op {
+        Mr18Op::Value(v) => v,
+        _ => value,
+    };
     let edges = super::coldinit::mrw_ddr(rank.cs(), 18, value);
+    let (e0, e1) = if op == Mr18Op::Skip {
+        (0, 0)
+    } else {
+        (edges[0].0[0], edges[1].0[0])
+    };
     rows[0] = Row::raw(
-        edges[0].0[0],
+        e0,
         0,
         0,
         rank.control() | if first_clock { 0x400 } else { 0 },
     );
-    rows[1] = Row::raw(edges[1].0[0], 0, 0, rank.control());
+    rows[1] = Row::raw(e1, 0, 0, rank.control());
     if long_tail {
         rows[2] = Row::nop(0x0b00);
         rows[3] = Row::nop(0x0800);
@@ -218,7 +311,7 @@ pub fn calibration_entry(
         out,
     );
     out(Step::Launch {
-        rows: &mr18_rows(rank, mr18_base.0 | 0x80, true, false),
+        rows: &mr18_rows(rank, mr18_base.0 | 0x80, true, false, mr18_site::ENTRY),
         outer: 0,
     });
     writes(
@@ -261,7 +354,7 @@ pub fn calibration_loops(
         out(Step::Write(0x10fb5 + db * 0x1000, 0));
     }
     out(Step::Launch {
-        rows: &mr18_rows(rank, mr18_base.0 | 0xc8, false, false),
+        rows: &mr18_rows(rank, mr18_base.0 | 0xc8, false, false, mr18_site::LEVEL),
         outer: 0,
     });
     out(Step::Write(0x1f0a7, 0x6300));
@@ -278,7 +371,7 @@ pub fn calibration_loops(
         });
     }
     out(Step::Launch {
-        rows: &mr18_rows(rank, mr18_base.0 | 0x80, false, false),
+        rows: &mr18_rows(rank, mr18_base.0 | 0x80, false, false, mr18_site::RESTORE),
         outer: 0,
     });
 }
@@ -550,7 +643,7 @@ pub fn cleanup_sequence(rank: Rank, mr18_base: Mr18Base, out: &mut impl FnMut(St
         outer: 0,
     });
     out(Step::Launch {
-        rows: &mr18_rows(rank, mr18_base.0, true, true),
+        rows: &mr18_rows(rank, mr18_base.0, true, true, mr18_site::CLEANUP),
         outer: 0,
     });
     let mut rows = [Row::EMPTY; 12];
@@ -705,4 +798,47 @@ pub const fn measurement_program(rank: Rank) -> [Row; 152] {
     rows[150] = Row::nop(0x5f00);
     rows[151] = Row::nop(0x0c00);
     rows
+}
+
+#[cfg(test)]
+mod mr18_ops_tests {
+    use super::*;
+
+    #[test]
+    fn ops_text() {
+        use Mr18Op::*;
+        assert_eq!(parse_mr18_ops(None), Some([Reference; 4]));
+        assert_eq!(parse_mr18_ops(Some(",,,")), Some([Reference; 4]));
+        assert_eq!(
+            parse_mr18_ops(Some("00,c8,-,")),
+            Some([Value(0), Value(0xc8), Skip, Reference])
+        );
+        assert_eq!(
+            parse_mr18_ops(Some("80,48,00,0C")),
+            Some([Value(0x80), Value(0x48), Value(0), Value(0x0c)])
+        );
+        assert_eq!(parse_mr18_ops(Some("")), None);
+        assert_eq!(parse_mr18_ops(Some(",,")), None);
+        assert_eq!(parse_mr18_ops(Some(",,,,")), None);
+        assert_eq!(parse_mr18_ops(Some("100,,,")), None);
+        assert_eq!(parse_mr18_ops(Some("g,,,")), None);
+        assert_eq!(MR18_OPS, [Reference; 4]);
+    }
+
+    #[test]
+    fn ops_rows() {
+        for rank in [Rank::R0, Rank::R1] {
+            for (lt, fc) in [(true, false), (false, false), (true, true)] {
+                let r = mr18_rows_op(rank, 0x8c, lt, fc, Mr18Op::Reference);
+                assert_eq!(r, mr18_rows(rank, 0x8c, lt, fc, mr18_site::ENTRY));
+                let v = mr18_rows_op(rank, 0x8c, lt, fc, Mr18Op::Value(0x0c));
+                assert_eq!(v, mr18_rows_op(rank, 0x0c, lt, fc, Mr18Op::Reference));
+                let s = mr18_rows_op(rank, 0x8c, lt, fc, Mr18Op::Skip);
+                assert_eq!((s[0].0[0], s[1].0[0]), (0, 0));
+                assert_eq!(&s[0].0[1..], &r[0].0[1..]);
+                assert_eq!(&s[1].0[1..], &r[1].0[1..]);
+                assert_eq!(&s[2..], &r[2..]);
+            }
+        }
+    }
 }

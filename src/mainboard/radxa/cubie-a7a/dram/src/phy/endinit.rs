@@ -43,6 +43,15 @@ pub const ORDER: [u8; 20] = [
 pub const MR16_WRITE: u8 = 0x41;
 /// MR16 switching the DRAM to the target FSP: FSP-WR 1, FSP-OP 1, VRCG.
 pub const MR16_SWITCH: u8 = 0x45;
+/// Fix candidate (FEL lab; not the default yet): the switch with
+/// FSP-WR back to 0, FSP-OP 1, VRCG off: the MR16 the training firmware
+/// leaves (read back on the board after its pstate-1 training). Later MRWs
+/// (WCK2CK leveling's MR18) then go to the non-operating set. With the
+/// reference's 0x45 the leveling's MR18 MRWs land in the operating set and
+/// break the read path (measured).
+pub const MR16_SWITCH_FSPWR0: u8 = 0x04;
+/// [`MR16_SWITCH_FSPWR0`] with VRCG left on (also passed on the board).
+pub const MR16_SWITCH_FSPWR0_VRCG: u8 = 0x44;
 
 /// FEL lab bisect, measurement only: the parts of [`run_with`],
 /// one bit each. A set bit leaves that part out wherever it occurs; the
@@ -160,6 +169,31 @@ impl Variant {
 
     pub const fn no_mrw_of(&self, ma: u8) -> bool {
         ma < 64 && self.no_mrw & (1 << ma) != 0
+    }
+
+    /// `self` with the switch's MR16 from the fix knob `fspwr0` (env
+    /// `A7A_EI_FSPWR0`: `04` = [`MR16_SWITCH_FSPWR0`], `44` =
+    /// [`MR16_SWITCH_FSPWR0_VRCG`]); `None` for any other text, or when the
+    /// switch value was already changed (`A7A_HYBRID_EI_MR16`).
+    pub const fn with_fspwr0(self, fspwr0: Option<&str>) -> Option<Variant> {
+        let Some(s) = fspwr0 else {
+            return Some(self);
+        };
+        let b = s.as_bytes();
+        let v = if b.len() == 2 && b[0] == b'0' && b[1] == b'4' {
+            MR16_SWITCH_FSPWR0
+        } else if b.len() == 2 && b[0] == b'4' && b[1] == b'4' {
+            MR16_SWITCH_FSPWR0_VRCG
+        } else {
+            return None;
+        };
+        if self.mr16_switch != MR16_SWITCH {
+            return None;
+        }
+        Some(Variant {
+            mr16_switch: v,
+            ..self
+        })
     }
 
     pub const fn is_reference(&self) -> bool {
@@ -750,6 +784,25 @@ mod tests {
             launches(&steps(None))[4][2..6],
             mrw(3, 16, 0x45).map(|r| r.0)
         );
+    }
+
+    #[test]
+    fn fspwr0_fix_knob() {
+        let r = Variant::REFERENCE;
+        assert_eq!(r.with_fspwr0(None), Some(r));
+        assert_eq!(r.with_fspwr0(Some("04")).unwrap().mr16_switch, 0x04);
+        assert_eq!(r.with_fspwr0(Some("44")).unwrap().mr16_switch, 0x44);
+        assert_eq!(r.with_fspwr0(Some("45")), None);
+        assert_eq!(r.with_fspwr0(Some("4")), None);
+        let m = Variant::parse(None, None, Some(",05")).unwrap();
+        assert_eq!(m.with_fspwr0(Some("04")), None);
+        let w = Variant::parse(None, None, Some("45,")).unwrap();
+        assert_eq!(w.with_fspwr0(Some("04")).unwrap().mr16_write, 0x45);
+        // FSP-WR 0, FSP-OP 1 (jedec-lpddr's MR16 layout).
+        let d = jedec_lpddr::lp5::mr::Mr16::decode(MR16_SWITCH_FSPWR0);
+        assert_eq!((d.fsp_wr, d.fsp_op, d.vrcg), (0, 1, false));
+        let d = jedec_lpddr::lp5::mr::Mr16::decode(MR16_SWITCH_FSPWR0_VRCG);
+        assert_eq!((d.fsp_wr, d.fsp_op, d.vrcg), (0, 1, true));
     }
 
     #[test]

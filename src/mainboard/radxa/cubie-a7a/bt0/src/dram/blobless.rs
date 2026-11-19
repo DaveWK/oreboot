@@ -145,6 +145,12 @@ fn wck_level(p: &mut Para) {
     use cubie_a7a_dram::phy::wcklevel::{Channel, Rank};
     use cubie_a7a_dram::wl::{self, SNAP_NAMES, WL_POINTS, WL_STEP};
     let bases = blobless::wl_mr18_bases(p, PROBE_PSTATE);
+    {
+        use cubie_a7a_dram::phy::wcklevel::{Mr18Op, MR18_OPS};
+        if MR18_OPS != [Mr18Op::Reference; 4] {
+            println!("[dram] WL: MR18 ops (entry, level, restore, cleanup) {MR18_OPS:x?}");
+        }
+    }
     let saved = wl::begin(&mut Bt0Hw);
     println!("[dram] WL: lane maps {saved:x?} saved, identity set; sweep {WL_POINTS} points step {WL_STEP}, feedback lanes {:?}, convergence starts {:?}, framing starts {:?}, knob {} launches at counter -/+ {}", wl::FEEDBACK_LANES, wl::CONVERGENCE_STARTS, wl::FRAME_STARTS, wl::KNOB_LAUNCHES, wl::KNOB_OFFSET);
     // SAFETY: bt0 is single-threaded and nothing else refers to these.

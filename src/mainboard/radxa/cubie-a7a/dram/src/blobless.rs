@@ -219,13 +219,22 @@ fn mission_mr_overrides(f: &mut crate::phy::endinit::FspMrs) {
 /// (`write,switch` hex; either empty keeps the reference's). Unset: the
 /// reference stage. Applies wherever [`end_of_init`] runs (feature
 /// `hybrid` with `A7A_HYBRID_ENDINIT`, and the blobless flow).
+/// The fix candidate on top: env `A7A_EI_FSPWR0` = `04` or `44` ends the
+/// stage with FSP-WR 0 (`endinit::MR16_SWITCH_FSPWR0[_VRCG]`), as the
+/// training firmware leaves it; it cannot be combined with a switch value
+/// from `A7A_HYBRID_EI_MR16`.
 pub const END_OF_INIT_VARIANT: crate::phy::endinit::Variant =
     match crate::phy::endinit::Variant::parse(
         option_env!("A7A_HYBRID_EI_SKIP"),
         option_env!("A7A_HYBRID_EI_NO_MRW"),
         option_env!("A7A_HYBRID_EI_MR16"),
     ) {
-        Some(v) => v,
+        Some(v) => match v.with_fspwr0(option_env!("A7A_EI_FSPWR0")) {
+            Some(v) => v,
+            None => panic!(
+                "A7A_EI_FSPWR0 must be 04 or 44, without a switch value in A7A_HYBRID_EI_MR16"
+            ),
+        },
         None => panic!("A7A_HYBRID_EI_SKIP/_NO_MRW/_MR16 malformed"),
     };
 
