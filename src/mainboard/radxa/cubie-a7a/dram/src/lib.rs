@@ -186,3 +186,9 @@ pub fn init_opts<H: Hw>(
     }
     Ok(mib)
 }
+
+// The full-speed lab stages of the blob-free flow (feature `full-speed`;
+// declared here, below the code, so that no line of it moves). Each runs
+// only when its build knob selects it.
+#[cfg(any(test, feature = "full-speed"))]
+pub mod dcactl;
