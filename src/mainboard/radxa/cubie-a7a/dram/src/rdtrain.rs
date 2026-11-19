@@ -359,12 +359,71 @@ pub const RX_EN_MAX: u16 = 0x7ff;
 /// (public EIC7700X TRM).
 pub const MRL_CSR_MAX: u16 = 0x1f;
 
-/// The maximum read latency applied across passing read-training blocks in
-/// the current run (0: none applied yet or training failed).
-/// Later ACSM launches re-select channels and rewrite DFIMRL with the
-/// select's 8 (`phy::coldinit::select`, e.g. the post-training MR16 of
-/// `A7A_RD_FSPWR`), so the hand-over takes the trained value from here.
+/// The maximum read latency published after every required read-training block
+/// has passed including final cleanup (0: none published or training failed).
+/// Published only through [`MrlPublisher::finish`]; later ACSM launches
+/// re-select channels and rewrite DFIMRL with the select's 8
+/// (`phy::coldinit::select`, e.g. the post-training MR16 of `A7A_RD_FSPWR`),
+/// so the hand-over takes the trained value from here.
 pub static APPLIED_MRL: core::sync::atomic::AtomicU16 = core::sync::atomic::AtomicU16::new(0);
+
+#[cfg(test)]
+pub(crate) static APPLIED_MRL_TEST_LOCK: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Accumulates per-block trained read latencies across a read-training run
+/// and publishes the maximum to [`APPLIED_MRL`] only after every required
+/// block passes, including final cleanup (`out.ok() && out.applied`).
+///
+/// Starting a run clears [`APPLIED_MRL`] to `0`. Any failing block taints the
+/// run permanently so no later passing block can repopulate [`APPLIED_MRL`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MrlPublisher {
+    required: usize,
+    passed: usize,
+    max_mrl: u16,
+    failed: bool,
+}
+
+impl MrlPublisher {
+    /// Start a read-training run expecting `required` passing applied blocks,
+    /// immediately clearing any prior [`APPLIED_MRL`] to `0`.
+    pub fn begin(required: usize) -> Self {
+        APPLIED_MRL.store(0, core::sync::atomic::Ordering::Relaxed);
+        Self {
+            required,
+            passed: 0,
+            max_mrl: 0,
+            failed: false,
+        }
+    }
+
+    /// Record one completed block (after all final cleanup). Never publishes
+    /// [`APPLIED_MRL`]; any failing block taints the run.
+    pub fn record(&mut self, out: &RdTrain) {
+        if !self.failed && out.ok() && out.applied && out.mrl > 0 && out.mrl <= MRL_CSR_MAX {
+            self.passed += 1;
+            if out.mrl > self.max_mrl {
+                self.max_mrl = out.mrl;
+            }
+        } else {
+            self.failed = true;
+        }
+    }
+
+    /// Publish the maximum read latency to [`APPLIED_MRL`] iff `required > 0`,
+    /// no block failed, and every required block passed cleanly. Otherwise
+    /// leaves [`APPLIED_MRL`] at `0` and returns `None`.
+    pub fn finish(self) -> Option<u16> {
+        if !self.failed && self.required > 0 && self.passed == self.required && self.max_mrl > 0 {
+            APPLIED_MRL.store(self.max_mrl, core::sync::atomic::Ordering::Relaxed);
+            Some(self.max_mrl)
+        } else {
+            APPLIED_MRL.store(0, core::sync::atomic::Ordering::Relaxed);
+            None
+        }
+    }
+}
 
 /// Derive the read latency (`DFIMRL` / `HwtMRL`, in `DfiClk` cycles) from
 /// the trained receive-enable delay `rx_en` (11-bit CSR in 1/64 UI,
@@ -907,9 +966,6 @@ pub fn train_block_with<H: Hw>(
 ) {
     let (ch, rank) = (out.channel, out.rank);
     *out = RdTrain::empty(ch, rank);
-    if prev.is_none() {
-        APPLIED_MRL.store(0, core::sync::atomic::Ordering::Relaxed);
-    }
     let dbs = dbytes(ch);
     let t0 = hw.now_us();
     out.start_us = t0;
@@ -1014,21 +1070,14 @@ pub fn train_block_with<H: Hw>(
     }
     // Apply: the trained delays and the read latency stay only when every
     // stage, MRL derivation/confirmation and both data checks succeeded;
-    // otherwise everything goes back and APPLIED_MRL is cleared.
+    // otherwise everything goes back. APPLIED_MRL is published separately via
+    // MrlPublisher only after every required block completes final cleanup.
     let keep = cfg.apply
         && out.stop.is_none()
         && ex.failure.is_none()
         && out.check.iter().all(DataCheck::passed);
     out.applied = keep;
-    if keep {
-        let prev_mrl = APPLIED_MRL.load(core::sync::atomic::Ordering::Relaxed);
-        if out.mrl > prev_mrl {
-            APPLIED_MRL.store(out.mrl, core::sync::atomic::Ordering::Relaxed);
-        }
-    } else {
-        if cfg.apply {
-            APPLIED_MRL.store(0, core::sync::atomic::Ordering::Relaxed);
-        }
+    if !keep {
         latency_group(&mut ex, None, ch, search_mrl);
     }
 
@@ -1890,6 +1939,148 @@ mod pstate_config_tests {
         assert!(crate::blobless::handover_mrl(0, 1).is_err());
         assert!(crate::blobless::handover_mrl(MRL_CSR_MAX, 1).is_err());
         assert_eq!(crate::blobless::handover_mrl(4, 1), Ok(5));
+    }
+
+    struct AppliedMrlGuard;
+    impl AppliedMrlGuard {
+        fn acquire() -> Self {
+            use core::sync::atomic::Ordering;
+            while APPLIED_MRL_TEST_LOCK
+                .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_err()
+            {
+                core::hint::spin_loop();
+            }
+            Self
+        }
+    }
+    impl Drop for AppliedMrlGuard {
+        fn drop(&mut self) {
+            APPLIED_MRL.store(0, core::sync::atomic::Ordering::Relaxed);
+            APPLIED_MRL_TEST_LOCK.store(false, core::sync::atomic::Ordering::Release);
+        }
+    }
+
+    fn passing_block(ch: Channel, rank: Rank, mrl: u16) -> RdTrain {
+        let mut out = RdTrain::empty(ch, rank);
+        let mut chk = DataCheck::EMPTY;
+        for p in 0..CHECK_PATTERNS.len() {
+            chk.compares[p] = [16, 16];
+            chk.errors[p] = [0, 0];
+            chk.clean_lanes[p] = [9, 9];
+        }
+        chk.compares[CHECK_PATTERNS.len()] = [16, 16];
+        chk.errors[CHECK_PATTERNS.len()] = [16, 16];
+        chk.clean_lanes[CHECK_PATTERNS.len()] = [0, 0];
+        assert!(chk.passed());
+        out.check = [chk, chk];
+        out.restored = true;
+        out.applied = true;
+        out.mrl = mrl;
+        out.mrl_source = Some(MrlSource::Formula);
+        assert!(out.ok());
+        out
+    }
+
+    #[test]
+    fn mrl_publisher_publishes_max_only_after_all_blocks_pass() {
+        use core::sync::atomic::Ordering;
+        let _g = AppliedMrlGuard::acquire();
+        // Pre-seed stale value: begin() must clear it immediately.
+        APPLIED_MRL.store(6, Ordering::Relaxed);
+        let mut pub_mrl = MrlPublisher::begin(4);
+        assert_eq!(APPLIED_MRL.load(Ordering::Relaxed), 0);
+
+        let blocks = [
+            passing_block(Channel::A, Rank::R0, 4),
+            passing_block(Channel::B, Rank::R0, 5),
+            passing_block(Channel::A, Rank::R1, 4),
+            passing_block(Channel::B, Rank::R1, 4),
+        ];
+        for b in &blocks {
+            pub_mrl.record(b);
+            // Must remain unpublished until finish() after all blocks pass.
+            assert_eq!(APPLIED_MRL.load(Ordering::Relaxed), 0);
+        }
+        assert_eq!(pub_mrl.finish(), Some(5));
+        assert_eq!(APPLIED_MRL.load(Ordering::Relaxed), 5);
+    }
+
+    #[test]
+    fn mrl_publisher_late_cleanup_failure_leaves_unpublished() {
+        use core::sync::atomic::Ordering;
+        let _g = AppliedMrlGuard::acquire();
+
+        // Case 1: training and checks passed (applied=true), but final cleanup
+        // readback failed (restored=false -> ok()=false).
+        let mut pub_mrl = MrlPublisher::begin(4);
+        for b in [
+            passing_block(Channel::A, Rank::R0, 4),
+            passing_block(Channel::B, Rank::R0, 4),
+            passing_block(Channel::A, Rank::R1, 4),
+        ] {
+            pub_mrl.record(&b);
+        }
+        let mut late_fail = passing_block(Channel::B, Rank::R1, 4);
+        late_fail.restored = false;
+        assert!(!late_fail.ok());
+        pub_mrl.record(&late_fail);
+        assert_eq!(pub_mrl.finish(), None);
+        assert_eq!(APPLIED_MRL.load(Ordering::Relaxed), 0);
+
+        // Case 2: late ACSM exit launch failure sets failure=Some(...).
+        let mut pub_mrl = MrlPublisher::begin(4);
+        for b in [
+            passing_block(Channel::A, Rank::R0, 4),
+            passing_block(Channel::B, Rank::R0, 4),
+            passing_block(Channel::A, Rank::R1, 4),
+        ] {
+            pub_mrl.record(&b);
+        }
+        let mut late_acsm = passing_block(Channel::B, Rank::R1, 4);
+        late_acsm.failure = Some(WlFailure::Timeout(0));
+        late_acsm.restored = false;
+        assert!(!late_acsm.ok());
+        pub_mrl.record(&late_acsm);
+        assert_eq!(pub_mrl.finish(), None);
+        assert_eq!(APPLIED_MRL.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn mrl_publisher_fail_then_pass_across_blocks_leaves_unpublished() {
+        use core::sync::atomic::Ordering;
+        let _g = AppliedMrlGuard::acquire();
+        let mut pub_mrl = MrlPublisher::begin(4);
+
+        // Block 0 fails; blocks 1..3 all pass cleanly. Later passing blocks
+        // must not repopulate APPLIED_MRL.
+        let mut bad = passing_block(Channel::A, Rank::R0, 4);
+        bad.stop = Some(TrainStop::NoMrl);
+        bad.applied = false;
+        assert!(!bad.ok());
+        pub_mrl.record(&bad);
+        for b in [
+            passing_block(Channel::B, Rank::R0, 4),
+            passing_block(Channel::A, Rank::R1, 5),
+            passing_block(Channel::B, Rank::R1, 4),
+        ] {
+            pub_mrl.record(&b);
+            assert_eq!(APPLIED_MRL.load(Ordering::Relaxed), 0);
+        }
+        assert_eq!(pub_mrl.finish(), None);
+        assert_eq!(APPLIED_MRL.load(Ordering::Relaxed), 0);
+
+        // Early abort (only 3 of 4 blocks recorded) also leaves unpublished.
+        let mut pub_mrl = MrlPublisher::begin(4);
+        for b in [
+            passing_block(Channel::A, Rank::R0, 4),
+            passing_block(Channel::B, Rank::R0, 4),
+            passing_block(Channel::A, Rank::R1, 4),
+        ] {
+            pub_mrl.record(&b);
+        }
+        assert_eq!(pub_mrl.finish(), None);
+        assert_eq!(APPLIED_MRL.load(Ordering::Relaxed), 0);
     }
 }
 

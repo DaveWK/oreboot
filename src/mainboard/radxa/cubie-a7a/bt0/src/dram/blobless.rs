@@ -870,6 +870,7 @@ fn read_training(bases: [Option<cubie_a7a_dram::phy::wcklevel::Mr18Base>; 4]) ->
     }
     // SAFETY: bt0 is single-threaded and nothing else refers to it.
     let t = unsafe { &mut *core::ptr::addr_of_mut!(RD_TRAIN) };
+    let mut mrl_pub = rdtrain::MrlPublisher::begin(if TRAIN_ONLY { 0 } else { runs.len() });
     let mut prev = None;
     let mut ok = 0;
     for (n, &(ch, rank)) in runs.iter().enumerate() {
@@ -919,6 +920,7 @@ fn read_training(bases: [Option<cubie_a7a_dram::phy::wcklevel::Mr18Base>; 4]) ->
             RD_VREF.as_ref().map(|p| (p, &mut *vr)),
         );
         prev = Some(rank);
+        mrl_pub.record(t);
         ok += t.ok() as u32;
         let nm = rdtrain::block_name(ch, rank);
         let r = (rank == Rank::R1) as usize;
@@ -990,6 +992,7 @@ fn read_training(bases: [Option<cubie_a7a_dram::phy::wcklevel::Mr18Base>; 4]) ->
             break;
         }
     }
+    let published = mrl_pub.finish().is_some();
     println!(
         "[dram] RDT: done, {ok}/{} blocks trained and checked{}",
         runs.len(),
@@ -999,7 +1002,7 @@ fn read_training(bases: [Option<cubie_a7a_dram::phy::wcklevel::Mr18Base>; 4]) ->
             "; trained delays and read latency applied"
         }
     );
-    !TRAIN_ONLY && ok as usize == runs.len()
+    !TRAIN_ONLY && published && ok as usize == runs.len()
 }
 
 /// Feature `handover`: the hand-over to the controller without a

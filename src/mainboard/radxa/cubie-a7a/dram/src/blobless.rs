@@ -2117,14 +2117,11 @@ mod tests {
         }
     }
 
-    static HANDOVER_LOCK: core::sync::atomic::AtomicBool =
-        core::sync::atomic::AtomicBool::new(false);
-
     struct HandoverGuard;
     impl HandoverGuard {
         fn acquire() -> Self {
             use core::sync::atomic::Ordering;
-            while HANDOVER_LOCK
+            while crate::rdtrain::APPLIED_MRL_TEST_LOCK
                 .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
                 .is_err()
             {
@@ -2138,7 +2135,8 @@ mod tests {
             #[cfg(feature = "lab-knobs")]
             crate::knobs::set(crate::knobs::BUILD);
             crate::rdtrain::APPLIED_MRL.store(0, core::sync::atomic::Ordering::Relaxed);
-            HANDOVER_LOCK.store(false, core::sync::atomic::Ordering::Release);
+            crate::rdtrain::APPLIED_MRL_TEST_LOCK
+                .store(false, core::sync::atomic::Ordering::Release);
         }
     }
 
