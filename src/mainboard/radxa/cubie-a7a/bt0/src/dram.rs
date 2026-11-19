@@ -9,7 +9,7 @@
 
 use util::mmio::read32;
 
-use cubie_a7a_dram::sets::{ParamSet, CXMT_4G, HYNIX_4G, PARAM_SETS, SAFE_4G};
+use cubie_a7a_dram::sets::{ParamSet, ADC_STRAPS, CXMT_4G, HYNIX_4G, PARAM_SETS, SAFE_4G};
 
 use crate::axp::Axp;
 use crate::soc;
@@ -52,16 +52,16 @@ pub fn skip_tests() -> bool {
 pub fn report_previous_trace() {}
 
 /// DDR-PARA-SEL-ADC strap voltages from the A7A V1.10 schematic (sheet 6)
-/// and the set each one selects. The SK hynix 4 GB board leaves the
-/// divider unpopulated (pulled up to 1.8 V); 1569 mV is "DDR PARA 7".
-const ADC_STRAPS: [(u32, usize); 6] = [
-    (163, CXMT_4G),
-    (382, 1),
-    (608, 2),
-    (811, 3),
-    (1569, HYNIX_4G),
-    (1800, HYNIX_4G),
-];
+/// and the set each one selects: `cubie_a7a_dram::sets::ADC_STRAPS` (163 mV
+/// CXMT 4 GB, 382 mV CXMT 6 GB, 608 and 811 mV the 8 and 12 GB sets,
+/// 1569 mV and the unpopulated divider at 1.8 V SK hynix 4 GB). The table
+/// lives in the DRAM crate so that host tests cover it, together with
+/// `by_strap_mv`, the function form of the nearest-entry choice in
+/// [`select`].
+///
+/// Read on the boards: 163 mV (4 GB CXMT), 380 and 381 mV (6 GB CXMT).
+///
+/// The strap's GPADC channel:
 const DDR_SEL_ADC_CHANNEL: u32 = 1;
 
 /// Choose the parameter set like vendor boot0: read the PH16/PH17 strap
