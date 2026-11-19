@@ -217,6 +217,13 @@ impl<H: Hw> Phy<'_, H> {
 /// DevInit before reset release. Call after `blobless::pre_training` (PMU
 /// stalled); leaves CPU CSR access selected and the DRAM in reset.
 pub fn pre_release<H: Hw>(hw: &mut H, rep: &mut DevinitReport) {
+    pre_release_opts(hw, rep, false)
+}
+
+/// [`pre_release`]; with `keep_dram` (FEL lab, the hybrid's stage 0 over the
+/// PMU-trained state) the DRAM is neither put into reset (MemResetL 2) nor
+/// given the power-on-reset latch pulse, so only the PHY steps run.
+pub fn pre_release_opts<H: Hw>(hw: &mut H, rep: &mut DevinitReport, keep_dram: bool) {
     *rep = DevinitReport::EMPTY;
     csr_access(hw, true);
     let mut p = Phy(hw);
@@ -229,7 +236,9 @@ pub fn pre_release<H: Hw>(hw: &mut H, rep: &mut DevinitReport) {
     let cc = p.r(CLOCKING_CTRL);
     p.w(CLOCKING_CTRL, cc | 1);
     p.w(TX_RD_PTR_INIT, 1);
-    p.w(MEM_RESET_L, 2);
+    if !keep_dram {
+        p.w(MEM_RESET_L, 2);
+    }
     p.w(ACSM_CKE_CONTROL, 1);
     for (a, v) in UNNAMED_SETUP {
         p.w(a, v);
@@ -279,9 +288,13 @@ pub fn pre_release<H: Hw>(hw: &mut H, rep: &mut DevinitReport) {
     for n in 0..DBYTES {
         rep.ctl04_after[n as usize] = p.r(dx(n, RX_REPLICA_CTL04));
     }
-    p.w(CLR_POR_MEM_RESET, 1);
+    if !keep_dram {
+        p.w(CLR_POR_MEM_RESET, 1);
+    }
     p.w(PLL_CTRL3, PLL_CTRL3_VALUE);
-    p.w(CLR_POR_MEM_RESET, 0);
+    if !keep_dram {
+        p.w(CLR_POR_MEM_RESET, 0);
+    }
     p.w(PLL_BYPASS_MODE, 0);
     p.w(ZCAL_RESET, 0);
     p.w(PLL_STANDBY, 0);

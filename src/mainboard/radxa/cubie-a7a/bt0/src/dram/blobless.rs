@@ -1165,6 +1165,10 @@ pub fn init_one(para: &[u32; 32]) -> Option<u32> {
                 if t.done == 8 && t.exec.failure.is_none() {
                     // The reference's end of initialization (target
                     // FSP mode registers, FSP-OP switch) before WL.
+                    if let Some(spec) = option_env!("A7A_FSP0_MRS") {
+                        let f = blobless::fsp0_mrs(&mut Bt0Hw, &mut p, PROBE_PSTATE);
+                        println!("[dram] FSP0 MRs {spec} written (MR16 40 .. 00): failure {f:?}");
+                    }
                     let e = end_of_init(&mut p);
                     if e.failure.is_none() {
                         wck_level(&mut p);
@@ -1443,6 +1447,21 @@ pub fn hybrid_after_pmu(p: &mut Para) -> ! {
         hybrid_pstate()
     );
     print_ho_knobs();
+    if let Some(stage) = option_env!("A7A_HYBRID_COLD") {
+        // FEL lab: our DevInit / cold init / CBT over the
+        // PMU-trained state (blobless::hybrid_cold).
+        let stage = (stage.as_bytes()[0] - b'0') as u32;
+        let mut t = blobless::CaTrainReport::EMPTY;
+        blobless::hybrid_cold(&mut Bt0Hw, p, PROBE_PSTATE, stage, &mut t);
+        println!(
+            "[dram] HYBRID: our cold stage {stage}: devinit failure {:?}, exec failure {:?}, CBT blocks done {}, CA ch A {:?} ch B {:?}",
+            t.devinit.failure, t.exec.failure, t.done, t.channels[0].delay, t.channels[1].delay
+        );
+    }
+    if let Some(spec) = option_env!("A7A_FSP0_MRS") {
+        let f = blobless::fsp0_mrs(&mut Bt0Hw, p, PROBE_PSTATE);
+        println!("[dram] FSP0 MRs {spec} written (MR16 40 .. 00): failure {f:?}");
+    }
     if option_env!("A7A_HYBRID_ENDINIT").is_some() {
         let e = end_of_init(p);
         println!(

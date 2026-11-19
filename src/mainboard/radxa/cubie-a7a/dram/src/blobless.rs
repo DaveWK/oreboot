@@ -1067,6 +1067,118 @@ pub fn cold_init_ca_train<H: Hw>(
     out.exec.elapsed_us = hw.now_us().wrapping_sub(t0);
 }
 
+/// FEL lab `A7A_FSP0_MRS=<MAs|all>`: after our cold init,
+/// before our end of initialization, the listed mode registers (the end of
+/// initialization's values, `A7A_BL_MRS` applied) written into FSP 0 while
+/// FSP 0 operates: MR16 0x40 (FSP-WR 0, FSP-OP 0, VRCG), the MRWs, MR16
+/// 0x00. After a DRAM reset FSP 0 holds the reset values (MR18 CKR 1, a
+/// 2:1 WCK ratio), and the end of initialization makes FSP 0 operate during
+/// its per-rank writes (MR16 0x41). Returns the launch failure, if any.
+pub fn fsp0_mrs<H: Hw>(hw: &mut H, p: &mut Para, pstate: u32) -> Option<crate::wl::WlFailure> {
+    use crate::phy::endinit::{self, skip, FspMrs, Variant, ORDER};
+    use crate::phy::wcklevel::Channel;
+    let spec = option_env!("A7A_FSP0_MRS")?;
+    let all = ORDER.iter().fold(0u64, |a, &ma| a | 1 << ma);
+    let only = if spec == "all" {
+        all
+    } else {
+        Variant::parse(None, Some(spec), None)
+            .map(|v| v.no_mrw)
+            .unwrap_or(0)
+    };
+    let v = Variant {
+        skip: skip::REFAB | skip::CBT_EXIT,
+        no_mrw: all & !only,
+        mr16_write: 0x40,
+        mr16_switch: 0x00,
+    };
+    let m = message_block(p, pstate);
+    let mut ex = crate::wl::WlExec::new(hw);
+    endinit::run_with(
+        Channel::B,
+        |ch, rank| {
+            let mut f = FspMrs::from_message_block(&m, ch, rank);
+            mission_mr_overrides(&mut f);
+            f
+        },
+        &v,
+        &mut |s| ex.step(s),
+    );
+    let f = ex.failure;
+    csr_access(hw, false);
+    f
+}
+
+/// FEL lab hybrid: our DevInit / cold init / CBT over the
+/// PMU-trained state, before our end of initialization, WL and the lean
+/// hand-over. `stage` 0: DevInit's PHY steps only (the DRAM kept out of
+/// reset); 1: DevInit, DRAM reset release and the cold-init MRWs (part 1 and
+/// 2), then the CBT exit of block 0 and the CBT end (the PMU's CA delays
+/// stay); 2: the whole cold init and CA training ([`cold_init_ca_train`]);
+/// 3: DevInit and the DRAM reset release only; 4: 3 plus cold-init part 1.
+pub fn hybrid_cold<H: Hw>(
+    hw: &mut H,
+    p: &mut Para,
+    pstate: u32,
+    stage: u32,
+    out: &mut CaTrainReport,
+) {
+    let (m1, m2) = mode_registers(p, pstate);
+    *out = CaTrainReport::EMPTY;
+    match stage {
+        0 => {
+            crate::phy::devinit::pre_release_opts(hw, &mut out.devinit, true);
+            csr_access(hw, false);
+        }
+        1 => {
+            let t0 = hw.now_us();
+            let mut ex = Executor {
+                hw: &mut *hw,
+                r: out.exec,
+                loop_run: 0,
+                mem_reset: 3,
+            };
+            bring_up_to_cbt(&mut ex, &m1, &m2, &mut out.devinit, &mut |_| {});
+            coldinit::block_exit(&coldinit::CBT_BLOCKS[0], &m2, &mut |s| ex.step(s));
+            coldinit::cbt_end(&mut |s| ex.step(s));
+            out.exec = ex.r;
+            csr_access(hw, false);
+            out.exec.elapsed_us = hw.now_us().wrapping_sub(t0);
+        }
+        3 | 4 => {
+            // 3: DevInit and the DRAM reset release only; 4: plus cold-init
+            // part 1 (no CBT entry, no CBT exit).
+            let t0 = hw.now_us();
+            let mut ex = Executor {
+                hw: &mut *hw,
+                r: out.exec,
+                loop_run: 0,
+                mem_reset: 2,
+            };
+            devinit::pre_release(ex.hw, &mut out.devinit);
+            let delay_row = [coldinit::Row::nop(0x1b00), coldinit::Row::EMPTY];
+            ex.step(coldinit::Step::Launch {
+                start: 0,
+                rows: &delay_row,
+            });
+            csr_access(ex.hw, true);
+            ex.hw.write16(csr(CLR_POR_MEM_RESET), 1);
+            ex.hw.write16(csr(CLR_POR_MEM_RESET), 0);
+            ex.hw.udelay(RESET_LOW_US);
+            ex.hw.write16(csr(MEM_RESET_L), 3);
+            ex.hw.udelay(RESET_HIGH_US);
+            ex.mem_reset = 3;
+            if stage == 4 {
+                coldinit::part1(&m1, &mut |s| ex.step(s));
+            }
+            out.exec = ex.r;
+            csr_access(hw, false);
+            out.exec.elapsed_us = hw.now_us().wrapping_sub(t0);
+        }
+        _ => cold_init_ca_train(hw, &m1, &m2, out),
+    }
+}
+
 /// The lean hand-over after our own training, the same
 /// steps the open driver takes without the PIE (`phy::devinit::
 /// mission_bringup` level 3 minus the PLL/DLL relock, which our flow never
