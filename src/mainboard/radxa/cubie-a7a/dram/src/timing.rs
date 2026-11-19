@@ -20,6 +20,12 @@ pub use jedec_lpddr::timing::ns_to_ck as ns;
 /// as the vendor parameter tables use them.
 use jedec_lpddr::lp5::timing as lp5;
 
+const FULL_INIT_1K: bool = crate::knob!("A7A_INIT_1K_FULL").is_some();
+const INIT_CYCLE_MASK: u32 = if FULL_INIT_1K { u32::MAX } else { 0xffff };
+// Conservative DWC INIT0.post_cke_x1024 bound (RK3588 INITTMG0 [25:16]).
+// At or below this clock the rounded 200 us count fits in ten bits.
+const MAX_INIT_MHZ: u32 = ((1 << 10) - 1) * 1024 * 1000 / lp5::T_INIT_200US;
+
 /// Write the timing registers of every frequency set of channel `ch`.
 /// Also fixes up the mode-register words of the parameter set the PHY
 /// firmware trains with (MR1 [7], MR2 [7]/[3]) and returns the read latency
@@ -30,6 +36,9 @@ pub fn set_channel_timing<H: Hw>(hw: &mut H, p: &mut Para, ch: usize) -> Result<
     let mut rl = 13;
     for ps in (0..=if multi { 3 } else { 0 }).rev() {
         let mhz = p.clk() / (((p.tpr2() >> (8 * ps)) & 0x1f) + 1);
+        if FULL_INIT_1K && mhz > MAX_INIT_MHZ {
+            return Err(Error::Config("200 us init wait outside its field"));
+        }
         rl = set_freq_timing(hw, p, ch, ps, mhz)?;
         hw.udelay(20);
     }
@@ -67,10 +76,9 @@ fn set_freq_timing<H: Hw>(
     let refi_x32 = t(T_REFI) >> 5;
     let rfc = t(T_RFCAB);
     let xsr = rfc + rtp;
-    // 200 us in units of 1024 cycles. The vendor init takes the cycle count
-    // modulo 2^16 first, which only matters at 600 MHz (54 instead of 118);
-    // kept, since that is what has run on hardware.
-    let init_1k = (t(T_INIT_200US) & 0xffff).div_ceil(1024);
+    // The board-tested default masks the 200 us wait before rounding to
+    // 1024-cycle units. At 600 MHz that gives 54; the full count gives 118.
+    let init_1k = (t(T_INIT_200US) & INIT_CYCLE_MASK).div_ceil(1024);
     let zqcal = t(T_ZQCAL);
     let xsr_extra = t(T_XSR_EXTRA);
     let cke = t(T_CKE);
@@ -242,6 +250,46 @@ mod tests {
 
     fn set(i: usize) -> Para {
         Para::from_sysconfig(&PARAM_SETS[i].para)
+    }
+
+    #[test]
+    fn init_1k_register_at_each_pstate() {
+        let mut hw = Rec::default();
+        let mut p = set(CXMT_4G);
+        set_channel_timing(&mut hw, &mut p, 0).unwrap();
+        for (ps, (mhz, legacy, full)) in
+            [(600, 54, 118), (300, 59, 59), (200, 40, 40), (100, 20, 20)]
+                .into_iter()
+                .enumerate()
+        {
+            let expected = if crate::knob!("A7A_INIT_1K_FULL").is_some() {
+                full
+            } else {
+                legacy
+            };
+            let esck = ns(lp5::T_ESCKE, mhz) + 1;
+            assert_eq!(
+                hw.mem[&freq(0, ps, 0x5c)],
+                esck | (expected << 16),
+                "pstate {ps}"
+            );
+        }
+    }
+
+    #[test]
+    fn full_init_1k_field_limit() {
+        assert_eq!(MAX_INIT_MHZ, 5237);
+        if FULL_INIT_1K {
+            let mut p = set(CXMT_4G);
+            p.w[0] = MAX_INIT_MHZ + 1;
+            p.w[24] = 0; // Divide by one for every pstate.
+            let mut hw = Rec::default();
+            assert!(matches!(
+                set_channel_timing(&mut hw, &mut p, 0),
+                Err(Error::Config("200 us init wait outside its field"))
+            ));
+            assert!(hw.writes.is_empty());
+        }
     }
 
     /// Density of one die in Gb: 2^(row + col + bank + bank group) 16-bit
