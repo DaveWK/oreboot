@@ -305,6 +305,55 @@ pub fn blind_baseline<P: WritePort>(
     Ok((v, left))
 }
 
+/// Centre a clean [`blind_baseline`] start on its whole clean run (FEL lab
+/// `A7A_WR_BLIND_CENTER`). The baseline keeps the first coarse
+/// point with the fewest errors and centres only within +/-8 of it, i.e.
+/// 4-8 UI/64 inside the early edge of the write window: about 50 ps at
+/// 1200 MHz WCK, about 25 ps at 2400. Per DBYTE (all lanes, both timing
+/// groups together, as in the baseline) this walks down and up from
+/// `start` in steps of 1 while the probe blocks stay clean, then sets the
+/// middle. Returns the value and the clean run `(lo, hi)` per DBYTE, and
+/// the error bits left. A DBYTE whose start is not clean keeps its start.
+#[allow(clippy::type_complexity)]
+pub fn blind_center<P: WritePort>(
+    p: &mut P,
+    start: [u16; DBYTES],
+    seed: &mut u32,
+) -> Result<([u16; DBYTES], [(u16, u16); DBYTES], u32), WrError<P::Error>> {
+    let mut v = start;
+    let mut run = [(0u16, 0u16); DBYTES];
+    for db in 0..DBYTES {
+        set_dbyte(p, db, start[db]).map_err(WrError::Port)?;
+    }
+    for db in 0..DBYTES {
+        run[db] = (start[db], start[db]);
+        if error_bits(p, seed).map_err(WrError::Port)? != 0 {
+            continue;
+        }
+        let mut lo = start[db];
+        while lo > 0 {
+            set_dbyte(p, db, lo - 1).map_err(WrError::Port)?;
+            if error_bits(p, seed).map_err(WrError::Port)? != 0 {
+                break;
+            }
+            lo -= 1;
+        }
+        let mut hi = start[db];
+        while hi < TX_DQ_MAX {
+            set_dbyte(p, db, hi + 1).map_err(WrError::Port)?;
+            if error_bits(p, seed).map_err(WrError::Port)? != 0 {
+                break;
+            }
+            hi += 1;
+        }
+        run[db] = (lo, hi);
+        v[db] = lo + (hi - lo) / 2;
+        set_dbyte(p, db, v[db]).map_err(WrError::Port)?;
+    }
+    let left = error_bits(p, seed).map_err(WrError::Port)?;
+    Ok((v, run, left))
+}
+
 /// A sweep: every lane at `base[db][lane] + lo + step * i`, i < `n`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Sweep {
@@ -1048,6 +1097,26 @@ mod tests {
             for lane in 0..DMI_LANE {
                 assert!(r.applied[db][lane].abs_diff(s.centre[db][lane][0]) <= 1);
             }
+        }
+    }
+
+    #[test]
+    fn blind_center_moves_off_the_early_edge() {
+        let mut s = Sim::new();
+        let mut seed = 21;
+        let (v, left) = blind_baseline(&mut s, &mut seed).unwrap();
+        assert_eq!(left, 0);
+        let (c, run, left) = blind_center(&mut s, v, &mut seed).unwrap();
+        assert_eq!(left, 0, "centred {c:x?} runs {run:x?}");
+        for db in 0..DBYTES {
+            // The DBYTE's clean run is the overlap of its lanes' windows:
+            // centres base + 0..6 (+1 for tg 1), half width 20 less 2 per
+            // Vref code off the DBYTE's best (all MRs start at 0x2e).
+            let base = s.centre[db][0][0];
+            let half = 20 - 2 * 0x2eu16.abs_diff(s.vref_best[db] as u16);
+            assert_eq!(run[db], (base + 7 - (half - 1), base + half - 1), "DBYTE {db}");
+            assert_eq!(c[db], run[db].0 + (run[db].1 - run[db].0) / 2);
+            assert!(run[db].0 <= v[db] && v[db] <= run[db].1);
         }
     }
 

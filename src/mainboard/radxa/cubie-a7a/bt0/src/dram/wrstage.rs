@@ -178,6 +178,26 @@ pub fn run() -> bool {
                     "[dram] WR: blind start: TxDqDly per DBYTE {v:03x?}, error bits left {left}"
                 );
                 blind_clean = left == 0;
+                if blind_clean
+                    && cubie_a7a_dram::knobs::env(
+                        "A7A_WR_BLIND_CENTER",
+                        option_env!("A7A_WR_BLIND_CENTER"),
+                    )
+                    .is_some()
+                {
+                    match wrtrain::blind_center(&mut p, v, &mut seed) {
+                        Ok((c, run, left)) => {
+                            println!(
+                                "[dram] WR: blind centre: TxDqDly per DBYTE {c:03x?}, clean runs {run:03x?}, error bits left {left}"
+                            );
+                            blind_clean = left == 0;
+                        }
+                        Err(e) => {
+                            println!("[dram] WR: blind centre failed: {e:?}; stopping");
+                            return false;
+                        }
+                    }
+                }
             }
             Err(e) => {
                 println!("[dram] WR: blind start failed: {e:?}; stopping");
