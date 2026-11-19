@@ -66,7 +66,7 @@ pub fn NO_BOOST() -> bool {
 fn RD_GAPS() -> Option<u32> {
     match cubie_a7a_dram::knobs::env("A7A_RD_GAPS", crate::knob!("A7A_RD_GAPS")) {
         Some(s) => match u32::from_str_radix(s, 16) {
-            Ok(v) if v >= 1 && v <= 0x3f => Some(v),
+            Ok(v) if (1..=0x3f).contains(&v) => Some(v),
             _ => panic!("A7A_RD_GAPS is a hex value 1..3f"),
         },
         None => None,

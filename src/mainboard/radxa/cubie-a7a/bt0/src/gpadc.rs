@@ -14,7 +14,7 @@ use crate::ccu;
 use crate::soc::{clr_set_bits, set_bits, time_us, udelay, CCU_BASE};
 
 const GPADC_BASE: usize = 0x0252_1000;
-const GP_SR_CON: usize = GPADC_BASE + 0x00;
+const GP_SR_CON: usize = GPADC_BASE;
 const GP_CTRL: usize = GPADC_BASE + 0x04;
 const GP_CS_EN: usize = GPADC_BASE + 0x08;
 /// Data-ready interrupt enable/status (GP_DATA_INTC/INTS; 0x20/0x30 are

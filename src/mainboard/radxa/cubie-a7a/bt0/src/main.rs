@@ -737,7 +737,7 @@ fn boot_sd(b: &Bringup) {
     soc::stage(8);
     let table = read_layout(&sd);
 
-    let mut handoff = handoff(&b);
+    let mut handoff = handoff(b);
     let mut main_entry = None;
     if let Err(error) = layout::load_entries(&table, b.dram_end as u64, |e, addr, padded| {
         load_entry(&sd, e, addr, padded);
@@ -893,7 +893,7 @@ fn boot_emmc(b: &Bringup, detect: bool) {
         }
     };
 
-    let mut handoff = handoff(&b);
+    let mut handoff = handoff(b);
     let mut main_entry = None;
     if let Err(error) = layout::load_entries(&table, b.dram_end as u64, |e, addr, padded| {
         let t0 = soc::time_us();

@@ -455,7 +455,7 @@ impl Smhc {
     /// Read `buf.len() * 4 / 512` blocks starting at block `lba`.
     pub fn read_blocks(&self, mut lba: u32, buf: &mut [u32]) -> Result<(), Error> {
         let words_per_block = BLOCK_SIZE / 4;
-        assert!(buf.len() % words_per_block == 0);
+        assert!(buf.len().is_multiple_of(words_per_block));
         for chunk in buf.chunks_mut(words_per_block * MAX_BLOCKS_PER_CMD as usize) {
             let blocks = (chunk.len() / words_per_block) as u32;
             let addr = if self.high_capacity {

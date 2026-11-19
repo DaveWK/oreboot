@@ -276,11 +276,11 @@ pub fn run() -> bool {
         match wrtrain::centre(&mut p, &m, tg, true, &mut seed) {
             Ok(c) => {
                 print_delays("ours", tg, &c.applied);
-                for db in 0..DBYTES {
+                for (db, pmu_db) in pmu[tg].iter().enumerate() {
                     let mut delta = [0i16; LANES];
                     let mut width = [0u16; LANES];
                     for lane in 0..LANES {
-                        delta[lane] = c.applied[db][lane] as i16 - pmu[tg][db][lane] as i16;
+                        delta[lane] = c.applied[db][lane] as i16 - pmu_db[lane] as i16;
                         width[lane] = c.fine[db][lane].width().unwrap_or(0);
                     }
                     let kinds = c.fine[db].map(|f| match f {
@@ -328,8 +328,9 @@ pub fn run() -> bool {
         }
     }
     if BITS() & 4 != 0 {
-        for tg in 0..2 {
-            let Some(centres) = centred[tg] else {
+        let snapshot = centred;
+        for (tg, slot) in snapshot.iter().enumerate() {
+            let Some(centres) = *slot else {
                 continue;
             };
             let mut cur = [[0u8; 2]; 2];
