@@ -2054,6 +2054,12 @@ mod tests {
             })
         }
 
+        fn fiu_written(&self) -> bool {
+            self.recorded()
+                .iter()
+                .any(|&(addr, _)| addr == crate::phy::csr(0x200a3))
+        }
+
         fn fiu_pulsed_after_last_dfimrl(&self) -> bool {
             let fiu = crate::phy::csr(0x200a3);
             let recs = self.recorded();
@@ -2179,7 +2185,7 @@ mod tests {
             hw.dfimrl_writes(),
             [(0, None), (1, None), (2, None), (3, None)]
         );
-        assert!(!hw.fiu_pulsed_after_last_dfimrl());
+        assert!(!hw.fiu_written());
     }
 
     #[test]
@@ -2198,7 +2204,7 @@ mod tests {
                 hw.dfimrl_writes(),
                 [(0, None), (1, None), (2, None), (3, None)]
             );
-            assert!(!hw.fiu_pulsed_after_last_dfimrl());
+            assert!(!hw.fiu_written());
         }
     }
 
@@ -2237,6 +2243,7 @@ mod tests {
             hw.dfimrl_writes(),
             [(0, None), (1, None), (2, None), (3, None)]
         );
+        assert!(!hw.fiu_written());
 
         // Explicit full-DBYTE A7A_HO_CSRS override still validates APPLIED_MRL
         // (0 is refused), and with a valid APPLIED_MRL writes only the
@@ -2257,7 +2264,7 @@ mod tests {
             hw.dfimrl_writes(),
             [(0, None), (1, None), (2, None), (3, None)]
         );
-        assert!(!hw.fiu_pulsed_after_last_dfimrl());
+        assert!(!hw.fiu_written());
 
         crate::rdtrain::APPLIED_MRL.store(4, core::sync::atomic::Ordering::Relaxed);
         let mut hw = HandoverHw::new();
@@ -2298,6 +2305,7 @@ mod tests {
             hw.dfimrl_writes(),
             [(0, None), (1, None), (2, None), (3, None)]
         );
+        assert!(!hw.fiu_written());
     }
 
     #[test]
@@ -2323,7 +2331,7 @@ mod tests {
                 hw.dfimrl_writes(),
                 [(0, None), (1, None), (2, None), (3, None)]
             );
-            assert!(!hw.fiu_pulsed_after_last_dfimrl());
+            assert!(!hw.fiu_written());
         }
     }
 
@@ -2349,7 +2357,7 @@ mod tests {
                 hw.dfimrl_writes(),
                 [(0, None), (1, None), (2, None), (3, None)]
             );
-            assert!(!hw.fiu_pulsed_after_last_dfimrl());
+            assert!(!hw.fiu_written());
         }
 
         crate::rdtrain::APPLIED_MRL.store(4, core::sync::atomic::Ordering::Relaxed);
@@ -2406,6 +2414,7 @@ mod tests {
             r.is_err(),
             "add=0 with missing APPLIED_MRL must fail closed"
         );
+        assert!(!hw.fiu_written());
     }
 
     #[cfg(feature = "lab-knobs")]
