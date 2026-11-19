@@ -15,7 +15,8 @@ memtest = { path = "../../../../lib/memtest" }
 [features]
 # VDD2L (ELDO1) at the vendor library's 1080 mV instead of 900 mV (power.rs).
 vendor-vdd2l = []
-# Runtime overrides of the lab knobs (knobs::env; bt0 feature dram-lab).
-# Off: knobs::env returns the build value, so the knob functions fold to
-# constants and images stay the size the build-time consts gave.
+# Runtime overrides of the lab knobs (knobs::get, knobs::env, knobs::set;
+# bt0 feature dram-lab). Off: knobs::get and knobs::env return the build
+# values, so the knob functions fold to constants and images stay the size
+# the build-time consts gave.
 lab-knobs = []

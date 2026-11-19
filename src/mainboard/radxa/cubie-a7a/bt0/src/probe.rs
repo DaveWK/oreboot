@@ -41,6 +41,15 @@
 use cubie_a7a_common::uart::{Uart, UART0_BASE};
 use util::mmio::{read16, read32, write16, write32};
 
+/// Whether any probe knob can be on: one is in the build's environment, or
+/// the DRAM lab mode may set them at run time. The hooks are compiled out
+/// of every other image (as before the probes existed).
+pub const ANY: bool = cfg!(feature = "dram-lab")
+    || option_env!("A7A_FETCH_PROBE").is_some()
+    || option_env!("A7A_SYS_SNAP").is_some()
+    || option_env!("A7A_RD_GAPS").is_some()
+    || option_env!("A7A_NO_BOOST").is_some();
+
 #[allow(non_snake_case)]
 pub fn FETCH_PROBE() -> bool {
     cubie_a7a_dram::knobs::env("A7A_FETCH_PROBE", option_env!("A7A_FETCH_PROBE")).is_some()

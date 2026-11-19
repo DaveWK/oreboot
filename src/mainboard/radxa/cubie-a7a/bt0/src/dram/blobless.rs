@@ -685,6 +685,7 @@ fn report_vref(nm: &str, v: &cubie_a7a_dram::rdvref::VrefResult) {
     }
 }
 
+#[cfg(all(not(feature = "wck-alias-probe"), not(feature = "rd-measure")))]
 static mut RD_TRAIN: cubie_a7a_dram::rdtrain::RdTrain = cubie_a7a_dram::rdtrain::RdTrain::empty(
     cubie_a7a_dram::phy::wcklevel::Channel::A,
     cubie_a7a_dram::phy::wcklevel::Rank::R0,

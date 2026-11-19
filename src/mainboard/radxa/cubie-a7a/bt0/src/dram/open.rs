@@ -104,7 +104,12 @@ static PIE_B_1RANK: &[u8] = unsafe { &*core::ptr::addr_of!(lab_fw::PIE_B_1RANK) 
 /// One init attempt with `para`; the size in MiB, or None.
 pub fn init_one(para: &[u32; 32]) -> Option<u32> {
     let bits = ::cubie_a7a_dram::knobs::get().open_opts;
-    let opts = opts(bits);
+    // Without the lab mode the options are the build's, a static the
+    // compiler folds into the init (as the former const OPTS).
+    #[cfg(not(feature = "dram-lab"))]
+    let opts = &BUILD_OPTS;
+    #[cfg(feature = "dram-lab")]
+    let opts = &opts(bits);
     if bits != 0 {
         println!("[bt0] DRAM: open init variant {bits:#x}: {opts:?}");
     }
@@ -115,7 +120,7 @@ pub fn init_one(para: &[u32; 32]) -> Option<u32> {
     };
     let mut p = Para::from_sysconfig(para);
     let t0 = soc::ticks();
-    let r = cubie_a7a_dram::init_opts(&mut Bt0Hw, &mut p, &fw, &opts);
+    let r = cubie_a7a_dram::init_opts(&mut Bt0Hw, &mut p, &fw, opts);
     #[cfg(feature = "hybrid")]
     if r.is_ok() && opts.stop_before_dfi {
         super::blobless::hybrid_after_pmu(&mut p);
@@ -208,6 +213,11 @@ pub const fn opts(bits: u32) -> ::cubie_a7a_dram::phy::init::Opts {
         snap: bits & 0x1000 != 0,
     }
 }
+
+/// [`opts`] of the build's `A7A_OPEN_OPTS` (images without the lab mode).
+#[cfg(not(feature = "dram-lab"))]
+static BUILD_OPTS: ::cubie_a7a_dram::phy::init::Opts =
+    opts(::cubie_a7a_dram::knobs::BUILD.open_opts);
 
 /// Bit 6 of `A7A_OPEN_OPTS`: no DRAM test in bt0 (quick test, address
 /// lines); entry 1 returns to FEL right after the init.

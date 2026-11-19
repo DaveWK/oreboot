@@ -4,10 +4,12 @@
 //! [`BUILD`] is what the build's environment says, parsed exactly as the
 //! knob consts did (same parsers, same panics on malformed values); every
 //! consumer reads [`get`], which is [`BUILD`] unless the bt0 DRAM lab mode
-//! (fastboot `oem dram-run`) installed overrides with [`set`] before the
-//! DRAM init. So a build without the lab mode behaves exactly as before
-//! (the host-side reference checks see the same values), and the
-//! lab mode can run any knob combination from one image.
+//! (fastboot `oem dram-run`) installed overrides with `set` before the
+//! DRAM init. Only feature `lab-knobs` (bt0 `dram-lab`) has the runtime
+//! store and `set`; without it [`get`] and [`env`] are the build's values,
+//! which fold to constants, so a build without the lab mode behaves and
+//! compiles as before (the host-side reference checks see the same
+//! values), and the lab mode can run any knob combination from one image.
 //!
 //! Runtime syntax ([`Knobs::apply`]): `NAME=value` with the build-time
 //! names and value formats, or `-NAME` to unset. The end-of-initialization
@@ -245,15 +247,31 @@ const BUILD_EI: EiSpec = EiSpec {
 /// The build's `A7A_BL_MRS` text (lenient, as before).
 pub const BUILD_BL_MRS: Option<&str> = option_env!("A7A_BL_MRS");
 
+#[cfg(feature = "lab-knobs")]
 static mut CURRENT: Option<Knobs> = None;
 
 /// The knobs in force: the runtime ones if the lab mode set them, else the
 /// build's (with `A7A_BL_MRS` parsed leniently, as it was).
+#[cfg(feature = "lab-knobs")]
 pub fn get() -> Knobs {
     // SAFETY: written only by the boot CPU before the DRAM init.
     if let Some(k) = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(CURRENT)) } {
         return k;
     }
+    build()
+}
+
+/// Without the lab mode: the build's knobs, which fold to constants at
+/// every use (images without `dram-lab` keep the build-time code).
+#[cfg(not(feature = "lab-knobs"))]
+#[inline(always)]
+pub fn get() -> Knobs {
+    build()
+}
+
+/// [`BUILD`] with `A7A_BL_MRS` parsed leniently, as it was.
+#[inline(always)]
+fn build() -> Knobs {
     let mut k = BUILD;
     k.bl_mrs = BUILD_BL_MRS.and_then(|s| MrList::parse(s, false));
     k
@@ -283,6 +301,7 @@ pub const fn env(_name: &str, build: Option<&'static str>) -> Option<&'static st
 }
 
 /// Install runtime knobs (bt0 lab mode, before the DRAM init).
+#[cfg(feature = "lab-knobs")]
 pub fn set(k: Knobs) {
     unsafe { core::ptr::write_volatile(core::ptr::addr_of_mut!(CURRENT), Some(k)) };
 }

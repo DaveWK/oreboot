@@ -21,3 +21,8 @@ regio = { path = "../../../../lib/regio" }
 sha256 = { path = "../../../../lib/sha256" }
 storage = { path = "../../../../lib/storage" }
 uart-16550 = { path = "../../../../lib/uart-16550" }
+
+[features]
+# fwlog::start_sram, the SRAM log sink of bt0's DRAM lab mode (bt0 feature
+# dram-lab). Off: the sink set is the one every other image had.
+sram-log = []

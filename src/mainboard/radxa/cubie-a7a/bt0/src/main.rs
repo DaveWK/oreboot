@@ -448,7 +448,9 @@ pub struct Pre {
 }
 
 /// Everything up to DRAM: clocks, UART, PMIC (the DRAM lab mode stops
-/// here and runs [`bring_up_dram`] on the host's command).
+/// here and runs [`bring_up_dram`] on the host's command). Inlined into
+/// [`bring_up`] in every image without the lab mode, as before the split.
+#[cfg_attr(not(feature = "dram-lab"), inline(always))]
 fn bring_up_pre() -> Pre {
     soc::set_cntfrq();
     soc::stage(1);
@@ -528,6 +530,8 @@ fn bring_up_pre() -> Pre {
 }
 
 /// DRAM init and tests, then the CPU clock boost.
+#[allow(unreachable_code)]
+#[cfg_attr(not(feature = "dram-lab"), inline(always))]
 fn bring_up_dram(pre: Pre) -> Bringup {
     let Pre {
         t_start,
@@ -547,7 +551,7 @@ fn bring_up_dram(pre: Pre) -> Bringup {
     // continuation is left out of them (keeps the av3g images under 0x40000).
     #[cfg(feature = "av3-dump")]
     {
-        let _ = (dram_mb, dram_mhz, t_start, hosc);
+        let _ = (dram_mb, dram_mhz, t_start, hosc, version);
         halt();
     }
     // Before anything else writes DRAM: keep the last boot's log, then move
@@ -569,19 +573,23 @@ fn bring_up_dram(pre: Pre) -> Bringup {
         halt();
     }
     let dram_end = mem::DRAM_BASE + test_size;
-    probe::gaps("init");
-    probe::snap("init");
-    probe::fetch("init");
+    if probe::ANY {
+        probe::gaps("init");
+        probe::snap("init");
+        probe::fetch("init");
+    }
 
     // Raise the CPU clocks only now: libdram trained at the boot clocks
     // (as SyterKit and the vendor SPL do). FEL lab `A7A_NO_BOOST`: not at
     // all (the lab states' clocks).
-    if let Some(p) = dram::pmic().filter(|_| !probe::NO_BOOST()) {
+    if let Some(p) = dram::pmic().filter(|_| !(probe::ANY && probe::NO_BOOST())) {
         if let Err(error) = dvfs::boost(p) {
             clock_failure(error);
         }
         ccu::dump();
-        probe::fetch("boost");
+        if probe::ANY {
+            probe::fetch("boost");
+        }
     }
     Bringup {
         t_start,
