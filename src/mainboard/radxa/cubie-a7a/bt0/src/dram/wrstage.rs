@@ -10,6 +10,12 @@
 //! | 0x4 | write Vref sweep (MR14/MR15, operating set-point) after the centring |
 //! | 0x8 | measurement only: the delays and Vref codes found before go back at the end |
 //! | 0x10 | before discovery, a blind clean start ([`wrtrain::blind_baseline`]: per DBYTE the delay with the fewest errors; for the blobless state, where nothing writes cleanly yet) |
+//! | 0x20 | with 0x10: after a clean blind start and a discovery that holds, go on to the centring (every lane its own delay). Without it a clean blind start is kept as it is: the discovery only prints its map |
+//!
+//! The discovery prints the map it measured before it judges it
+//! (`wrtrain::Map::check`), so a run whose map the rules refuse still
+//! shows which lanes fail which bits. A centring that does not write
+//! cleanly puts back the delays it found (`wrtrain::centre`).
 //!
 //! Env `A7A_WR_APPLY=1`: every compare first applies the TxDqDly writes
 //! made since the last one (`cubie_a7a_dram::blobless::apply_delays`:
@@ -25,7 +31,7 @@
 
 use cubie_a7a_dram::phy::{csr, csr_access};
 use cubie_a7a_dram::wrtrain::{
-    self, Delays, Folds, LaneFit, MrPort, WritePort, BLOCKS, DBYTES, DMI_LANE, LANES,
+    self, pattern, Delays, Folds, LaneFit, MrPort, WritePort, BLOCKS, DBYTES, LANES,
 };
 use cubie_a7a_dram::{Error, RegIo};
 
@@ -35,8 +41,8 @@ use super::bt0hw::Bt0Hw;
 fn BITS() -> u32 {
     match cubie_a7a_dram::knobs::env("A7A_WR_STAGE", crate::knob!("A7A_WR_STAGE")) {
         Some(s) => match u32::from_str_radix(s, 16) {
-            Ok(v) if v < 0x20 => v,
-            _ => panic!("A7A_WR_STAGE is a hex mask below 0x20"),
+            Ok(v) if v < 0x40 => v,
+            _ => panic!("A7A_WR_STAGE is a hex mask below 0x40"),
         },
         None => 0,
     }
@@ -73,11 +79,6 @@ const VREF_MAX: u8 = cubie_a7a_dram::pstate::dq_vref_code_max(
     cubie_a7a_dram::pstate::BOARD_VDDQ_MV,
 );
 const VREF_N_CAPPED: usize = wrtrain::vref_n_capped(VREF_FIRST, 1, VREF_N, VREF_MAX);
-
-fn pattern(addr: usize, seed: u32) -> u32 {
-    let x = (addr as u32).wrapping_mul(0x9e37_79b1) ^ seed;
-    x ^ (x >> 15)
-}
 
 struct Port(Bt0Hw);
 
@@ -205,12 +206,9 @@ pub fn run() -> bool {
             }
         }
     }
-    let m = match wrtrain::discover(&mut p, &mut seed) {
+    let m = match wrtrain::measure(&mut p, &mut seed) {
         Ok(m) => m,
         Err(e) if blind_clean => {
-            // Measured: with the blind start already clean the lane
-            // discovery has nothing to separate (LaneOverlap); keep the
-            // blind start and let the final probe check decide.
             println!("[dram] WR: discovery failed: {e:?}; the blind start is clean, keeping it");
             return final_check(&mut p, &mut seed);
         }
@@ -220,8 +218,8 @@ pub fn run() -> bool {
         }
     };
     println!(
-        "[dram] WR: blocks tg {:?}, DBYTEs {:x?}",
-        m.block_tg, m.block_dbs
+        "[dram] WR: blocks tg {:?}, DBYTEs {:x?}, on both tg {:04x}",
+        m.block_tg, m.block_dbs, m.block_both
     );
     for db in 0..DBYTES {
         println!(
@@ -230,6 +228,23 @@ pub fn run() -> bool {
             m.reachable(db, 0),
             m.reachable(db, 1)
         );
+    }
+    match m.check::<Error>() {
+        Ok(()) => {}
+        Err(e) if blind_clean => {
+            println!("[dram] WR: discovery failed: {e:?}; the blind start is clean, keeping it");
+            return final_check(&mut p, &mut seed);
+        }
+        Err(e) => {
+            println!("[dram] WR: discovery failed: {e:?}; stopping");
+            return false;
+        }
+    }
+    if blind_clean && BITS() & 0x20 == 0 {
+        println!(
+            "[dram] WR: discovery holds; no centring asked for (stage bit 20): the blind start is clean, keeping it"
+        );
+        return final_check(&mut p, &mut seed);
     }
     let mut pmu = [[[0u16; LANES]; DBYTES]; 2];
     for (tg, d) in pmu.iter_mut().enumerate() {
@@ -252,8 +267,9 @@ pub fn run() -> bool {
     }
     let measure_only = BITS() & 8 != 0;
     let mut centred = [None; 2];
+    let reached = [0, 1].map(|tg| (0..DBYTES).any(|db| m.reachable(db, tg)));
     for tg in 0..2 {
-        if (0..DBYTES).all(|db| !m.reachable(db, tg)) {
+        if !reached[tg] {
             println!("[dram] WR: tg {tg} not reachable from the probe blocks; left as it is");
             continue;
         }
@@ -280,7 +296,9 @@ pub fn run() -> bool {
                 centred[tg] = Some(c.applied);
             }
             Err(e) => {
-                println!("[dram] WR: centring tg {tg} failed: {e:?}");
+                println!(
+                    "[dram] WR: centring tg {tg} failed: {e:?}; the delays found before are back"
+                );
             }
         }
     }
@@ -291,7 +309,12 @@ pub fn run() -> bool {
         // group's result for it (the PMU's two groups agree within +/-3
         // units in a board dump); flagged, unmeasured.
         for tg in 0..2 {
-            if let (None, Some(other)) = (centred[tg], centred[1 - tg]) {
+            // Only a group out of reach: one whose centring failed has its
+            // own delays back and keeps them.
+            if reached[tg] {
+                continue;
+            }
+            if let Some(other) = centred[1 - tg] {
                 for (db, lanes) in other.iter().enumerate() {
                     for (lane, &v) in lanes.iter().enumerate() {
                         let _ = p.set_tx_dq(db, lane, tg, v);
@@ -395,9 +418,7 @@ fn final_check(p: &mut Port, seed: &mut u32) -> bool {
             }
         }
     }
-    println!(
-        "[dram] WR: final probe check: failing blocks {bad:04x}; DMI lane {DMI_LANE} set from its DBYTE's median"
-    );
+    println!("[dram] WR: final probe check: failing blocks {bad:04x}");
     bad == 0
 }
 
