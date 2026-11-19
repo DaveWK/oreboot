@@ -113,8 +113,8 @@ pub fn pmic() -> Option<&'static Axp<'static>> {
 
 /// Bring up DRAM with `set`. For the 4 GB sets, retry with the other
 /// vendor's set and then the conservative 1800 MHz set if init fails.
-/// Returns the DRAM size in MiB and the clock in MHz of the set that
-/// trained, or `None`.
+/// Returns the DRAM size in MiB and the clock in MHz the set that trained
+/// runs at, or `None`.
 pub fn init(pmic: Option<Axp<'static>>, set: &'static ParamSet) -> Option<(u32, u32)> {
     let capacity = |candidate: &ParamSet| {
         cubie_a7a_dram::size::boot_size_mib(&cubie_a7a_dram::Para::from_sysconfig(&candidate.para))
@@ -145,12 +145,12 @@ pub fn init(pmic: Option<Axp<'static>>, set: &'static ParamSet) -> Option<(u32, 
             );
             continue;
         }
-        println!(
-            "[bt0] DRAM: init with {} parameters ({} MHz)",
-            s.name, s.para[0]
-        );
+        // The clock the backend runs this set at (the end of this file). Kept
+        // as it stands: any other shape changes the other backends' images.
+        #[rustfmt::skip]
+        println!("[bt0] DRAM: init with {} parameters ({} MHz)", s.name, self::run_mhz!(s));
         if let Some(mib) = backend::init_one(&s.para) {
-            return Some((mib, s.para[0]));
+            return Some((mib, self::run_mhz!(s)));
         }
         println!("[bt0] DRAM: {} failed", s.name);
     }
@@ -235,3 +235,25 @@ pub fn dump_clocks(when: &str) {
 compile_error!(
     "another DRAM backend or a lab feature together with the default feature `blobfree` (the blob-free boot): build it with --no-default-features"
 );
+
+// The DRAM clock (WCK, MHz) the backend brings parameter set `$s` up at,
+// for the init line, the FEL mailbox and main's hand-over. The vendor
+// library and the driver with the PHY's firmware train every pstate and
+// run at the set's own clock (the same expression as before, so their
+// images do not change); the blob-free flow trains one pstate and runs
+// there (`blobless::run_mhz`: 1200 MHz at pstate 1 of a 2400 MHz set).
+// Used by path (`self::run_mhz!`): a `use`d macro is in scope before its
+// definition.
+#[cfg(not(dram_blobfree))]
+macro_rules! set_run_mhz {
+    ($s:ident) => {
+        $s.para[0]
+    };
+}
+#[cfg(dram_blobfree)]
+macro_rules! set_run_mhz {
+    ($s:ident) => {
+        blobless::run_mhz(&$s.para)
+    };
+}
+use set_run_mhz as run_mhz;

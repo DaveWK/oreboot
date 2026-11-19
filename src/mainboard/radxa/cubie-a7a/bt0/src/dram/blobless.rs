@@ -1672,3 +1672,11 @@ pub fn hybrid_after_pmu(p: &mut Para) -> ! {
     }
     crate::halt()
 }
+
+/// The DRAM clock (WCK, MHz) this backend runs `para` at: the one pstate
+/// its stages train and hand over at ([`stage_pstate`]), by the set's
+/// divider for it.
+#[cfg(dram_blobfree)]
+pub fn run_mhz(para: &[u32; 32]) -> u32 {
+    Para::from_sysconfig(para).pstate_mhz(stage_pstate() as usize)
+}
