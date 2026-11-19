@@ -215,6 +215,7 @@ pub struct TakeOver {
 pub struct Musb<'a> {
     desc: Descriptors<'a>,
     configured: bool,
+    ended: bool,
     high_speed: bool,
     pending_address: Option<u8>,
 }
@@ -404,6 +405,7 @@ impl<'a> Musb<'a> {
             Musb {
                 desc,
                 configured: false,
+                ended: false,
                 high_speed: true,
                 pending_address: None,
             },
@@ -417,6 +419,7 @@ impl<'a> Musb<'a> {
         Musb {
             desc,
             configured: true,
+            ended: false,
             high_speed: read8(POWER) & POWER_HSMODE != 0,
             pending_address: None,
         }
@@ -434,9 +437,13 @@ impl<'a> Musb<'a> {
         }
     }
 
-    /// Bus events and EP0. Err(Reset) when a configured session ends.
+    /// Bus events and EP0. Once a configured session ends, never accept
+    /// another configuration in this transport, even if INFO ignored an error.
     fn poll(&mut self) -> Result<(), Error> {
         recovery::kick();
+        if self.ended {
+            return Err(Error::Reset);
+        }
         let u = read8(INTRUSB);
         if u != 0 {
             write8(INTRUSB, u);
@@ -458,11 +465,17 @@ impl<'a> Musb<'a> {
             self.high_speed = read8(POWER) & POWER_HSMODE != 0;
             configure_ep1(self.maxp() as u16);
             if was {
+                self.ended = true;
                 return Err(Error::Reset);
             }
         }
         if tx & 1 != 0 {
+            let was = self.configured;
             self.ep0();
+            if was && !self.configured {
+                self.ended = true;
+                return Err(Error::Reset);
+            }
         }
         Ok(())
     }
@@ -636,10 +649,7 @@ impl Transport for Musb<'_> {
     fn wait_configured(&mut self) -> Result<(), Error> {
         while !self.configured {
             // A reset before configuration is just enumeration.
-            match self.poll() {
-                Ok(()) | Err(Error::Reset) => {}
-                Err(e) => return Err(e),
-            }
+            self.poll()?;
         }
         Ok(())
     }
@@ -678,25 +688,22 @@ impl Transport for Musb<'_> {
     fn disconnect(&mut self) -> Result<(), Error> {
         // Let the host take the last reply first.
         let t0 = now();
-        let mut drained = Ok(());
-        loop {
-            let _ = self.poll();
+        let drained = loop {
+            if let Err(e) = self.poll() {
+                break Err(e);
+            }
             write8(INDEX, usb::EP1);
             if read16(TXCSR) & (TXCSR_TXPKTRDY | TXCSR_FIFONOTEMPTY) == 0 {
-                break;
+                break Ok(());
             }
             if now() - t0 > PACKET_TIMEOUT_US {
-                drained = Err(Error::Timeout("last reply"));
-                break;
+                break Err(Error::Timeout("last reply"));
             }
-        }
+        };
         disconnect_bus();
         self.configured = false;
+        self.ended = true;
         drained
-    }
-
-    fn is_reset(e: &Error) -> bool {
-        *e == Error::Reset
     }
 
     fn log(&mut self, dir: &str, line: &[u8]) {

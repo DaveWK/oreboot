@@ -756,6 +756,8 @@ pub fn run(b: &Bringup) -> Back {
             found.usb0_clk,
             found.usb0_bgr
         );
+        // Only one configuration per serve: on reset/disconnect both arms,
+        // media handles and the staged download's length die with the session.
         let mut dev = A7a {
             b,
             serial,
@@ -840,9 +842,6 @@ impl proto::Transport for Speed<'_, '_> {
     }
     fn disconnect(&mut self) -> Result<(), musb::Error> {
         self.0.disconnect()
-    }
-    fn is_reset(e: &musb::Error) -> bool {
-        <Musb as proto::Transport>::is_reset(e)
     }
     fn log(&mut self, dir: &str, line: &[u8]) {
         if dir == "<" {

@@ -10,9 +10,9 @@
 //! `reboot` or `reboot-bootloader`. Every exit is acknowledged with `OKAY`
 //! and the controller is disconnected (quiescent) before [`serve`] returns
 //! it; a failed acknowledgement or disconnect is an error instead, so a
-//! hand-over never follows a reply the host did not get. A failed download
-//! is terminal too (the host and device no longer agree on what the next
-//! packet is). Everything a board refuses is a `FAIL` and the loop goes on.
+//! hand-over never follows a reply the host did not get. A bus reset,
+//! disconnect, or failed download ends the session. Everything a board
+//! refuses is a `FAIL` and the loop goes on.
 use core::fmt::{self, Write};
 
 /// Reported by `getvar:version`.
@@ -207,7 +207,8 @@ pub enum Exit<B> {
 /// The USB device controller, as fastboot needs it.
 pub trait Transport {
     type Error: Copy + fmt::Debug;
-    /// Wait until the host configured the device (again, after a bus reset).
+    /// Wait for the initial configuration. After that, reset or disconnect
+    /// is terminal and must be reported by every subsequent transfer.
     fn wait_configured(&mut self) -> Result<(), Self::Error>;
     /// One command packet into `out` (at least [`PACKET`] bytes); its length.
     fn recv(&mut self, out: &mut [u8]) -> Result<usize, Self::Error>;
@@ -220,8 +221,6 @@ pub trait Transport {
     fn send_data(&mut self, data: &[u8]) -> Result<(), Self::Error>;
     /// Wait until the host took the last reply, then leave the bus.
     fn disconnect(&mut self) -> Result<(), Self::Error>;
-    /// The error is a bus reset: wait for configuration again and go on.
-    fn is_reset(e: &Self::Error) -> bool;
     /// A received command ("<") or a sent final reply (">").
     fn log(&mut self, _dir: &str, _line: &[u8]) {}
 }
@@ -237,7 +236,7 @@ impl<T: Transport> Info for Sink<'_, T> {
     fn info(&mut self, msg: fmt::Arguments) {
         let mut l = Line::new("INFO");
         let _ = l.write_fmt(msg);
-        // A transport fault shows up at the next reply or receive.
+        // A session-ending fault must also be reported by the final reply.
         let _ = self.0.send(l.as_bytes());
     }
 }
@@ -305,11 +304,6 @@ fn send_line<T: Transport>(t: &mut T, kind: &str, msg: fmt::Arguments) -> Result
     t.send(l.as_bytes())
 }
 
-/// A reply whose failure the next receive reports (so the loop goes on).
-fn reply<T: Transport>(t: &mut T, kind: &str, msg: fmt::Arguments) {
-    let _ = send_line(t, kind, msg);
-}
-
 /// Acknowledge an exit and quiesce; either failing is an error.
 fn finish<T: Transport, B>(t: &mut T, exit: Exit<B>) -> Result<Exit<B>, T::Error> {
     let ack = send_line(t, "OKAY", format_args!(""));
@@ -352,30 +346,37 @@ fn protocol_var(name: &str, max: usize, staged: usize, out: &mut Line) -> bool {
     }
 }
 
-fn getvar<T: Transport, D: Device>(t: &mut T, d: &mut D, max: usize, staged: usize, name: &str) {
+fn getvar<T: Transport, D: Device>(
+    t: &mut T,
+    d: &mut D,
+    max: usize,
+    staged: usize,
+    name: &str,
+) -> Result<(), T::Error> {
     if name == "all" {
         for n in PROTOCOL_VARS.iter().chain(d.getvar_names()) {
             let mut l = Line::new("INFO");
             let _ = write!(l, "{n}:");
             if protocol_var(n, max, staged, &mut l) || d.getvar(n, &mut l) {
-                let _ = t.send(l.as_bytes());
+                t.send(l.as_bytes())?;
             }
         }
-        return reply(t, "OKAY", format_args!(""));
+        return send_line(t, "OKAY", format_args!(""));
     }
     let mut l = Line::new("OKAY");
     if protocol_var(name, max, staged, &mut l) || d.getvar(name, &mut l) {
         t.log(">", l.as_bytes());
-        let _ = t.send(l.as_bytes());
+        t.send(l.as_bytes())
     } else {
-        reply(t, "FAIL", format_args!("unknown variable"))
+        send_line(t, "FAIL", format_args!("unknown variable"))
     }
 }
 
 /// Serve fastboot until an acknowledged exit (Ok) or a terminal transport
 /// fault (Err). Downloads land in `buf`; max-download-size is its length
 /// (at most 4 GiB - 1). Each `download` command drops the previous image,
-/// even one it refuses.
+/// even one it refuses. The download is only staged for this invocation;
+/// the caller must also discard board-local session state before serving again.
 pub fn serve<T: Transport, D: Device>(
     t: &mut T,
     d: &mut D,
@@ -384,13 +385,9 @@ pub fn serve<T: Transport, D: Device>(
     let max = buf.len().min(u32::MAX as usize);
     let mut downloaded = 0usize;
     let mut packet = [0u8; PACKET];
+    t.wait_configured()?;
     loop {
-        t.wait_configured()?;
-        let n = match t.recv(&mut packet) {
-            Ok(n) => n.min(PACKET),
-            Err(e) if T::is_reset(&e) => continue,
-            Err(e) => return Err(e),
-        };
+        let n = t.recv(&mut packet)?.min(PACKET);
         // A zero-length packet ends a host transfer that filled whole
         // packets (macOS and Windows hosts after such a download): no command.
         if n == 0 {
@@ -400,13 +397,13 @@ pub fn serve<T: Transport, D: Device>(
         let cmd = match parse(&packet[..n]) {
             Ok(c) => c,
             Err(m) => {
-                reply(t, "FAIL", format_args!("{}", m.message()));
+                send_line(t, "FAIL", format_args!("{}", m.message()))?;
                 continue;
             }
         };
         d.command(&cmd);
         match cmd {
-            Command::Getvar(name) => getvar(t, d, max, downloaded, name),
+            Command::Getvar(name) => getvar(t, d, max, downloaded, name)?,
             Command::Download(size) => {
                 downloaded = 0;
                 match size {
@@ -417,12 +414,12 @@ pub fn serve<T: Transport, D: Device>(
                         downloaded = len;
                         send_line(t, "OKAY", format_args!(""))?;
                     }
-                    Some(len) if len as usize > max => reply(
+                    Some(len) if len as usize > max => send_line(
                         t,
                         "FAIL",
                         format_args!("download larger than max-download-size 0x{max:x}"),
-                    ),
-                    _ => reply(t, "FAIL", format_args!("bad download size")),
+                    )?,
+                    _ => send_line(t, "FAIL", format_args!("bad download size"))?,
                 }
             }
             Command::Flash(part) => {
@@ -432,13 +429,13 @@ pub fn serve<T: Transport, D: Device>(
                     d.flash(part, &buf[..downloaded], &mut Sink(t))
                 };
                 match r {
-                    Ok(()) => reply(t, "OKAY", format_args!("")),
-                    Err(e) => reply(t, "FAIL", format_args!("{e}")),
+                    Ok(()) => send_line(t, "OKAY", format_args!(""))?,
+                    Err(e) => send_line(t, "FAIL", format_args!("{e}"))?,
                 }
             }
             Command::Erase(part) => match d.erase(part, &mut Sink(t)) {
-                Ok(()) => reply(t, "OKAY", format_args!("")),
-                Err(e) => reply(t, "FAIL", format_args!("{e}")),
+                Ok(()) => send_line(t, "OKAY", format_args!(""))?,
+                Err(e) => send_line(t, "FAIL", format_args!("{e}"))?,
             },
             Command::Boot | Command::Continue => {
                 let image = (downloaded > 0).then(|| &buf[..downloaded]);
@@ -449,7 +446,7 @@ pub fn serve<T: Transport, D: Device>(
                 };
                 match r {
                     Ok(plan) => return finish(t, Exit::Boot(plan)),
-                    Err(e) => reply(t, "FAIL", format_args!("{e}")),
+                    Err(e) => send_line(t, "FAIL", format_args!("{e}"))?,
                 }
             }
             Command::Reboot | Command::RebootBootloader => {
@@ -457,20 +454,20 @@ pub fn serve<T: Transport, D: Device>(
                 match d.reboot(bootloader) {
                     Ok(()) if bootloader => return finish(t, Exit::Bootloader),
                     Ok(()) => return finish(t, Exit::Reset),
-                    Err(e) => reply(t, "FAIL", format_args!("{e}")),
+                    Err(e) => send_line(t, "FAIL", format_args!("{e}"))?,
                 }
             }
-            Command::RebootOther(_) => reply(
+            Command::RebootOther(_) => send_line(
                 t,
                 "FAIL",
                 format_args!("no such mode; use reboot or reboot-bootloader"),
-            ),
+            )?,
             Command::Oem(args) => {
                 let image = (downloaded > 0).then(|| &buf[..downloaded]);
                 match d.oem(args, image, &mut Sink(t)) {
                     Ok(Some(exit)) => return finish(t, exit),
-                    Ok(None) => reply(t, "OKAY", format_args!("")),
-                    Err(e) => reply(t, "FAIL", format_args!("{e}")),
+                    Ok(None) => send_line(t, "OKAY", format_args!(""))?,
+                    Err(e) => send_line(t, "FAIL", format_args!("{e}"))?,
                 }
             }
             Command::Fetch { part, offset, size } => {
@@ -484,16 +481,16 @@ pub fn serve<T: Transport, D: Device>(
                     offset.unwrap_or(Some(0)),
                     size.map_or(Some(None), |s| s.map(Some)),
                 ) else {
-                    reply(t, "FAIL", format_args!("bad fetch offset or size"));
+                    send_line(t, "FAIL", format_args!("bad fetch offset or size"))?;
                     continue;
                 };
                 let room = MAX_FETCH.min(max);
                 if size.is_some_and(|s| s == 0 || s > room as u64) {
-                    reply(
+                    send_line(
                         t,
                         "FAIL",
                         format_args!("fetch size must be 1..=max-fetch-size"),
-                    );
+                    )?;
                     continue;
                 }
                 let r = if part == DOWNLOAD_TARGET {
@@ -503,20 +500,20 @@ pub fn serve<T: Transport, D: Device>(
                     d.fetch(part, offset, size, buf, &mut Sink(t))
                 };
                 match r {
-                    Ok(r) if r.is_empty() || r.len() > room || r.end > buf.len() => reply(
+                    Ok(r) if r.is_empty() || r.len() > room || r.end > buf.len() => send_line(
                         t,
                         "FAIL",
                         format_args!("fetch: nothing to send or too large"),
-                    ),
+                    )?,
                     Ok(r) => {
                         send_line(t, "DATA", format_args!("{:08x}", r.len()))?;
                         t.send_data(&buf[r])?;
                         send_line(t, "OKAY", format_args!(""))?;
                     }
-                    Err(e) => reply(t, "FAIL", format_args!("{e}")),
+                    Err(e) => send_line(t, "FAIL", format_args!("{e}"))?,
                 }
             }
-            Command::Unknown(_) => reply(t, "FAIL", format_args!("unknown command")),
+            Command::Unknown(_) => send_line(t, "FAIL", format_args!("unknown command"))?,
         }
     }
 }
@@ -617,6 +614,9 @@ mod tests {
         packets: VecDeque<Vec<u8>>,
         replies: Vec<String>,
         resets: usize,
+        reset_after_replies: Option<usize>,
+        reset_on_reply: Option<&'static [u8]>,
+        ended: bool,
         download_fail: bool,
         ack_fail: bool,
         flush_fail: bool,
@@ -637,9 +637,17 @@ mod tests {
     impl Transport for Host {
         type Error = E;
         fn wait_configured(&mut self) -> Result<(), E> {
+            self.ended = false;
             Ok(())
         }
         fn recv(&mut self, out: &mut [u8]) -> Result<usize, E> {
+            if self.ended {
+                return Err(E::Reset);
+            }
+            if self.reset_after_replies == Some(self.replies.len()) {
+                self.reset_after_replies = None;
+                return Err(E::Reset);
+            }
             if self.resets > 0 {
                 self.resets -= 1;
                 return Err(E::Reset);
@@ -665,6 +673,12 @@ mod tests {
             Ok(())
         }
         fn send(&mut self, data: &[u8]) -> Result<(), E> {
+            if self.reset_on_reply == Some(data) {
+                self.ended = true;
+            }
+            if self.ended {
+                return Err(E::Reset);
+            }
             self.replies.push(String::from_utf8(data.to_vec()).unwrap());
             if self.ack_fail && data == b"OKAY" {
                 return Err(E::Timeout);
@@ -679,9 +693,6 @@ mod tests {
                 Ok(())
             }
         }
-        fn is_reset(e: &E) -> bool {
-            *e == E::Reset
-        }
     }
 
     #[derive(Default)]
@@ -689,6 +700,8 @@ mod tests {
         seen: Vec<String>,
         flashed: Vec<(String, usize)>,
         booted_len: Option<usize>,
+        nor: Option<crate::nor::Guard>,
+        emmc: Option<crate::emmcarm::Guard>,
     }
 
     impl Device for Board {
@@ -704,6 +717,12 @@ mod tests {
         }
         fn command(&mut self, c: &Command) {
             self.seen.push(std::format!("{c:?}"));
+            if let Some(guard) = self.nor.as_mut() {
+                guard.observe(c);
+            }
+            if let Some(guard) = self.emmc.as_mut() {
+                guard.observe(c);
+            }
         }
         fn flash(
             &mut self,
@@ -718,7 +737,18 @@ mod tests {
             self.flashed.push((part.into(), image.len()));
             Ok(())
         }
-        fn erase(&mut self, _part: &str, _info: &mut dyn Info) -> Result<(), &'static str> {
+        fn erase(&mut self, part: &str, _info: &mut dyn Info) -> Result<(), &'static str> {
+            if part.starts_with("emmc") {
+                return self
+                    .emmc
+                    .as_mut()
+                    .ok_or("not armed")?
+                    .take(part, None, 0)
+                    .map(|_| ());
+            }
+            if let Some(guard) = self.nor.as_mut() {
+                return guard.take(part, None, 0).map(|_| ());
+            }
             Err("not armed")
         }
         fn boot(
@@ -787,6 +817,32 @@ mod tests {
                 "fel" => Ok(Some(Exit::Bootloader)),
                 "hello" => {
                     info.info(format_args!("hi"));
+                    Ok(None)
+                }
+                "nor-arm main erase" => {
+                    let guard = self.nor.get_or_insert_with(|| crate::nor::Guard::new(true));
+                    guard.arm("main erase", 0)?;
+                    Ok(None)
+                }
+                "emmc-arm emmc-boot0 erase" => {
+                    let guard = self
+                        .emmc
+                        .get_or_insert_with(|| crate::emmcarm::Guard::new(true));
+                    guard.arm("emmc-boot0 erase", 0)?;
+                    Ok(None)
+                }
+                "emmc-arm bootcfg 08 02" => {
+                    let guard = self
+                        .emmc
+                        .get_or_insert_with(|| crate::emmcarm::Guard::new(true));
+                    guard.arm("bootcfg 08 02", 0)?;
+                    Ok(None)
+                }
+                "emmc-bootcfg 08 02" => {
+                    self.emmc
+                        .as_mut()
+                        .ok_or("not armed")?
+                        .take_boot_config("08 02", 0)?;
                     Ok(None)
                 }
                 _ => Err("unknown oem command"),
@@ -898,7 +954,7 @@ mod tests {
     }
 
     #[test]
-    fn download_failure_is_terminal_bus_reset_is_not() {
+    fn download_failure_and_bus_reset_are_terminal() {
         let mut h = Host::new(&["download:10", "boot"]);
         h.download_fail = true;
         let mut b = Board::default();
@@ -908,7 +964,55 @@ mod tests {
 
         let mut h = Host::new(&["reboot-bootloader"]);
         h.resets = 3;
-        assert_eq!(run(&mut h, &mut Board::default()), Ok(Exit::Bootloader));
+        assert_eq!(run(&mut h, &mut Board::default()), Err(E::Reset));
+    }
+
+    #[test]
+    fn reset_ends_session_and_reconnect_cannot_use_staged_image_or_arms() {
+        for (arm, action) in [
+            ("oem nor-arm main erase", "erase:main"),
+            ("oem emmc-arm emmc-boot0 erase", "erase:emmc-boot0"),
+            ("oem emmc-arm bootcfg 08 02", "oem emmc-bootcfg 08 02"),
+        ] {
+            let mut buf = [0; 64];
+            let mut first = Host::new(&["download:10", arm, action, "flash:main"]);
+            first.reset_after_replies = Some(3);
+            let mut board = Board::default();
+            assert_eq!(serve(&mut first, &mut board, &mut buf), Err(E::Reset));
+            assert_eq!(first.replies, ["DATA00000010", "OKAY", "OKAY"]);
+            assert_eq!(first.packets.len(), 2);
+            assert!(
+                board
+                    .nor
+                    .as_ref()
+                    .and_then(crate::nor::Guard::armed)
+                    .is_some()
+                    || board
+                        .emmc
+                        .as_ref()
+                        .and_then(crate::emmcarm::Guard::armed)
+                        .is_some()
+            );
+
+            // Reuse the DRAM but instantiate a fresh board session as bt0 does.
+            let mut next = Host::new(&[action, "flash:main", "reboot-bootloader"]);
+            assert_eq!(
+                serve(&mut next, &mut Board::default(), &mut buf),
+                Ok(Exit::Bootloader)
+            );
+            assert_eq!(
+                next.replies,
+                ["FAILnot armed", "FAILdownload an image first", "OKAY"]
+            );
+        }
+    }
+
+    #[test]
+    fn reset_during_progress_is_terminal() {
+        let mut h = Host::new(&["oem hello", "reboot-bootloader"]);
+        h.reset_on_reply = Some(b"INFOhi");
+        assert_eq!(run(&mut h, &mut Board::default()), Err(E::Reset));
+        assert_eq!(h.packets.len(), 1);
     }
 
     #[test]
