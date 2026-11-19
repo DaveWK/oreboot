@@ -109,6 +109,7 @@ pub struct Mrs {
     pub mr41: u8,
 }
 
+#[cfg(test)]
 impl Mrs {
     /// The values the reference oracle wrote at pstate 1 for the CXMT 4 GB
     /// set. Their derivation from the parameter set is not implemented yet.
@@ -527,6 +528,7 @@ pub struct Mrs2 {
     pub mr17_rank1: u8,
 }
 
+#[cfg(test)]
 impl Mrs2 {
     /// The reference oracle's pstate-1 values for the CXMT 4 GB set.
     pub const ORACLE_PSTATE1_CXMT_4G: Mrs2 = Mrs2 {

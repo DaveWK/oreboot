@@ -1309,11 +1309,7 @@ pub fn init_one(para: &[u32; 32]) -> Option<u32> {
                 // Cold init to CBT, then our own command bus training on the
                 // DRAM's CBT echo for both channels, ranks and phases.
                 let (m1, m2) = blobless::mode_registers(&mut p, PROBE_PSTATE);
-                println!(
-                "[dram] blobless: MRs from our parameters: {m1:x?} {m2:x?}; oracle constants equal: {}",
-                m1 == cubie_a7a_dram::phy::coldinit::Mrs::ORACLE_PSTATE1_CXMT_4G
-                    && m2 == cubie_a7a_dram::phy::coldinit::Mrs2::ORACLE_PSTATE1_CXMT_4G
-            );
+                println!("[dram] blobless: MRs from our parameters: {m1:x?} {m2:x?}");
                 let mut t = blobless::CaTrainReport::EMPTY;
                 ca_train_staged(&mut Bt0Hw, &m1, &m2, &mut t);
                 let e = &t.exec;
