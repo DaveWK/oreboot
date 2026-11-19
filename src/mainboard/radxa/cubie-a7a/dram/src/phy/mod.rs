@@ -118,5 +118,21 @@ pub fn read_latency_csrs<H: Hw>(hw: &mut H) -> (u32, u32) {
     (a, b)
 }
 
+// DEVINIT and hand-over share these master CSR names from the public EIC7700X
+// TRM Part 2 register list (same PHY family). Mission values below were read
+// back after a blobless boot on the 4 GB A7A.
+/// PUBMODE[0] = 0: leave PHY training mode and return the DFI to the controller.
+/// A7A readback: `2026-11-18-1725-4g-luckfox.log`, byte 3825500: `2006e=0000`.
+pub(crate) const PUBMODE: u32 = 0x2006e;
+/// MemResetL[1:0] = 01: clear ProtectMemReset and keep BP_MemReset_L high
+/// (DRAM reset released). Same log, byte 3825462: `20060=0001`.
+pub const MEM_RESET_L: u32 = 0x20060;
+/// PMIEnable[0] = 1: enable the PHY's PMI for mission operation.
+/// Same log, byte 3825424: `20054=0001`.
+pub(crate) const PMI_ENABLE: u32 = 0x20054;
+/// ACSMWckEnControl[0] = 0: release the training sequencer's WCK enable
+/// control. Same log, byte 3825535: `2002a=0000`.
+pub(crate) const ACSM_WCK_EN_CONTROL: u32 = 0x2002a;
+
 #[cfg(test)]
 mod dfs_table_tests;

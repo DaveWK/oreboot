@@ -17,16 +17,18 @@
 //! wait (fixed in the oracle for every input tried).
 
 use super::{csr, csr_access};
+// These master CSRs are shared with the hand-over path. During DevInit
+// the PHY still controls training; the mission values documented there apply
+// only when the controller takes over.
+use super::{ACSM_WCK_EN_CONTROL, MEM_RESET_L, PMI_ENABLE, PUBMODE};
 use crate::hw::Hw;
 
 const POR_CONTROL: u32 = 0x20090;
 const PIE_WORDS: [(u32, u16); 2] = [(0x9002e, 0x715d), (0x9002f, 0x00ce)];
 const CLOCKING_CTRL: u32 = 0x200a2;
 const TX_RD_PTR_INIT: u32 = 0x200f8;
-const MEM_RESET_L: u32 = 0x20060;
 const ACSM_CKE_CONTROL: u32 = 0x20028;
 const UNNAMED_SETUP: [(u32, u16); 2] = [(0x2f0a5, 1), (0x2f077, 0)];
-const PUBMODE: u32 = 0x2006e;
 const PRBS_GEN_CTL: u32 = 0x70060;
 const PRBS_RESERVED: u32 = 0x70011;
 const PSTATE: u32 = 0x2008b;
@@ -47,7 +49,6 @@ const PLL_CTRL3: u32 = 0x20049;
 const PLL_BYPASS_MODE: u32 = 0x200e1;
 const PLL_STANDBY: u32 = 0x200e0;
 const PLL_PWR_DN: u32 = 0x200c3;
-const PMI_ENABLE: u32 = 0x20054;
 const PLL_START_LOCK: u32 = 0x200e2;
 const DLL_CONTROL: u32 = 0x20078;
 const PCLK_GATE_CONTROL: u32 = 0x20200;
@@ -71,7 +72,6 @@ const ACSM_WCK_READ_STATIC_HI: u32 = 0x2003a;
 const ACSM_WCK_READ_TOGGLE: u32 = 0x2003b;
 const ACSM_WCK_READ_FAST_TOGGLE: u32 = 0x2003c;
 const ACSM_WCK_FREE_RUN: u32 = 0x20041;
-const ACSM_WCK_EN_CONTROL: u32 = 0x2002a;
 const PULSE_ADJUST: u16 = 4;
 
 /// DBYTE `n` RxReplica registers (n = 0xf: broadcast to all DBYTEs).

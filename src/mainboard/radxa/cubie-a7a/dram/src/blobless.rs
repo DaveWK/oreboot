@@ -12,8 +12,8 @@ use crate::hw::{Error, Hw};
 use crate::para::Para;
 use crate::phy::prog::{self, Kind, Op};
 use crate::phy::{
-    coldinit, csr, csr_access, devinit, freq, init, sequence, tables, MICRO_CONT_MUX_SEL,
-    MICRO_RESET,
+    coldinit, csr, csr_access, devinit, freq, init, sequence, tables, ACSM_WCK_EN_CONTROL,
+    MICRO_CONT_MUX_SEL, MICRO_RESET, PMI_ENABLE, PUBMODE,
 };
 use crate::{ccu, ctrl, power};
 
@@ -417,7 +417,7 @@ pub const ACSM_STOP: u32 = 0x20023;
 pub const ACSM_LAST: u32 = 0x20024;
 pub const ACSM_OUTER_LOOP: u32 = 0x20027;
 /// MemResetL: [1] ProtectMemReset, [0] BP_MemReset_L. 2 keeps DRAM in reset.
-pub const MEM_RESET_L: u32 = 0x20060;
+pub use crate::phy::MEM_RESET_L;
 
 /// [`sequence::Port`] on the PHY CSRs for the firmware-free path. Preflight
 /// requires the PMU stalled (MicroReset 1) and MemResetL at `mem_reset`
@@ -1349,13 +1349,10 @@ fn mission_handover_relock_with<H: Hw>(
             }
         }
     }
-    // Validate APPLIED_MRL on every handover regardless of `A7A_HO_CSRS`,
-    // failing closed on any missing or out-of-range value. Without a full
-    // four-DBYTE `A7A_HO_CSRS` override, write `trained + mrl_add` (including
-    // `mrl_add = 0` or unset) to every DBYTE so the post-training select's 8
-    // cannot remain in mission mode; with a full override, skip only that
-    // write so the explicit absolute writes below are the sole DFIMRL writes
-    // before the latch pulse.
+    // Always reject missing or out-of-range APPLIED_MRL. Replace the post-training
+    // select's 8 with trained + mrl_add on every DBYTE, even for zero/unset add.
+    // Only a full four-DBYTE A7A_HO_CSRS override skips that write, so its absolute
+    // values below are the sole DFIMRL writes before the latch pulse.
     let trained = crate::rdtrain::APPLIED_MRL.load(core::sync::atomic::Ordering::Relaxed);
     let mission = match handover_mrl(trained, mrl_add) {
         Ok(v) => v,
@@ -1370,9 +1367,8 @@ fn mission_handover_relock_with<H: Hw>(
         }
     }
     if let Some(spec) = ho_csrs {
-        // FEL lab A7A_HO_CSRS="csr=hex,...": explicit PHY CSR writes before
-        // the latch pulse and DFI init (includes absolute DFIMRL overrides
-        // separate from `A7A_HO_MRL_ADD`).
+        // FEL lab A7A_HO_CSRS="csr=hex,...": explicit writes before the latch
+        // pulse and DFI init, including absolute DFIMRL overrides independent of A7A_HO_MRL_ADD.
         for pair in spec.split(',') {
             let mut it = pair.split('=');
             if let (Some(a), Some(v)) = (it.next(), it.next()) {
@@ -1390,9 +1386,8 @@ fn mission_handover_relock_with<H: Hw>(
     hw.write16(csr(0x200a3), 0);
     hw.udelay(5);
     if crate::obs::OBS_ARM() & crate::obs::ARM_CHECK != 0 {
-        // FEL lab A7A_OBS_ARM bit 0: the PHY's RX FIFO pointer check,
-        // armed (masked off the interrupt pin) before the DFI init, so the
-        // dfi_init_start check and every later read are covered.
+        // FEL lab A7A_OBS_ARM bit 0: arm the RX FIFO pointer check before DFI init
+        // (masked off the interrupt pin) to cover dfi_init_start and every later read.
         crate::obs::arm(hw);
     }
     if HO_PULSE_RESTORE() {
@@ -1401,7 +1396,12 @@ fn mission_handover_relock_with<H: Hw>(
             hw.write16(csr(c), v.wrapping_sub(ACSM_PULSE_ADJUST));
         }
     }
-    for (c, v) in [(0x2006e, 0u16), (0x20060, 1), (0x20054, 1), (0x2002a, 0)] {
+    for (c, v) in [
+        (PUBMODE, 0u16),
+        (MEM_RESET_L, 1),
+        (PMI_ENABLE, 1),
+        (ACSM_WCK_EN_CONTROL, 0),
+    ] {
         hw.write16(csr(c), v);
     }
     csr_access(hw, false);
