@@ -245,6 +245,109 @@ pub fn choose_all(r: &mut VrefResult) {
     }
 }
 
+/// The two-dimensional search of `crate::rdeye` (feature `full-speed`;
+/// declared here, below the code, so that no line of it moves). A plan for it is a
+/// [`VrefPlan`] with [`VrefPlan::EYE_FLAG`] in `dacs`: `start`, `step`
+/// and `n` are then the search's coarse reference rows.
+#[cfg(any(test, feature = "full-speed"))]
+impl VrefPlan {
+    /// In `dacs`: the plan is the two-dimensional search's.
+    pub const EYE_FLAG: u8 = 0x80;
+
+    /// The search's default coarse rows: 0x18..0x58 step 8 (nine rows)
+    /// around the init value 0x35, both DACs, measure only.
+    pub const EYE: VrefPlan = VrefPlan {
+        start: 0x18,
+        step: 8,
+        n: 9,
+        dacs: 3 | Self::EYE_FLAG,
+        apply: false,
+    };
+
+    pub const fn eye(&self) -> bool {
+        self.dacs & Self::EYE_FLAG != 0
+    }
+
+    /// The DACs the plan writes (bit 0 VrefDAC0, bit 1 VrefDAC1).
+    pub const fn dac_mask(&self) -> u8 {
+        self.dacs & 3
+    }
+
+    /// The text of knob `A7A_RD_VREF`: `eye` or `eye-apply` (the
+    /// two-dimensional search), optionally followed by
+    /// `,<start>,<step>,<n>` and `,<dacs>` (hex) as for the sweep, or one
+    /// of the sweep's forms ([`VrefPlan::parse`]). None: unset; Err:
+    /// malformed, or coarse rows over the search's budget.
+    pub const fn parse_knob(s: Option<&str>) -> Result<Option<VrefPlan>, ()> {
+        let Some(text) = s else {
+            return Ok(None);
+        };
+        let b = text.as_bytes();
+        let mut p = VrefPlan::EYE;
+        let mut i = if starts(b, b"eye-apply") {
+            p.apply = true;
+            9
+        } else if starts(b, b"eye") {
+            3
+        } else {
+            return VrefPlan::parse(s);
+        };
+        let mut field = 0;
+        while i < b.len() {
+            i += 1;
+            let mut v: u32 = 0;
+            let mut digits = 0;
+            while i < b.len() && b[i] != b',' {
+                let d = match b[i] {
+                    b'0'..=b'9' => b[i] - b'0',
+                    b'a'..=b'f' => b[i] - b'a' + 10,
+                    b'A'..=b'F' => b[i] - b'A' + 10,
+                    _ => return Err(()),
+                };
+                v = v * 16 + d as u32;
+                digits += 1;
+                if v > 0xff {
+                    return Err(());
+                }
+                i += 1;
+            }
+            if digits == 0 {
+                return Err(());
+            }
+            match field {
+                0 => p.start = v as u16,
+                1 => p.step = v as u16,
+                2 => p.n = v as u16,
+                3 if v >= 1 && v <= 3 => p.dacs = v as u8 | Self::EYE_FLAG,
+                _ => return Err(()),
+            }
+            field += 1;
+        }
+        let rows = VrefPlan {
+            dacs: p.dac_mask(),
+            ..p
+        };
+        if (field != 0 && field < 3) || !rows.valid() || !crate::rdeye::rows_valid(&p) {
+            return Err(());
+        }
+        Ok(Some(p))
+    }
+}
+
+/// The parser of knob `A7A_RD_VREF` in a build with the search: bt0 reads
+/// the knob through `VrefPlan::parse` without feature `full-speed` and
+/// through this with it.
+#[cfg(any(test, feature = "full-speed"))]
+pub struct EyeKnob;
+
+#[cfg(any(test, feature = "full-speed"))]
+impl EyeKnob {
+    /// [`VrefPlan::parse_knob`].
+    pub const fn parse(s: Option<&str>) -> Result<Option<VrefPlan>, ()> {
+        VrefPlan::parse_knob(s)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     extern crate std;

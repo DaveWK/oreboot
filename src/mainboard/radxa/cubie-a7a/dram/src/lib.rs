@@ -192,3 +192,5 @@ pub fn init_opts<H: Hw>(
 // only when its build knob selects it.
 #[cfg(any(test, feature = "full-speed"))]
 pub mod dcactl;
+#[cfg(any(test, feature = "full-speed"))]
+pub mod rdeye;

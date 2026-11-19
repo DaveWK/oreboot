@@ -953,7 +953,7 @@ pub fn train_block_with<H: Hw>(
             ..VrefResult::EMPTY
         };
         if out.stop.is_none() && ex.failure.is_none() {
-            vref_sweep(&mut ex, out, vr, dbs, &prog, regs, cfg);
+            vref_stage(&mut ex, out, vr, dbs, &prog, regs, cfg);
         }
     }
     if out.stop.is_none() && ex.failure.is_none() {
@@ -1683,4 +1683,27 @@ mod pstate_config_tests {
             }
         }
     }
+}
+
+// The read training's reference stage (below the code, so that no line of
+// it moves): the sweep itself, or with feature `full-speed` the stage of
+// `crate::rdeye`, which is the sweep unless the build's `A7A_RD_VREF`
+// selects the two-dimensional search.
+#[cfg(any(test, feature = "full-speed"))]
+use crate::rdeye::stage as vref_stage;
+#[cfg(not(any(test, feature = "full-speed")))]
+use vref_sweep as vref_stage;
+
+/// The sweep, for `crate::rdeye`'s stage.
+#[cfg(any(test, feature = "full-speed"))]
+pub(crate) fn sweep_1d<H: Hw>(
+    ex: &mut WlExec<'_, H>,
+    out: &mut RdTrain,
+    vr: &mut VrefResult,
+    dbs: [u32; 2],
+    prog: &[Row],
+    regs: [u32; 2],
+    cfg: &TrainConfig,
+) {
+    vref_sweep(ex, out, vr, dbs, prog, regs, cfg)
 }
