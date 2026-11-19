@@ -69,11 +69,11 @@ otp = []
 dram-trace = []
 # The read path measurement searches (rd::measure_block) instead of the
 # read training (rdtrain).
-rd-measure = ["blobless"]
+rd-measure = ["blobless", "cubie-a7a-dram/vendor-rd-ref"]
 # The read training as a measurement image: it runs, checks and puts
 # everything back (the initial state repeated), with the vendor's trained
 # values as references. Without it the training is applied.
-rd-train-only = ["blobless"]
+rd-train-only = ["blobless", "cubie-a7a-dram/vendor-rd-ref"]
 # The hand-over to the DDR controller without a PIE after the applied read
 # training (crate module handover; measurement image).
 handover = ["blobless"]

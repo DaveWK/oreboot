@@ -388,7 +388,9 @@ pub const VIS_DFE0: u16 = 0x200;
 pub const ALL_ZERO: EntryMrs = EntryMrs::READ_ENABLE_PSTATE1;
 /// The vendor's trained point at 1200 MHz (av3c/av3g: RxEnDly
 /// 0x357-0x36b, RxClk about 0x1b7-0x1c0), for reference in the output.
+#[cfg(feature = "vendor-rd-ref")]
 pub const VENDOR_RX_EN: u16 = 0x369;
+#[cfg(feature = "vendor-rd-ref")]
 pub const VENDOR_CLK: u16 = 0x1bd;
 /// Per lane: passing points, RxEnDly min and max, receive clock delay min
 /// and max.

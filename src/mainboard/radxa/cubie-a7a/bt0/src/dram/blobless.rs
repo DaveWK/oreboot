@@ -847,15 +847,32 @@ fn read_training(bases: [Option<cubie_a7a_dram::phy::wcklevel::Mr18Base>; 4]) ->
             None => cubie_a7a_dram::rdtrain::BUILD_BELOW_PSTATE1,
         }
     };
+    #[cfg(feature = "rd-train-only")]
     println!(
-        "[dram] RDT: read training ({}, pstate {}): order {:?}; config {:x?}; latch events (CSR, read at, bits) {:05x?} held {} us; receive clock effective delay 64 x coarse + fine (fine < 0x40 written); VrefDAC {}; check patterns (MR33, MR34) {:x?} then the first inverted (negative control); MRR {:?} at the FIFO location of MR5; no PState flip, no refresh; ps = taps x UI / 64; MRL = ceil((RxEnDly/64 UI + {} UI + {} ps) / {} UI) + {}, search {}, sweep {}..={}",
-        if TRAIN_ONLY { "measurement image" } else { "applied" },
+        "[dram] RDT: read training (measurement image, pstate {}): order {:?}; config {:x?}; latch events (CSR, read at, bits) {:05x?} held {} us; receive clock effective delay 64 x coarse + fine (fine < 0x40 written); VrefDAC from the vendor (av3c); check patterns (MR33, MR34) {:x?} then the first inverted (negative control); MRR {:?} at the FIFO location of MR5; no PState flip, no refresh; ps = taps x UI / 64; MRL = ceil((RxEnDly/64 UI + {} UI + {} ps) / {} UI) + {}, search {}, sweep {}..={}",
         ps,
         runs,
         base_cfg,
         rd::EVENTS,
         rd::HOLD_US,
-        if TRAIN_ONLY { "from the vendor (av3c)" } else { "as initialised (ours)" },
+        CHECK_PATTERNS,
+        MRR_MAS,
+        base_cfg.fifo_ui,
+        base_cfg.fifo_ps,
+        base_cfg.dficlk_ui,
+        base_cfg.mrl_margin,
+        base_cfg.search_mrl(),
+        base_cfg.mrl_min,
+        base_cfg.mrl_max,
+    );
+    #[cfg(not(feature = "rd-train-only"))]
+    println!(
+        "[dram] RDT: read training (applied, pstate {}): order {:?}; config {:x?}; latch events (CSR, read at, bits) {:05x?} held {} us; receive clock effective delay 64 x coarse + fine (fine < 0x40 written); VrefDAC as initialised (ours); check patterns (MR33, MR34) {:x?} then the first inverted (negative control); MRR {:?} at the FIFO location of MR5; no PState flip, no refresh; ps = taps x UI / 64; MRL = ceil((RxEnDly/64 UI + {} UI + {} ps) / {} UI) + {}, search {}, sweep {}..={}",
+        ps,
+        runs,
+        base_cfg,
+        rd::EVENTS,
+        rd::HOLD_US,
         CHECK_PATTERNS,
         MRR_MAS,
         base_cfg.fifo_ui,

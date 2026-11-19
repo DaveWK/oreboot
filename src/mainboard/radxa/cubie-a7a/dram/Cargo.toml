@@ -42,3 +42,6 @@ drift-log = []
 # crate compiles exactly as before, so the other images stay
 # byte-identical.
 full-speed = []
+# Vendor-trained reference delays (rd::VENDOR_RX_EN, rd::VENDOR_CLK) for
+# lab comparison output only (bt0 features rd-measure and rd-train-only).
+vendor-rd-ref = []
