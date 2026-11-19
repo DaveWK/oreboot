@@ -432,6 +432,13 @@ pub fn hand_over(b: &Bringup, handoff: cubie_a7a_common::Handoff, main_entry: u3
     // Images and handoff in DRAM as written, MMU off, as main expects.
     #[cfg(feature = "fastboot")]
     crate::cache::off();
+    if crate::probe::FETCH_PROBE || crate::probe::SYS_SNAP {
+        // Entry 1 stopped the watchdog; a hung probe must come back to FEL.
+        recovery::arm_watchdog();
+        soc::clr_set_bits(AHB, AHB_BT0_CLEAR, 0);
+        crate::probe::snap("entry2");
+        crate::probe::fetch("entry2");
+    }
     // The ROM's interrupts off, or the warm reset never happens (rmr_switch).
     quiesce_rom_interrupts();
     // As the SD boot from here: bt0's bus clock, the attempt marker and the

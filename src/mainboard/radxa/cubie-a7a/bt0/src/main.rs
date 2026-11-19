@@ -69,6 +69,7 @@ mod ext;
 mod extcheck;
 #[cfg(feature = "fastboot")]
 mod musb;
+mod probe;
 mod recovery;
 mod smhc;
 mod soc;
@@ -536,14 +537,19 @@ fn bring_up() -> Bringup {
         halt();
     }
     let dram_end = mem::DRAM_BASE + test_size;
+    probe::gaps("init");
+    probe::snap("init");
+    probe::fetch("init");
 
     // Raise the CPU clocks only now: libdram trained at the boot clocks
-    // (as SyterKit and the vendor SPL do).
-    if let Some(p) = dram::pmic() {
+    // (as SyterKit and the vendor SPL do). FEL lab `A7A_NO_BOOST`: not at
+    // all (the lab states' clocks).
+    if let Some(p) = dram::pmic().filter(|_| !probe::NO_BOOST) {
         if let Err(error) = dvfs::boost(p) {
             clock_failure(error);
         }
         ccu::dump();
+        probe::fetch("boost");
     }
     Bringup {
         t_start,
