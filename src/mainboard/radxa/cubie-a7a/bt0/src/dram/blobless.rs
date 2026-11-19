@@ -36,7 +36,8 @@ const _: () = assert!(
 
 /// The pstate our stages run at: the hybrid's trained pstate (A7A_OPEN_OPTS
 /// bits 3-5), else [`PROBE_PSTATE`].
-/// [`stage_pstate`] from the build's knobs (const contexts).
+/// [`stage_pstate`] from the build's knobs (const contexts; the write stage).
+#[cfg(any(feature = "bl-mission", feature = "hybrid"))]
 pub(super) const fn stage_pstate_build() -> u32 {
     #[cfg(feature = "hybrid")]
     {
