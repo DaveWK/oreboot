@@ -33,7 +33,10 @@ use crate::phy::{csr, csr_access};
 /// observation CSRs before the DFI init and after the hand-over. Unset: 0.
 #[allow(non_snake_case)]
 pub fn OBS_ARM() -> u16 {
-    obs_knob(crate::knobs::env("A7A_OBS_ARM", crate::knob!("A7A_OBS_ARM")))
+    obs_knob(crate::knobs::env(
+        "A7A_OBS_ARM",
+        crate::knob!("A7A_OBS_ARM"),
+    ))
 }
 /// Arm the RX FIFO pointer check.
 pub const ARM_CHECK: u16 = 1;

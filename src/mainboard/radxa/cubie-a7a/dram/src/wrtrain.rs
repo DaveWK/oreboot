@@ -1250,7 +1250,11 @@ mod tests {
             // Vref code off the DBYTE's best (all MRs start at 0x2e).
             let base = s.centre[db][0][0];
             let half = 20 - 2 * 0x2eu16.abs_diff(s.vref_best[db] as u16);
-            assert_eq!(run[db], (base + 7 - (half - 1), base + half - 1), "DBYTE {db}");
+            assert_eq!(
+                run[db],
+                (base + 7 - (half - 1), base + half - 1),
+                "DBYTE {db}"
+            );
             assert_eq!(c[db], run[db].0 + (run[db].1 - run[db].0) / 2);
             assert!(run[db].0 <= v[db] && v[db] <= run[db].1);
         }

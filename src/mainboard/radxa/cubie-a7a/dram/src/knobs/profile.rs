@@ -327,7 +327,10 @@ mod tests {
         // Derived lines, not validated ones: the 1200 MHz line with the
         // stages generated for the pstate.
         for (p, pstate) in [(&BOOT_800, "2"), (&BOOT_400, "3")] {
-            assert_eq!(line(p), std::format!("A7A_PSTATE={pstate} {}", line(&BOOT_1200)));
+            assert_eq!(
+                line(p),
+                std::format!("A7A_PSTATE={pstate} {}", line(&BOOT_1200))
+            );
             let ps: usize = pstate.parse().unwrap();
             assert_eq!(4 * crate::pstate::BOARD_DFI_MHZ[ps], p.mhz);
             assert_eq!(p.vdd2l_mv, BOOT_1200.vdd2l_mv);

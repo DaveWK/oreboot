@@ -251,7 +251,10 @@ fn set_mac_address(mac: &[u8; 6]) {
         MAC_ADDRESS0_HIGH,
         MAC_ADDRESS0_HIGH_AE | (mac[5] as u32) << 8 | mac[4] as u32,
     );
-    write32(MAC_ADDRESS0_LOW, u32::from_le_bytes([mac[0], mac[1], mac[2], mac[3]]));
+    write32(
+        MAC_ADDRESS0_LOW,
+        u32::from_le_bytes([mac[0], mac[1], mac[2], mac[3]]),
+    );
 }
 
 /// Bring up GMAC0 and its PHY (see the module documentation).
@@ -273,7 +276,9 @@ pub fn init() {
     }
     // Software reset: completes only once the PHY supplies the RX clock.
     write32(DMA_MODE, DMA_MODE_SWR);
-    let reset_ok = wait(DMA_RESET_TIMEOUT_US, || read32(DMA_MODE) & DMA_MODE_SWR == 0);
+    let reset_ok = wait(DMA_RESET_TIMEOUT_US, || {
+        read32(DMA_MODE) & DMA_MODE_SWR == 0
+    });
     // The reset clears the address registers; program them afterwards.
     set_mac_address(&mac);
 

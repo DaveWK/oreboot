@@ -747,7 +747,14 @@ pub const fn calibration_program(rank: Rank) -> [Row; 26] {
 /// pstate 0: the slow CK stays 40 ns while the row rate doubles). Every row
 /// repeats CA/CS; control bit 10 is set on the even rows. Chip selects and
 /// rank control use the existing original cold-init encoder.
-pub(super) const fn held_edge(rows: &mut [Row], start: usize, n: usize, rank: Rank, ca: u8, cs: bool) {
+pub(super) const fn held_edge(
+    rows: &mut [Row],
+    start: usize,
+    n: usize,
+    rank: Rank,
+    ca: u8,
+    cs: bool,
+) {
     let edge = Row::cmd(if cs { rank.cs() } else { 0 }, ca);
     let mut i = 0;
     while i < n {

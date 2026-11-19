@@ -1648,10 +1648,7 @@ mod pstate_config_tests {
     #[test]
     fn pstate2_and_pstate3_configs() {
         let c1 = TrainConfig::PSTATE1;
-        for (ps, c, rx_en, mrl) in [
-            (2, PSTATE2, 0x307, 4),
-            (3, PSTATE3, 0x2a5, 3),
-        ] {
+        for (ps, c, rx_en, mrl) in [(2, PSTATE2, 0x307, 4), (3, PSTATE3, 0x2a5, 3)] {
             // Only the latency inputs and the UI differ from pstate 1.
             assert_eq!(
                 TrainConfig {
