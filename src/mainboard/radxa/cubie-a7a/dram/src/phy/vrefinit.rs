@@ -271,8 +271,10 @@ mod tests {
     /// sets the knob, so a default image has it only from the environment.
     #[test]
     fn build_value() {
-        assert_eq!(parse(option_env!("A7A_VREF_INIT")), Ok(VREF_DAC_INIT));
-        if option_env!("A7A_VREF_INIT").is_none() {
+        let resolved = crate::knob!("A7A_VREF_INIT");
+        assert_eq!(parse(resolved), Ok(VREF_DAC_INIT));
+        assert_eq!(value(resolved), VREF_DAC_INIT);
+        if resolved.is_none() {
             assert_eq!(VREF_DAC_INIT, VENDOR_VREF_DAC);
         }
         for p in [&BOOT_1200, &BOOT_2400, &BOOT_800, &BOOT_400] {
@@ -284,6 +286,54 @@ mod tests {
         for (i, (got, want)) in tables::C_PSTATE.iter().zip(&want).enumerate() {
             assert_eq!((shape(got), got.val), (shape(want), want.val), "op {i}");
         }
+    }
+
+    /// Resolution of `A7A_VREF_INIT` across both `crate::knob!` modes without
+    /// enabling feature `boot-profile` in the host suite:
+    ///
+    /// - With `boot-profile`, `crate::knob!` calls `knobs::profile::value` ->
+    ///   `knobs::profile::resolve` (`dram/src/knobs/profile.rs:245-276`), which
+    ///   maps `UNSET` (`"-"`, `profile.rs:209`) to `None` before checking the
+    ///   profile (`profile.rs:250-257`), so `value` gives `0x35` for every
+    ///   `BOOT_*` profile and for `None` (`A7A_PROFILE=none`).
+    /// - Without `boot-profile`, `crate::knob!` is raw `option_env!`
+    ///   (`profile.rs:280-286`), so `"-"` reaches [`parse`] directly and is
+    ///   rejected as [`VrefInitError::NotHex`].
+    #[test]
+    fn profile_resolve_semantics() {
+        use crate::knobs::profile::{resolve, UNSET};
+
+        assert_eq!(UNSET, "-");
+
+        let r2400 = resolve(Some(&BOOT_2400), "A7A_VREF_INIT", Some("-"));
+        assert_eq!(r2400, None);
+        assert_eq!(value(r2400), VENDOR_VREF_DAC);
+        assert_eq!(value(r2400), 0x35);
+
+        for p in [&BOOT_1200, &BOOT_2400, &BOOT_800, &BOOT_400] {
+            let unset = resolve(Some(p), "A7A_VREF_INIT", Some("-"));
+            assert_eq!(unset, None, "profile {} unset sentinel", p.mhz);
+            assert_eq!(value(unset), 0x35, "profile {} unset sentinel", p.mhz);
+
+            let absent = resolve(Some(p), "A7A_VREF_INIT", None);
+            assert_eq!(absent, None, "profile {} absent", p.mhz);
+            assert_eq!(value(absent), 0x35, "profile {} absent", p.mhz);
+
+            let set = resolve(Some(p), "A7A_VREF_INIT", Some("34"));
+            assert_eq!(set, Some("34"), "profile {} override", p.mhz);
+            assert_eq!(value(set), 0x34, "profile {} override", p.mhz);
+        }
+
+        // `resolve` maps `UNSET` ("-") to `None` regardless of the profile
+        // argument (`dram/src/knobs/profile.rs:250-257`).
+        let none_unset = resolve(None, "A7A_VREF_INIT", Some("-"));
+        assert_eq!(none_unset, None);
+        assert_eq!(value(none_unset), 0x35);
+
+        // No-profile `crate::knob!` (`dram/src/knobs/profile.rs:280-286`) passes
+        // `option_env!` raw without calling `resolve`, so `"-"` reaches `parse`
+        // and is rejected as not hex.
+        assert_eq!(parse(Some("-")), Err(VrefInitError::NotHex));
     }
 
     /// The table has one plain write per receiver reference CSR, 156 of
