@@ -586,7 +586,7 @@ impl Device for Lab {
             #[cfg(not(dram_blobfree))]
             "phyfw" => {
                 let img = image.ok_or("stage the build's phy-fw-lab.bin first")?;
-                crate::dram::open::lab_fw::load(img)?;
+                unsafe { crate::dram::open::lab_fw::load(img) }?; // SAFETY: sole, polled FEL command loop.
                 info.info(format_args!("PHY firmware loaded ({} bytes)", img.len()));
                 Ok(None)
             }

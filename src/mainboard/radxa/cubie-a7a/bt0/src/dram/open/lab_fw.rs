@@ -50,15 +50,20 @@ fn validate(blob: &[u8]) -> Result<&[u8], &'static str> {
     Ok(data)
 }
 
-/// Validate the whole host blob before acquiring the single writer.
-pub fn load(blob: &[u8]) -> Result<(), &'static str> {
+/// Validate and publish the host blob once.
+///
+/// # Safety
+/// Calls must be serialized. The FEL lab command loop runs on the boot CPU
+/// with IRQ and FIQ masked by its entry stub (`fel.rs`, `cpsid if`).
+pub unsafe fn load(blob: &[u8]) -> Result<(), &'static str> {
     let data = validate(blob)?;
-    STATE
-        .compare_exchange(EMPTY, WRITING, Ordering::Acquire, Ordering::Relaxed)
-        .map_err(|_| "PHY firmware already staged")?;
-    // SAFETY: only the caller that changed EMPTY to WRITING can write, and
-    // the payload is inaccessible to readers until READY. No safe caller can
-    // obtain a reference into PAYLOAD before then.
+    // No RMW: as in dram/wrstage.rs, exclusive accesses abort with MMU off.
+    if STATE.load(Ordering::Relaxed) != EMPTY {
+        return Err("PHY firmware already staged");
+    }
+    STATE.store(WRITING, Ordering::Relaxed);
+    // SAFETY: there is only one writer, and readers acquire READY before
+    // taking a reference. Nothing mutates PAYLOAD after that publication.
     unsafe {
         core::ptr::copy_nonoverlapping(
             data.as_ptr(),
@@ -91,6 +96,8 @@ mod tests {
 
     #[test]
     fn validates_all_images_before_publication_and_never_rewrites() {
+        // SAFETY: this is the only test staging a payload; calls are sequential.
+        let load = |blob: &[u8]| unsafe { super::load(blob) };
         let mut good = [0; HEADER + SIZE];
         good[..4].copy_from_slice(b"A7AP");
         good[4..8].copy_from_slice(&6u32.to_le_bytes());
@@ -110,6 +117,7 @@ mod tests {
             bad[index] ^= 1;
             assert!(load(&bad).is_err(), "accepted wrong {label}");
             assert!(!loaded(), "published wrong {label}");
+            assert_eq!(STATE.load(Ordering::Relaxed), EMPTY);
             bad[index] ^= 1;
         }
         assert!(load(&good[..good.len() - 1]).is_err());
@@ -121,7 +129,7 @@ mod tests {
         assert_eq!(load(&good), Ok(()));
         assert!(loaded());
         assert_eq!(images().unwrap(), [&[0][..]; 6]);
-        assert!(load(&good).is_err());
+        assert_eq!(load(&good), Err("PHY firmware already staged"));
         assert_eq!(images().unwrap(), [&[0][..]; 6]);
     }
 }
