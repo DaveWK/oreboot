@@ -109,6 +109,22 @@ pub const CHECKS: usize = CHECK_PATTERNS.len() + 1;
 /// MRR: MR5 and MR8 (read-only identification), MR16 and MR2 (written by
 /// the initialisation).
 pub const MRR_MAS: [u8; 4] = [5, 8, 16, 2];
+/// The mode MRs the read training leaves (`exit`): FEL lab knob
+/// `A7A_RD_EXIT=<mr18>,<mr10>` (hex; MR46 0) replaces the message block's
+/// MR18 0x0c / MR10 0x54, e.g. `00,00`, the training firmware's operating
+/// values at pstate 1 (read on the board). Unset: the reference's.
+pub const EXIT_MRS: ModeMrs = match option_env!("A7A_RD_EXIT") {
+    Some(s) => match crate::blobless::hex_pair(s) {
+        Some((mr18, mr10)) => ModeMrs {
+            mr18,
+            mr10,
+            mr46: 0,
+        },
+        None => panic!("A7A_RD_EXIT is two hex bytes: mr18,mr10"),
+    },
+    None => ModeMrs::EXIT_PSTATE1,
+};
+
 /// RxFifoVisibility for the MRR read-out: ObsSel 1, then ObsSel 1 with
 /// RdEnDfe0/1 and pointer 0x3c (the reference's value). FEL lab knob
 /// `A7A_RD_VIS` (hex) replaces the second value: the reference
@@ -190,7 +206,7 @@ impl TrainConfig {
     /// launches, read latency 4 (as the `rd` searches).
     pub const PSTATE1: TrainConfig = TrainConfig {
         next: ModeMrs::NEXT_PSTATE1,
-        exit: ModeMrs::EXIT_PSTATE1,
+        exit: EXIT_MRS,
         gate_step: 0x40,
         gate_n: 32,
         clk_step: 16,

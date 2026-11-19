@@ -279,7 +279,15 @@ fn wck_level(p: &mut Para) {
         read_enable(bases);
         #[cfg(not(feature = "rd-measure"))]
         {
+            if let Some((before, _)) = blobless::RD_FSPWR {
+                let f = blobless::mr16_all(&mut Bt0Hw, before);
+                println!("[dram] RD: MR16 {before:02x} to all ranks before the read training: failure {f:?}");
+            }
             let applied = read_training(bases);
+            if let Some((_, after)) = blobless::RD_FSPWR {
+                let f = blobless::mr16_all(&mut Bt0Hw, after);
+                println!("[dram] RD: MR16 {after:02x} to all ranks after the read training: failure {f:?}");
+            }
             #[cfg(any(feature = "bl-mission", feature = "hybrid"))]
             if applied {
                 let relock = option_env!("A7A_BL_RELOCK").is_some();
@@ -1329,7 +1337,19 @@ pub fn hybrid_after_pmu(p: &mut Para) -> ! {
         }
     } else if option_env!("A7A_HYBRID_SKIP_WL").is_some() {
         let bases = blobless::wl_mr18_bases(p, PROBE_PSTATE);
+        if let Some((before, _)) = blobless::RD_FSPWR {
+            let f = blobless::mr16_all(&mut Bt0Hw, before);
+            println!(
+                "[dram] RD: MR16 {before:02x} to all ranks before the read training: failure {f:?}"
+            );
+        }
         let applied = read_training(bases);
+        if let Some((_, after)) = blobless::RD_FSPWR {
+            let f = blobless::mr16_all(&mut Bt0Hw, after);
+            println!(
+                "[dram] RD: MR16 {after:02x} to all ranks after the read training: failure {f:?}"
+            );
+        }
         if applied {
             let r = blobless::mission_handover(&mut Bt0Hw, p, PROBE_PSTATE);
             println!("[dram] MISSION: lean hand-over at pstate {PROBE_PSTATE}: {r:?}");

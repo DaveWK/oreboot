@@ -238,6 +238,65 @@ pub const END_OF_INIT_VARIANT: crate::phy::endinit::Variant =
         None => panic!("A7A_HYBRID_EI_SKIP/_NO_MRW/_MR16 malformed"),
     };
 
+/// MRW MR16 = `mr16` to both channels and ranks at once, through the end
+/// of initialization's own switch launch (`endinit::run_with` with the
+/// per-rank launches and the CBT exit controls left out; the remaining
+/// channel-select and clock CSR writes ran harmlessly on the PMU-trained
+/// state, as a bisect run showed). FEL lab: opens or closes an FSP-WR =
+/// FSP-OP window for a stage whose MRWs must reach the operating set.
+pub fn mr16_all<H: Hw>(hw: &mut H, mr16: u8) -> Option<crate::wl::WlFailure> {
+    use crate::phy::endinit::{self, skip, FspMrs, Variant};
+    use crate::phy::wcklevel::Channel;
+    let v = Variant {
+        skip: skip::RANK_LAUNCH | skip::CBT_EXIT,
+        mr16_switch: mr16,
+        ..Variant::REFERENCE
+    };
+    let mut ex = crate::wl::WlExec::new(hw);
+    endinit::run_with(
+        Channel::B,
+        |_, _| FspMrs { mr: [(0, 0); 20] },
+        &v,
+        &mut |s| ex.step(s),
+    );
+    let f = ex.failure;
+    csr_access(hw, false);
+    f
+}
+
+const fn hex_nib(c: u8) -> Option<u8> {
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Two hex bytes `a,b` (FEL lab knob text); `None` for anything else.
+pub const fn hex_pair(s: &str) -> Option<(u8, u8)> {
+    let b = s.as_bytes();
+    if b.len() != 5 || b[2] != b',' {
+        return None;
+    }
+    match (hex_nib(b[0]), hex_nib(b[1]), hex_nib(b[3]), hex_nib(b[4])) {
+        (Some(a), Some(b2), Some(c), Some(e)) => Some((a * 16 + b2, c * 16 + e)),
+        _ => None,
+    }
+}
+
+/// FEL lab `A7A_RD_FSPWR=<before>,<after>` (hex MR16 values): an MR16 write
+/// to all ranks before the read training and another after it, so that its
+/// mode MRWs (MR20, MR18, MR10, MR46) reach the operating set-point; e.g.
+/// `05,04` after the FSP-WR 0 end of initialization. Unset: none.
+pub const RD_FSPWR: Option<(u8, u8)> = match option_env!("A7A_RD_FSPWR") {
+    Some(s) => match hex_pair(s) {
+        Some(p) => Some(p),
+        None => panic!("A7A_RD_FSPWR is two hex bytes: before,after"),
+    },
+    None => None,
+};
+
 /// The end-of-initialization stage's run ([`end_of_init`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EndInitReport {
@@ -1046,4 +1105,60 @@ pub fn mission_handover_relock<H: Hw>(
     crate::post::dfi_init_cpu(hw, channels)?;
     crate::post::controller_after_phy(hw, p)?;
     Ok(rden)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn hex_pair_text() {
+        use super::hex_pair;
+        assert_eq!(hex_pair("05,04"), Some((5, 4)));
+        assert_eq!(hex_pair("0c,5A"), Some((0x0c, 0x5a)));
+        assert_eq!(hex_pair("5,4"), None);
+        assert_eq!(hex_pair("05;04"), None);
+        assert_eq!(hex_pair("0g,04"), None);
+        assert_eq!(super::RD_FSPWR, None);
+        assert_eq!(
+            crate::rdtrain::EXIT_MRS,
+            crate::phy::rxen::ModeMrs::EXIT_PSTATE1
+        );
+    }
+
+    #[test]
+    fn global_mr16_is_one_mrw_to_both_ranks() {
+        use crate::phy::coldinit::{mrw, Row};
+        use crate::phy::endinit::{run_with, skip, FspMrs, Variant};
+        use crate::phy::wcklevel::{Channel, Step};
+        let v = Variant {
+            skip: skip::RANK_LAUNCH | skip::CBT_EXIT,
+            mr16_switch: 0x05,
+            ..Variant::REFERENCE
+        };
+        let mut launches: [[Row; 12]; 4] = [[Row::EMPTY; 12]; 4];
+        let mut n = 0;
+        run_with(
+            Channel::B,
+            |_, _| FspMrs { mr: [(0, 0); 20] },
+            &v,
+            &mut |s| {
+                if let Step::Launch { rows, .. } = s {
+                    launches[n][..rows.len()].copy_from_slice(rows);
+                    n += 1;
+                }
+            },
+        );
+        // The switch, the settle and the close launches.
+        assert_eq!(n, 3);
+        assert_eq!(&launches[0][2..6], &mrw(3, 16, 0x05));
+        // No other command row (CS) in any launch.
+        for (k, l) in launches[..n].iter().enumerate() {
+            for (i, r) in l.iter().enumerate() {
+                let cs = r.0[0] >> 14;
+                assert!(
+                    cs == 0 || (k == 0 && (2..6).contains(&i)),
+                    "launch {k} row {i}"
+                );
+            }
+        }
+    }
 }
