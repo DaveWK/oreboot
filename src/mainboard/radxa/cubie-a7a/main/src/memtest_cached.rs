@@ -20,7 +20,7 @@ use crate::memtest_cached_core::{
     validate_live_rank_map, wb_mapped_range, Bit37Shape, CopyLegStats, ErrorDecode, LiveRankMap,
     PassReport, RunCoverage, UnlocalizedMismatch, Verdict, ABOVE_4G, ADDRMAP1_CH0, BIT37_SEED_1000,
     BIT37_SEED_1010, COPY_BLOCK_BYTES, COPY_SEED_BASE, MAIR_WB, SCTLR_C, SCTLR_I, SCTLR_M,
-    STRESS_BLOCK_BYTES,
+    STRESS_BLOCK_BYTES, TEARDOWN_WDT_RELOAD_LINES, WDT0_CTRL_ADDR, WDT0_RELOAD_VAL,
 };
 
 /// Level-1 table of the cached EL3 flat map (4 KiB aligned).
@@ -105,7 +105,8 @@ impl CachedEl3FlatMap {
         })
     }
 
-    /// Tear down the cached EL3 flat map in one register-only `asm!` block:
+    /// Tear down the cached EL3 flat map in one register-only `asm!` block and
+    /// return elapsed `CNTPCT_EL0` ticks across the teardown:
     /// 1. Clear both `SCTLR_EL3.C` and `SCTLR_EL3.I` (keeping `M=1` so the
     ///    flat VA=PA map stays active). Per Arm ARM `SCTLR_EL3.I` ("Stage 1
     ///    instruction access cacheability"), EL3 instruction fetches to Normal
@@ -113,12 +114,15 @@ impl CachedEl3FlatMap {
     ///    and instruction-side refills into L1/L2/L3.
     /// 2. `DC CIVAC` every cache line across `[wb_start, wb_end)` — all Normal
     ///    WB DRAM blocks mapped by `L1_CACHED` — reaching PoC across L1/L2/L3.
+    ///    Every `TEARDOWN_WDT_RELOAD_LINES` lines, reload WDT0 via a single
+    ///    Device-nGnRnE store (`WDT0_CTRL_ADDR`, L1 block 0, allocates no cache
+    ///    line) from register-held address and value.
     /// 3. Hold `C=0, I=0` through the final maintenance barrier (`dsb sy; isb`),
     ///    then `ic iallu; dsb sy; isb` to invalidate all instruction caches,
     ///    then restore original `SCTLR_EL3` (`M=0, C=0`, saved `I`), `isb`,
     ///    `tlbi alle3; dsb sy; isb`, and restore `TTBR0/TCR/MAIR; isb`.
     #[inline(never)]
-    fn teardown(&self) {
+    fn teardown(&self) -> u64 {
         let sctlr_no_ci = (self.sctlr | SCTLR_M) & !(SCTLR_C | SCTLR_I);
         let wb_start = self.wb_start;
         let wb_end = self.wb_end;
@@ -127,17 +131,31 @@ impl CachedEl3FlatMap {
         let b = self.ttbr;
         let t = self.tcr;
         let m = self.mair;
+        let wdt_ctrl = WDT0_CTRL_ADDR;
+        let wdt_val = WDT0_RELOAD_VAL;
+        let reload_lines = TEARDOWN_WDT_RELOAD_LINES;
+        let t0: u64;
+        let t1: u64;
         // SAFETY: all values are loaded into registers before the first
-        // `msr sctlr_el3`; `options(nostack)` and no memory operands ensure
-        // zero stack or other loads/stores occur across the transition. Only
-        // the boot core is running (`main.rs` prepared all other cores off).
+        // `msr sctlr_el3`; `options(nostack)` and no Normal-memory operands
+        // ensure zero stack or Normal loads/stores occur across the transition
+        // (only Device-nGnRnE stores to `WDT0_CTRL_ADDR` reload the watchdog).
+        // Only the boot core is running (`main.rs` prepared all other cores off).
         unsafe {
             asm!(
+                "isb",
+                "mrs {t0}, cntpct_el0",
                 "dsb sy",
                 "msr sctlr_el3, {no_ci}",
                 "isb",
+                "mov {cnt}, {reload}",
                 "1:",
                 "dc civac, {p}",
+                "subs {cnt}, {cnt}, #1",
+                "b.ne 2f",
+                "str {wdt_val:w}, [{wdt_ctrl}]",
+                "mov {cnt}, {reload}",
+                "2:",
                 "add {p}, {p}, {step}",
                 "cmp {p}, {end}",
                 "b.lo 1b",
@@ -155,6 +173,7 @@ impl CachedEl3FlatMap {
                 "msr tcr_el3, {t}",
                 "msr mair_el3, {m}",
                 "isb",
+                "mrs {t1}, cntpct_el0",
                 no_ci = in(reg) sctlr_no_ci,
                 p = inout(reg) wb_start => _,
                 end = in(reg) wb_end,
@@ -163,18 +182,35 @@ impl CachedEl3FlatMap {
                 b = in(reg) b,
                 t = in(reg) t,
                 m = in(reg) m,
+                wdt_ctrl = in(reg) wdt_ctrl,
+                wdt_val = in(reg) wdt_val,
+                reload = in(reg) reload_lines,
+                cnt = out(reg) _,
+                t0 = out(reg) t0,
+                t1 = lateout(reg) t1,
                 options(nostack),
             );
         }
+        t1.wrapping_sub(t0)
+    }
+
+    /// Tear down the cached EL3 flat map, returning `(wb_start, wb_end, ticks)`.
+    fn finish(self) -> (u64, u64, u64) {
+        crate::soc::watchdog_kick();
+        let wb_start = self.wb_start;
+        let wb_end = self.wb_end;
+        let ticks = self.teardown();
+        core::mem::forget(self);
+        (wb_start, wb_end, ticks)
     }
 }
 
 impl Drop for CachedEl3FlatMap {
     fn drop(&mut self) {
         // Reload WDT0 (Device-nGnRnE block 0) before the full-DRAM DC CIVAC
-        // sweep so the entire teardown has a fresh 16 s watchdog window.
+        // sweep so even the first reload interval starts from a full 16 s count.
         crate::soc::watchdog_kick();
-        self.teardown();
+        let _ = self.teardown();
     }
 }
 
@@ -479,7 +515,11 @@ pub fn run(h: &Handoff) -> Result<(), &'static str> {
     cov.copy_r1_to_r0_bytes = leg_bytes[1];
     cov.copy_r1_above4g_bytes = leg_bytes[2];
 
-    drop(map);
+    let (wb_start, wb_end, teardown_ticks) = map.finish();
+    let teardown_ms = teardown_ticks / (crate::soc::TIMER_HZ / 1000);
+    println!(
+        "[main] memtest-cached: teardown {wb_start:#x}..{wb_end:#x} ms={teardown_ms} ticks={teardown_ticks}"
+    );
 
     let total_ms = elapsed_ms(t_total);
     let (verdict, reason) = evaluate_verdict(Ok(live_map), total.errors, &cov);

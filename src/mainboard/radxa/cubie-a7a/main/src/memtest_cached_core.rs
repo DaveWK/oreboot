@@ -39,6 +39,33 @@ pub const COPY_BLOCKS_PER_LEG: usize = 4;
 /// Channel 0 DRAM controller ADDRMAP1 MMIO address
 /// (`cubie-a7a-dram/src/ctrl.rs`: `CTRL0 = 0x0a10_0000`, `addrmap(0, 1)`).
 pub const ADDRMAP1_CH0: usize = 0x0a13_0004;
+/// WDT0_CTRL reload register (`main/src/soc.rs:12,148-150`,
+/// `bt0/src/recovery.rs:16,64-66`): Device-nGnRnE MMIO in L1 block 0.
+pub const WDT0_CTRL_ADDR: u64 = 0x0205_000c;
+/// WDT0_CTRL reload value (`(0x0a57 << 1) | 1`, `main/src/soc.rs:149`,
+/// `bt0/src/recovery.rs:65`).
+pub const WDT0_RELOAD_VAL: u32 = (0x0a57 << 1) | 1;
+/// Watchdog timeout armed by bt0 (`bt0/src/recovery.rs:50-56`: 16 s).
+pub const WDT0_TIMEOUT_US: u64 = 16 * 1_000_000;
+/// Reload WDT0 from inside the teardown `DC CIVAC` loop every 524,288 lines
+/// (32 MiB): at 1 us/line that is 0.524 s between reloads (>30x under 16 s).
+pub const TEARDOWN_WDT_RELOAD_LINES: u64 = 1 << 19;
+
+/// Worst-case microseconds between consecutive WDT0 reloads during the
+/// teardown sweep when each `DC CIVAC` line takes `us_per_line` microseconds.
+pub const fn teardown_wdt_max_interval_us(reload_lines: u64, us_per_line: u64) -> Option<u64> {
+    if reload_lines == 0 {
+        return None;
+    }
+    reload_lines.checked_mul(us_per_line)
+}
+
+const _: () = {
+    match teardown_wdt_max_interval_us(TEARDOWN_WDT_RELOAD_LINES, 1) {
+        Some(us) if us < WDT0_TIMEOUT_US => {}
+        _ => panic!("teardown WDT reload interval exceeds 16 s at 1 us/line"),
+    }
+};
 /// Base bit offset of the chip-select field in ADDRMAP1
 /// (`cubie-a7a-dram/src/ctrl.rs`: `CS_BIT0_BASE = 6`).
 pub const CS_BIT0_BASE: u32 = 6;
@@ -1727,5 +1754,26 @@ mod tests {
         let mut gap = t4;
         gap[6] = (6u64 << 30) | BLOCK | AF | SH_INNER | ATTR1 | XN;
         assert!(wb_mapped_range(&gap).is_err());
+    }
+
+    #[test]
+    fn teardown_wdt_reload_interval_stays_under_16s_at_1us_per_line() {
+        assert_eq!(WDT0_CTRL_ADDR, 0x0205_000c);
+        assert_eq!(WDT0_RELOAD_VAL, 0x14af);
+        assert_eq!(WDT0_TIMEOUT_US, 16_000_000);
+        // Zero reload_lines is rejected.
+        assert_eq!(teardown_wdt_max_interval_us(0, 1), None);
+        // At 1 us/line, worst-case time between reloads stays strictly under 16 s.
+        let max_us_1 = teardown_wdt_max_interval_us(TEARDOWN_WDT_RELOAD_LINES, 1).unwrap();
+        assert_eq!(max_us_1, 524_288);
+        assert!(max_us_1 < WDT0_TIMEOUT_US);
+        // Even at 10 us/line (10x slower), reloads stay well under 16 s.
+        let max_us_10 = teardown_wdt_max_interval_us(TEARDOWN_WDT_RELOAD_LINES, 10).unwrap();
+        assert!(max_us_10 < WDT0_TIMEOUT_US);
+        // Reload counts across 4 GB and 6 GB (64-byte lines).
+        let lines_4g = (4 * GIB) / CACHE_LINE_ALIGN;
+        let lines_6g = (6 * GIB) / CACHE_LINE_ALIGN;
+        assert_eq!(lines_4g / TEARDOWN_WDT_RELOAD_LINES, 128);
+        assert_eq!(lines_6g / TEARDOWN_WDT_RELOAD_LINES, 192);
     }
 }
