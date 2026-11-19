@@ -8,9 +8,10 @@ const LINKERSCRIPT_FILENAME: &str = "link-cubie-a7a-bt0.ld";
 
 // The A733 mask ROM copies the eGON image from boot media to SRAM at 0x47000
 // and branches to its first word. The image (code, data, DRAM PHY firmware
-// inside the vendor DRAM library), bss and stack must end below 0x90000,
-// where recovery.rs stages the vendor SPL. The BROM loads eGON images of at
-// least 0x4a000 bytes (the vendor boot0 on the Cubie A7A card).
+// inside the vendor DRAM library), bss and stack must end below 0x90000
+// (nothing of bt0 lies between there and the early log buffer at 0xf0000).
+// The BROM loads eGON images of at least 0x4a000 bytes (the vendor boot0 on
+// the Cubie A7A card).
 // See SyterKit boards/radxa-cubie-a7a/configs (SPL_BIN_TEXT_BASE/MAX_SIZE).
 //
 // Feature `fel` (src/fel.rs) links bt0 at 0x90000 instead, where the vendor

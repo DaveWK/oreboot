@@ -51,6 +51,22 @@ script, are in the workspace that builds the whole chain:
 <https://github.com/DaveWK/radxa-a7a-workspace> (`make firmware`,
 `make fel-boot`).
 
+## Boot failures
+
+`bt0` arms the watchdog and marks each boot attempt in an RTC register;
+EDK2 confirms the boot from its boot manager. A boot that fails or hangs
+before that (no boot medium, a read or CRC error, a hang in a later stage)
+ends in a watchdog reset. The next `bt0` sees the marker before it sets up
+the bus clocks, the PMIC or DRAM: loaded from the SD card, it prints one
+line and enters the mask ROM's FEL mode, so the board answers on USB
+(`xfel`) instead of resetting in a loop; the reset after that tries the
+boot again. Loaded from the eMMC or the SPI NOR, it reports the failed boot
+and tries again.
+
+FEL is also reached with the board's UBOOT key, and from a running system
+by writing 0x5AA5A55A to RTC GP_DATA_REG2 before a reset
+(`bt0/src/felreboot.rs`).
+
 ## USB FEL boot (feature `fel`)
 
 `bt0` built with `--features fel` (plus a DRAM backend, e.g. `dramlib`) is

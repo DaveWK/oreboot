@@ -57,8 +57,8 @@ pub fn init_one(para: &[u32; 32]) -> Option<u32> {
 /// Reads named PHY CSRs
 /// one at a time (EIC7700X TRM Part 2 register names, same PHY family);
 /// the only writes are the CSR access mux and the PState select, both put
-/// back. Then bt0 halts and the boot watchdog falls into the vendor
-/// recovery.
+/// back. Then bt0 halts (a watchdog reset; from the SD card the next
+/// start enters FEL).
 #[cfg(feature = "av3-dump")]
 fn av3_dump(size: c_int) {
     const PSTATE: usize = phy(0x2008b);
@@ -94,7 +94,7 @@ fn av3_dump(size: c_int) {
     w16(MICRO_CONT_MUX_SEL, mux);
     #[cfg(feature = "av3g")]
     av3g_compare();
-    println!("[av3] done; halting into the vendor recovery");
+    println!("[av3] done; halting");
 }
 
 /// The full dump: read-path CSRs, the read-path read-backs, the TRM CSR

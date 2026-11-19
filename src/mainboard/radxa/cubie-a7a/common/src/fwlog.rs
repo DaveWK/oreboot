@@ -46,7 +46,7 @@ pub const AREA_SIZE: usize = 0x0004_0000;
 pub const DATA_SIZE: usize = AREA_SIZE - HEADER_SIZE;
 
 /// bt0's buffer until DRAM is up: the top 16 KiB of SHARED_SRAM, clear of
-/// bt0's image, bss and stack and of the recovery staging area.
+/// bt0's image, bss and stack.
 pub const EARLY_BASE: usize = 0x000f_0000;
 pub const EARLY_SIZE: usize = 0x4000;
 

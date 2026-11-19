@@ -118,9 +118,7 @@ pub mod mem {
 /// the SD card. bt0 reads it to find what to load where.
 pub mod layout {
     /// Byte offset of the table on the boot medium (sector 4088, just below
-    /// 2 MiB). Everything between bt0 and here stays free so a vendor U-Boot
-    /// FIT (0x6a000..0x18e000 on Radxa's dlan17 cards) can stay in place for
-    /// [`KIND_VENDOR_SPL`] recovery.
+    /// 2 MiB). Everything between bt0 and here stays free.
     pub const TABLE_OFFSET: u32 = 0x001f_f000;
     pub const MAGIC: [u8; 8] = *b"A7ABOOT1";
     pub const VERSION: u32 = 1;
@@ -132,8 +130,10 @@ pub mod layout {
     pub const KIND_PAYLOAD: u32 = 2;
     /// Optional DTB handed to the payload instead of the generated one.
     pub const KIND_DTB: u32 = 3;
-    /// A vendor eGON SPL, loaded to SRAM 0x47000 and run in place of bt0
-    /// when the previous oreboot boot never confirmed ([`super::recovery`]).
+    /// A vendor eGON SPL (linked at SRAM 0x47000) that earlier bt0 versions
+    /// ran after a failed boot. Never loaded now and no longer written by
+    /// the image tool; still a known kind, so that the tables of cards
+    /// written before keep validating.
     pub const KIND_VENDOR_SPL: u32 = 4;
 
     use bootlayout::{Contract, KindRule, Place};
@@ -166,7 +166,7 @@ pub mod layout {
             kind: KIND_DTB,
             place: Place::AtLeast(super::mem::PAYLOAD_RAM_BASE as u64),
         },
-        // Existing optional recovery format; never loaded by this path.
+        // In older tables only; checked like before, never loaded.
         KindRule {
             kind: KIND_VENDOR_SPL,
             place: Place::Recovery {
@@ -204,7 +204,7 @@ pub mod layout {
     }
 
     /// Actual bt0 load orchestration: no callback can run until the entire
-    /// table passes. Recovery-only entries are deliberately excluded.
+    /// table passes. [`KIND_VENDOR_SPL`] entries are deliberately excluded.
     pub fn load_entries(
         table: &Table,
         dram_end: u64,
@@ -410,14 +410,16 @@ pub mod layout {
     }
 }
 
-/// Boot-attempt tracking, so a broken oreboot/EDK2 build falls back to the
-/// vendor bootloader by itself instead of needing a card reader.
+/// Boot-attempt tracking, so a broken oreboot/EDK2 build on an SD card ends
+/// in the mask ROM's FEL (USB) by itself instead of in a reset loop.
 ///
 /// bt0 writes [`ATTEMPT`] to an RTC general purpose register (kept across
 /// watchdog resets while VDD_RTC is up) and arms WDT0. EDK2 confirms from
 /// its boot manager with the [`SIP_BOOT_OK`] SMC; main then clears the
 /// register and stops the watchdog. If bt0 finds [`ATTEMPT`] still set, the
-/// previous boot failed or hung, and it runs the vendor SPL once instead.
+/// previous boot failed or hung: loaded from the SD card it clears the
+/// marker and enters the ROM's FEL once instead; from the eMMC or the SPI
+/// NOR it reports that and tries again.
 pub mod recovery {
     /// RTC GP_DATA_REG6.
     pub const RTC_GPR: usize = 0x0709_0118;

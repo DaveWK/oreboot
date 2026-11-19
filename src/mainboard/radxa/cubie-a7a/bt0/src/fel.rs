@@ -26,11 +26,11 @@
 //! 0x90000 is touched (the ROM's FEL memory is in 0x47000..0x87000): image,
 //! bss and stack sit at 0x90000..0xdf000 (build.rs), then [`MAILBOX`],
 //! below xfel's helper area at 0xee800; the SD path's SRAM log buffer
-//! (0xf0000) and vendor recovery are left out of this build. The one bus
-//! clock bt0's clock setup changes that the ROM's USB could depend on
-//! ([`AHB`]) is put back for FEL and set again in entry 2. The watchdog
-//! runs during entry 1 (a hang resets the board, which comes back in FEL
-//! because the SD card does not boot) and is stopped before returning.
+//! (0xf0000) is left out of this build. The one bus clock bt0's clock
+//! setup changes that the ROM's USB could depend on ([`AHB`]) is put back
+//! for FEL and set again in entry 2. The watchdog runs during entry 1 (a
+//! hang resets the board, which comes back in FEL because the SD card does
+//! not boot) and is stopped before returning.
 //!
 //! The mailbox tells the host what happened ([`MAILBOX`] layout below).
 

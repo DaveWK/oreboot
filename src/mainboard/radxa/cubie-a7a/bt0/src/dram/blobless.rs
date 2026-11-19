@@ -4,7 +4,8 @@
 //! loaded or run. Development stage: it runs the firmware-free PHY probe
 //! (crate `cubie-a7a-dram`, module `blobless`), prints what it found and
 //! halts. DRAM is not brought up yet, so the boot watchdog resets the board
-//! and the next boot takes the recovery path (README, Recovery).
+//! and, from the SD card, the next start enters FEL (README, Boot
+//! failures).
 
 #[cfg(not(feature = "wck-alias-probe"))]
 use cubie_a7a_dram::blobless::BlockTrain;

@@ -14,8 +14,8 @@ blobless = []
 # One held-reset alias observation; bypass all ACSM/DevInit/CBT probes.
 wck-alias-probe = ["blobless"]
 # Measurement build: the vendor library trains, bt0 prints the trained
-# per-DBYTE/lane PHY delays (read-only, named CSRs) and halts into the vendor
-# recovery. Comparison data only; never shipped.
+# per-DBYTE/lane PHY delays (read-only, named CSRs) and halts. Comparison
+# data only; never shipped.
 av3-dump = ["dramlib"]
 # As av3-dump (the library's normal run), then the PHY's mission state by
 # address range (crate `dump`) instead of the per-CSR dump, for the
@@ -27,7 +27,7 @@ av3h = ["av3-dump"]
 av3c = ["av3-dump"]
 # As av3c, plus our data-mode compare in the vendor library's trained state
 # (positive control), the PHY taking the DFI after a controller quiesce;
-# then the halt into the vendor recovery. This is the eye image.
+# then the halt. This is the eye image.
 av3g = ["av3c"]
 # The gate image of av3g: the gate window and the four-pattern data check
 # instead of the per-lane eye.

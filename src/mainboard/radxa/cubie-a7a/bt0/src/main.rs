@@ -261,7 +261,7 @@ fn halt() -> ! {
 
 /// Clock failure can invalidate UART/timer assumptions. Keep the already armed
 /// DCXO watchdog running; record exact failure without any timer delay, UART,
-/// storage access, new PLL gate-off, or attempt to execute vendor fallback.
+/// storage access or new PLL gate-off.
 /// RTC diagnostic0/1/2 then contain address/lastvalue/phase+readcount; stageE*
 /// distinguishes this from the normal initial-clock snapshots.
 fn clock_failure(error: ccu::Error) -> ! {
@@ -487,6 +487,10 @@ fn bring_up_pre() -> Pre {
     soc::stage(3);
     #[cfg(not(feature = "fel"))]
     if fel_reboot {
+        println!(
+            "[bt0] FEL reboot flag ({:#010x} in RTC GP_DATA_REG2) found and cleared: entering the mask ROM's FEL",
+            felreboot::FEL_FLAG
+        );
         felreboot::enter_fel();
     }
 
@@ -506,32 +510,31 @@ fn bring_up_pre() -> Pre {
 
     soc::stage(4);
     dram::report_previous_trace();
-    // The vendor recovery reads the SD card and replaces bt0 at 0x47000,
-    // the FEL code's memory; the FEL boot starts its attempt in entry 2.
-    // From the eMMC (boot_media 0x02/0x12) there is no vendor SPL to fall
-    // back to: report and try again, as the NOR does.
+    // A boot that never reached EDK2's boot manager (no medium, a failed
+    // read or CRC, a halt, a hang: all end in a watchdog reset with the
+    // attempt marker set) is answered here, on the next start: the reset
+    // put the mask ROM's clocks back, and `ccu::init`, the PMIC and DRAM
+    // are still to come, as where the FEL reboot flag is honoured above.
+    // From the SD card: the ROM's FEL, so the board can be reached over USB
+    // (felreboot.rs); the marker is cleared, so the reset after that tries
+    // again. From the eMMC (boot_media 0x02/0x12): report and try again, as
+    // the NOR does. The FEL boot starts its attempt in entry 2.
     #[cfg(medium)]
-    if boot_media_is_emmc(boot_media()) {
-        if recovery::previous_boot_failed() {
-            println!("[bt0] the previous boot never reached EDK2's boot manager; trying again");
-        }
-        recovery::begin_attempt();
-    } else {
-        if recovery::previous_boot_failed() {
-            println!("[bt0] the previous boot never reached EDK2's boot manager");
-            let mut sd = smhc::Smhc::new_smhc0(soc::SMHC0_BASE);
-            match sd.init_card() {
-                Ok(()) => recovery::boot_vendor_spl(&sd, &read_layout(&sd)),
-                Err(e) => {
-                    println!("[bt0] recovery: SD init failed: {e:?}");
-                }
+    {
+        let failed = recovery::previous_boot_failed();
+        if boot_media_is_emmc(boot_media()) {
+            if failed {
+                println!("[bt0] the previous boot never reached EDK2's boot manager; trying again");
             }
-            println!("[bt0] recovery not possible; trying oreboot again");
+        } else if failed {
+            println!(
+                "[bt0] the previous boot never reached EDK2's boot manager: entering the mask ROM's FEL (USB); the next reset tries the boot again"
+            );
+            felreboot::enter_fel();
         }
         recovery::begin_attempt();
     }
-    // No vendor SPL on the NOR: report the failed attempt and try oreboot
-    // again.
+    // The NOR: report the failed attempt and try again.
     #[cfg(feature = "spinor")]
     {
         if recovery::previous_boot_failed() {
@@ -661,7 +664,7 @@ fn place(handoff: &mut Handoff, e: &layout::Entry, addr: usize) -> Option<u32> {
             handoff.dtb_addr = e.load_addr;
             handoff.dtb_size = e.size as u64;
         }
-        _ => unreachable!(), // validated kinds; recovery entries skipped
+        _ => unreachable!(), // validated kinds; entries that are not loaded are skipped
     }
     None
 }
@@ -699,7 +702,8 @@ fn boot_media_is_emmc(media: u8) -> bool {
 /// medium the mask ROM loaded bt0 from; the other one is the fallback if
 /// the first cannot be initialised (no card, no module). Any other value
 /// tries the SD card first. Once a medium is up, a failed read or CRC
-/// halts as before (the watchdog resets the board).
+/// halts (the watchdog resets the board; the next start answers the
+/// failed attempt in `bring_up_pre`).
 #[cfg(medium)]
 #[unsafe(no_mangle)]
 extern "C" fn main() -> ! {
