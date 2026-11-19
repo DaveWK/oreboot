@@ -226,6 +226,85 @@ pub fn discover<P: WritePort>(p: &mut P, seed: &mut u32) -> Result<Map, WrError<
     Ok(m)
 }
 
+/// Failing data bits over every block, two seeds.
+fn error_bits<P: WritePort>(p: &mut P, seed: &mut u32) -> Result<u32, P::Error> {
+    let mut n = 0;
+    for _ in 0..2 {
+        *seed = seed.wrapping_add(0x9e37_79b9);
+        n += p.check(*seed)?.iter().map(|f| f.count_ones()).sum::<u32>();
+    }
+    Ok(n)
+}
+
+/// Set every lane of DBYTE `db`, both timing groups, to `v`.
+fn set_dbyte<P: WritePort>(p: &mut P, db: usize, v: u16) -> Result<(), P::Error> {
+    for tg in 0..2 {
+        for lane in 0..LANES {
+            p.set_tx_dq(db, lane, tg, v)?;
+        }
+    }
+    Ok(())
+}
+
+/// A clean-writing start for [`discover`] without any map or reference
+/// (the blobless state: every TxDqDly at 0x20): per DBYTE in turn, all its
+/// lanes and both timing groups at one value, the value with the fewest
+/// failing data bits over all blocks. A DBYTE's errors only depend on its
+/// own delay, so the DBYTEs can be searched one at a time: a coarse pass
+/// (step 8 over the whole range), then step 1 within +/-8 of the coarse
+/// best, the middle of the longest run of minimal error counts; two
+/// rounds. Returns the value per DBYTE and the remaining error bits (0
+/// when the start is clean).
+pub fn blind_baseline<P: WritePort>(
+    p: &mut P,
+    seed: &mut u32,
+) -> Result<([u16; DBYTES], u32), WrError<P::Error>> {
+    let mut v = [0x20u16; DBYTES];
+    for db in 0..DBYTES {
+        set_dbyte(p, db, v[db]).map_err(WrError::Port)?;
+    }
+    for _round in 0..2 {
+        for db in 0..DBYTES {
+            let mut best = (u32::MAX, v[db]);
+            let mut x = 0u16;
+            while x <= TX_DQ_MAX {
+                set_dbyte(p, db, x).map_err(WrError::Port)?;
+                let e = error_bits(p, seed).map_err(WrError::Port)?;
+                if e < best.0 {
+                    best = (e, x);
+                }
+                x += 8;
+            }
+            let lo = best.1.saturating_sub(8);
+            let hi = (best.1 + 8).min(TX_DQ_MAX);
+            let mut counts = [u32::MAX; 17];
+            for (i, x) in (lo..=hi).enumerate() {
+                set_dbyte(p, db, x).map_err(WrError::Port)?;
+                counts[i] = error_bits(p, seed).map_err(WrError::Port)?;
+            }
+            let min = *counts.iter().min().unwrap_or(&u32::MAX);
+            let (mut run, mut best_run) = ((0usize, 0usize), (0usize, 0usize));
+            for (i, &c) in counts.iter().enumerate() {
+                if c == min {
+                    if run.1 == 0 {
+                        run.0 = i;
+                    }
+                    run.1 += 1;
+                    if run.1 > best_run.1 {
+                        best_run = run;
+                    }
+                } else {
+                    run = (0, 0);
+                }
+            }
+            v[db] = lo + (best_run.0 + (best_run.1.max(1) - 1) / 2) as u16;
+            set_dbyte(p, db, v[db]).map_err(WrError::Port)?;
+        }
+    }
+    let left = error_bits(p, seed).map_err(WrError::Port)?;
+    Ok((v, left))
+}
+
 /// A sweep: every lane at `base[db][lane] + lo + step * i`, i < `n`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Sweep {
@@ -936,6 +1015,25 @@ mod tests {
             assert!(r.applied[db][DMI_LANE].abs_diff(s.centre[db][3][0]) <= 4);
         }
         assert_eq!(r.centred.count_ones(), 36);
+    }
+
+    #[test]
+    fn blind_baseline_then_discovery_from_the_untrained_state() {
+        let mut s = Sim::new();
+        let mut seed = 21;
+        assert!(matches!(
+            discover(&mut s, &mut seed),
+            Err(WrError::Baseline(_))
+        ));
+        let (v, left) = blind_baseline(&mut s, &mut seed).unwrap();
+        assert_eq!(left, 0, "start {v:x?}");
+        let m = discover(&mut s, &mut seed).unwrap();
+        let r = centre(&mut s, &m, 0, true, &mut seed).unwrap();
+        for db in 0..DBYTES {
+            for lane in 0..DMI_LANE {
+                assert!(r.applied[db][lane].abs_diff(s.centre[db][lane][0]) <= 1);
+            }
+        }
     }
 
     #[test]

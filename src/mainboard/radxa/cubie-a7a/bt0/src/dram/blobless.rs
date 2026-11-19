@@ -270,7 +270,7 @@ fn wck_level(p: &mut Para) {
         let r = blobless::mission_handover(&mut Bt0Hw, p, PROBE_PSTATE);
         println!("[dram] MISSION (hybrid, no read training): {r:?}");
         if r.is_ok() {
-            super::wrstage::run();
+            let _ = super::wrstage::run();
         }
         return;
     }
@@ -287,7 +287,13 @@ fn wck_level(p: &mut Para) {
                 println!("[dram] MISSION: PLL/DLL relock before the DFI init: {relock}");
                 println!("[dram] MISSION: lean hand-over at pstate {PROBE_PSTATE}: {r:?}");
                 if r.is_ok() {
-                    super::wrstage::run();
+                    let clean = super::wrstage::run();
+                    #[cfg(feature = "bl-mission")]
+                    // SAFETY: bt0 is single-threaded.
+                    unsafe {
+                        MISSION_OK = clean;
+                    }
+                    let _ = clean;
                 }
             } else {
                 println!("[dram] MISSION: skipped, read training not applied on every block");
@@ -1009,7 +1015,18 @@ fn end_of_init(p: &mut Para) -> blobless::EndInitReport {
     e
 }
 
-/// Probe the PHY with `para`, print the result and stop.
+/// Feature `bl-mission`, FEL lab knob `A7A_BL_BOOT`: when the lean
+/// hand-over succeeded and the write stage (`A7A_WR_STAGE`) left the probe
+/// blocks writing cleanly, [`init_one`] returns the size instead of
+/// halting, and bt0 goes on (its DRAM tests, then main): the blob-free
+/// boot attempt. Unset: the halt, as before.
+#[cfg(feature = "bl-mission")]
+const BL_BOOT: bool = option_env!("A7A_BL_BOOT").is_some();
+#[cfg(feature = "bl-mission")]
+static mut MISSION_OK: bool = false;
+
+/// Probe the PHY with `para`, print the result and stop (or, with
+/// `A7A_BL_BOOT`, return the size after a clean blobless bring-up).
 pub fn init_one(para: &[u32; 32]) -> Option<u32> {
     let mut p = Para::from_sysconfig(para);
     let mut rb = [Readback::default(); 2];
@@ -1113,6 +1130,19 @@ pub fn init_one(para: &[u32; 32]) -> Option<u32> {
         }
         Err(e) => {
             println!("[dram] blobless: pre-training failed after {ms} ms: {e:?}");
+        }
+    }
+    #[cfg(feature = "bl-mission")]
+    // SAFETY: bt0 is single-threaded.
+    if BL_BOOT && unsafe { MISSION_OK } {
+        match cubie_a7a_dram::size::boot_size_mib(&p) {
+            Ok(mib) => {
+                println!("[dram] BLOBLESS BOOT: hand-over and write stage clean; {mib} MiB, continuing the boot");
+                return Some(mib);
+            }
+            Err(e) => {
+                println!("[dram] BLOBLESS BOOT: no size: {e:?}");
+            }
         }
     }
     #[cfg(not(any(feature = "wck-alias-probe", feature = "rd-measure")))]
@@ -1295,7 +1325,7 @@ pub fn hybrid_after_pmu(p: &mut Para) -> ! {
         let r = blobless::mission_handover(&mut Bt0Hw, p, hybrid_pstate());
         println!("[dram] MISSION (hybrid, no leveling, no read training): {r:?}");
         if r.is_ok() {
-            super::wrstage::run();
+            let _ = super::wrstage::run();
         }
     } else if option_env!("A7A_HYBRID_SKIP_WL").is_some() {
         let bases = blobless::wl_mr18_bases(p, PROBE_PSTATE);

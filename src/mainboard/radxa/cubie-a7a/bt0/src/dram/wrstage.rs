@@ -9,6 +9,7 @@
 //! | 0x2 | after discovery, every TxDqDly to the reset value 0x20 (the untrained blobless state) before the centring |
 //! | 0x4 | write Vref sweep (MR14/MR15, operating set-point) after the centring |
 //! | 0x8 | measurement only: the delays and Vref codes found before go back at the end |
+//! | 0x10 | before discovery, a blind clean start ([`wrtrain::blind_baseline`]: per DBYTE the delay with the fewest errors; for the blobless state, where nothing writes cleanly yet) |
 //!
 //! The compare is through the controller: the CPU writes and reads back
 //! [`PROBE`] blocks. The verdict is the host's check afterwards (MRR,
@@ -25,8 +26,8 @@ use super::bt0hw::Bt0Hw;
 
 const BITS: u32 = match option_env!("A7A_WR_STAGE") {
     Some(s) => match u32::from_str_radix(s, 16) {
-        Ok(v) if v < 0x10 => v,
-        _ => panic!("A7A_WR_STAGE is a hex mask below 0x10"),
+        Ok(v) if v < 0x20 => v,
+        _ => panic!("A7A_WR_STAGE is a hex mask below 0x20"),
     },
     None => 0,
 };
@@ -124,18 +125,33 @@ fn print_delays(tag: &str, tg: usize, d: &Delays) {
 }
 
 /// The stage (see the module docs); nothing when `A7A_WR_STAGE` is unset.
-pub fn run() {
+/// Returns whether the probe blocks write cleanly at the end (true when
+/// the stage is off).
+pub fn run() -> bool {
     if BITS == 0 {
-        return;
+        return true;
     }
     let (mut p, mut mp) = ports();
     let mut seed = 0x5eed_0001u32;
     println!("[dram] WR: stage bits {BITS:x}, probe blocks {PROBE:08x?} x {BLOCK_BYTES} B");
+    if BITS & 0x10 != 0 {
+        match wrtrain::blind_baseline(&mut p, &mut seed) {
+            Ok((v, left)) => {
+                println!(
+                    "[dram] WR: blind start: TxDqDly per DBYTE {v:03x?}, error bits left {left}"
+                );
+            }
+            Err(e) => {
+                println!("[dram] WR: blind start failed: {e:?}; stopping");
+                return false;
+            }
+        }
+    }
     let m = match wrtrain::discover(&mut p, &mut seed) {
         Ok(m) => m,
         Err(e) => {
             println!("[dram] WR: discovery failed: {e:?}; stopping");
-            return;
+            return false;
         }
     };
     println!(
@@ -200,6 +216,26 @@ pub fn run() {
             }
             Err(e) => {
                 println!("[dram] WR: centring tg {tg} failed: {e:?}");
+            }
+        }
+    }
+    if BITS & 0x10 != 0 && !measure_only {
+        // Blind (blobless) mode: a timing group the probe blocks cannot
+        // reach (rank 1 above the 32-bit window) would keep the untrained
+        // 0x20 and corrupt every later write to that rank. Take the other
+        // group's result for it (the PMU's two groups agree within +/-3
+        // units in a board dump); flagged, unmeasured.
+        for tg in 0..2 {
+            if let (None, Some(other)) = (centred[tg], centred[1 - tg]) {
+                for (db, lanes) in other.iter().enumerate() {
+                    for (lane, &v) in lanes.iter().enumerate() {
+                        let _ = p.set_tx_dq(db, lane, tg, v);
+                    }
+                }
+                println!(
+                    "[dram] WR: tg {tg} unmeasured: set from tg {} (unverified)",
+                    1 - tg
+                );
             }
         }
     }
@@ -291,4 +327,5 @@ pub fn run() {
     println!(
         "[dram] WR: final probe check: failing blocks {bad:04x}; DMI lane {DMI_LANE} set from its DBYTE's median"
     );
+    bad == 0
 }

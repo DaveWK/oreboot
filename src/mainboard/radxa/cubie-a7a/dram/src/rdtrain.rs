@@ -110,8 +110,20 @@ pub const CHECKS: usize = CHECK_PATTERNS.len() + 1;
 /// the initialisation).
 pub const MRR_MAS: [u8; 4] = [5, 8, 16, 2];
 /// RxFifoVisibility for the MRR read-out: ObsSel 1, then ObsSel 1 with
-/// RdEnDfe0/1 and pointer 0x3c (the reference's value).
-pub const VIS_MRR: [u16; 2] = [0x300, 0x3fc];
+/// RdEnDfe0/1 and pointer 0x3c (the reference's value). FEL lab knob
+/// `A7A_RD_VIS` (hex) replaces the second value: the reference
+/// writes 0xfffc there (stage 0x06's read-out),
+/// and our blobless MRRs read all-zero on the board.
+pub const VIS_MRR: [u16; 2] = [
+    0x300,
+    match option_env!("A7A_RD_VIS") {
+        Some(s) => match u16::from_str_radix(s, 16) {
+            Ok(v) => v,
+            Err(_) => panic!("A7A_RD_VIS is not a hex halfword"),
+        },
+        None => 0x3fc,
+    },
+];
 /// DxRxStandbyEn broadcast (0 forces the receivers on for the MRR).
 pub const RX_STANDBY: u32 = 0x1f00a;
 
