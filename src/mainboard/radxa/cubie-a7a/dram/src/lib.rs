@@ -8,6 +8,7 @@
 pub mod blobless;
 pub mod ccu;
 pub mod ctrl;
+pub mod dca;
 pub mod dump;
 pub mod handover;
 pub mod hw;
@@ -18,6 +19,7 @@ pub mod post;
 pub mod power;
 pub mod rd;
 pub mod rdtrain;
+pub mod rdvref;
 pub mod sets;
 pub mod size;
 pub mod timing;

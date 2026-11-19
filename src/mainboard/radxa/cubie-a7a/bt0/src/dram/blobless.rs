@@ -615,6 +615,47 @@ fn read_enable(bases: [Option<cubie_a7a_dram::phy::wcklevel::Mr18Base>; 4]) {
 }
 
 #[cfg(all(not(feature = "wck-alias-probe"), not(feature = "rd-measure")))]
+/// `A7A_RD_VREF` (FEL lab): the read Vref sweep inside the read
+/// training (crate module `rdvref`): `measure` or `apply`, optionally
+/// `,<start>,<step>,<n>[,<dacs>]` in hex. Unset: no sweep (the default).
+#[cfg(all(not(feature = "wck-alias-probe"), not(feature = "rd-measure")))]
+const RD_VREF: Option<cubie_a7a_dram::rdvref::VrefPlan> =
+    match cubie_a7a_dram::rdvref::VrefPlan::parse(option_env!("A7A_RD_VREF")) {
+        Ok(p) => p,
+        Err(()) => panic!("A7A_RD_VREF: measure|apply[,start,step,n[,dacs]] (hex)"),
+    };
+
+#[cfg(all(not(feature = "wck-alias-probe"), not(feature = "rd-measure")))]
+static mut RD_VREF_RESULT: cubie_a7a_dram::rdvref::VrefResult =
+    cubie_a7a_dram::rdvref::VrefResult::EMPTY;
+
+/// The read Vref sweep's lines for one block.
+#[cfg(all(not(feature = "wck-alias-probe"), not(feature = "rd-measure")))]
+#[inline(never)]
+fn report_vref(nm: &str, v: &cubie_a7a_dram::rdvref::VrefResult) {
+    let p = v.plan;
+    println!(
+        "[dram] RDV {nm}: ran {} plan start {:02x} step {} n {} dacs {} apply {}; common choice per byte {:02x?}; applied {}",
+        v.ran, p.start, p.step, p.n, p.dacs, p.apply, v.common, v.applied
+    );
+    for i in 0..2 {
+        for lane in 0..cubie_a7a_dram::wl::LANES {
+            crate::recovery::kick();
+            let mut buf = [b'.'; 2 * cubie_a7a_dram::rdvref::POINTS_MAX];
+            for (k, w) in v.profile[i][lane].iter().take(p.n as usize).enumerate() {
+                let x = w.unwrap_or(0xff);
+                buf[2 * k] = b"0123456789abcdef"[(x >> 4) as usize];
+                buf[2 * k + 1] = b"0123456789abcdef"[(x & 0xf) as usize];
+            }
+            let txt = core::str::from_utf8(&buf[..2 * p.n as usize]).unwrap_or("?");
+            println!(
+                "[dram] RDV {nm} b{i} l{lane}: found {:02x}/{:02x} chosen {:02x?} recentred {:?} widths {txt}",
+                v.found[i][0][lane], v.found[i][1][lane], v.chosen[i][lane], v.recentred[i][lane]
+            );
+        }
+    }
+}
+
 static mut RD_TRAIN: cubie_a7a_dram::rdtrain::RdTrain = cubie_a7a_dram::rdtrain::RdTrain::empty(
     cubie_a7a_dram::phy::wcklevel::Channel::A,
     cubie_a7a_dram::phy::wcklevel::Rank::R0,
@@ -709,7 +750,16 @@ fn read_training(bases: [Option<cubie_a7a_dram::phy::wcklevel::Mr18Base>; 4]) ->
         };
         t.channel = ch;
         t.rank = rank;
-        rdtrain::train_block(&mut Bt0Hw, t, prev, start, &cfg);
+        // SAFETY: bt0 is single-threaded and nothing else refers to it.
+        let vr = unsafe { &mut *core::ptr::addr_of_mut!(RD_VREF_RESULT) };
+        rdtrain::train_block_with(
+            &mut Bt0Hw,
+            t,
+            prev,
+            start,
+            &cfg,
+            RD_VREF.as_ref().map(|p| (p, &mut *vr)),
+        );
         prev = Some(rank);
         ok += t.ok() as u32;
         let nm = rdtrain::block_name(ch, rank);
@@ -768,6 +818,9 @@ fn read_training(bases: [Option<cubie_a7a_dram::phy::wcklevel::Mr18Base>; 4]) ->
                 "[dram] RDT {nm} run {n} TABLE MRL {m}: compares {} errors {} all lanes {}; probe at the search MRL after it {}",
                 o.compares, o.errors, o.pass, o.back
             );
+        }
+        if RD_VREF.is_some() {
+            report_vref(nm, vr);
         }
         for (k, m) in t.mrr.iter().enumerate() {
             println!(
@@ -1075,6 +1128,138 @@ pub fn init_one(para: &[u32; 32]) -> Option<u32> {
     crate::halt()
 }
 
+/// `A7A_DCA` (FEL lab; feature `hybrid`): the WCK duty-cycle
+/// stage (crate module `dca`) right after the PMU's training, before
+/// anything else of ours: `mrr`, `dcm`, `measure` or `apply`. Unset: no
+/// stage (the default). Companions: `A7A_DCA_MR16` (hex, MR16 as the DRAM
+/// has it; default 04, the PMU's end state, or the end of
+/// initialization's switch value when `A7A_HYBRID_ENDINIT` ran),
+/// `A7A_DCA_VIS` (hex RxFifoVisibility for the MRR contents, default
+/// fffc), `A7A_DCA_MRL=trace` (the reference's read latency during the stage),
+/// `A7A_DCA_ITER` (sweeps, 1-9), `A7A_DCA_SINGLE_FLIP=1`.
+#[cfg(feature = "hybrid")]
+const DCA_MODE: Option<cubie_a7a_dram::dca::Mode> = match option_env!("A7A_DCA") {
+    None => None,
+    Some(s) => match cubie_a7a_dram::dca::Mode::parse(s) {
+        Some(m) => Some(m),
+        None => panic!("A7A_DCA must be mrr, dcm, measure or apply"),
+    },
+};
+
+#[cfg(feature = "hybrid")]
+const fn hex_knob(s: Option<&str>, default: u32, max: u32, what: &str) -> u32 {
+    let Some(s) = s else {
+        return default;
+    };
+    match u32::from_str_radix(s, 16) {
+        Ok(v) if v <= max => v,
+        _ => panic!("{}", what),
+    }
+}
+
+#[cfg(feature = "hybrid")]
+const DCA_CONFIG: cubie_a7a_dram::dca::Config = {
+    use cubie_a7a_dram::dca::{Config, DcaPolicy, Mode, VIS_TRACE};
+    let mr16_default = if option_env!("A7A_HYBRID_ENDINIT").is_some() {
+        blobless::END_OF_INIT_VARIANT.mr16_switch as u32
+    } else {
+        0x04
+    };
+    Config {
+        mode: match DCA_MODE {
+            Some(m) => m,
+            None => Mode::Mrr,
+        },
+        pstate: match super::open::OPTS.only_pstate {
+            Some(ps) => ps,
+            None => PROBE_PSTATE,
+        },
+        mr16_found: hex_knob(
+            option_env!("A7A_DCA_MR16"),
+            mr16_default,
+            0xff,
+            "A7A_DCA_MR16: hex byte",
+        ) as u8,
+        vis: hex_knob(
+            option_env!("A7A_DCA_VIS"),
+            VIS_TRACE as u32,
+            0xffff,
+            "A7A_DCA_VIS: hex halfword",
+        ) as u16,
+        trace_mrl: match option_env!("A7A_DCA_MRL") {
+            None => false,
+            Some(s) if s.len() == 5 && s.as_bytes()[0] == b't' => true,
+            Some(_) => panic!("A7A_DCA_MRL must be trace"),
+        },
+        iterations: hex_knob(option_env!("A7A_DCA_ITER"), 1, 9, "A7A_DCA_ITER: 1-9") as u8,
+        policy: DcaPolicy {
+            single_flip: option_env!("A7A_DCA_SINGLE_FLIP").is_some(),
+            ..DcaPolicy::DEFAULT
+        },
+        ..Config::DEFAULT
+    }
+};
+
+#[cfg(feature = "hybrid")]
+static mut DCA_BLOCK: cubie_a7a_dram::dca::DcaBlock = cubie_a7a_dram::dca::DcaBlock::empty(
+    cubie_a7a_dram::phy::wcklevel::Channel::A,
+    cubie_a7a_dram::phy::wcklevel::Rank::R0,
+);
+
+/// The DCA stage on the four blocks, printed (`DCA ...` lines).
+#[cfg(feature = "hybrid")]
+#[inline(never)]
+fn dca_stage() {
+    use cubie_a7a_dram::dca::{self, MRR_FOUND, MRR_OPERATING};
+    let cfg = DCA_CONFIG;
+    println!("[dram] DCA: {cfg:x?}");
+    // SAFETY: bt0 is single-threaded and nothing else refers to it.
+    let b = unsafe { &mut *core::ptr::addr_of_mut!(DCA_BLOCK) };
+    for &(ch, rank) in dca::BLOCKS.iter() {
+        crate::recovery::kick();
+        b.channel = ch;
+        b.rank = rank;
+        dca::run_block(&mut Bt0Hw, b, &cfg);
+        let nm = cubie_a7a_dram::rdtrain::block_name(ch, rank);
+        println!(
+            "[dram] DCA {nm}: stop {:?} failure {:?} restored {} MRR DBYTE {:?}; MR30 found {:02x?} final {:02x?}; DCM once {:02x?}; {} launches, {} writes, {} us",
+            b.stop, b.failure, b.restored, b.mrr_db, b.mr30_found, b.mr30_final, b.dcm_once, b.launches, b.writes, b.elapsed_us
+        );
+        for (what, list) in [
+            ("FSP-WR found", &b.found[..]),
+            ("FSP-WR operating", &b.operating[..]),
+        ] {
+            for m in list {
+                println!(
+                    "[dram] DCA {nm} MRR {what} MR{}: {:02x?} raw {:04x?} | {:04x?} info {:04x?} | {:04x?}",
+                    m.ma, m.value, m.raw[0], m.raw[1], m.info[0], m.info[1]
+                );
+            }
+        }
+        let _ = (MRR_FOUND, MRR_OPERATING);
+        if b.mr26.iter().any(|x| x.is_some()) {
+            println!("[dram] DCA {nm} MR26 per step -7..+7: {:02x?}", b.mr26);
+            for (k, byte) in ["upper", "lower"].iter().enumerate() {
+                let s = &b.sweep[k];
+                println!(
+                    "[dram] DCA {nm} {byte}: flip0 ones {:?} flip1 ones {:?} reads {:?}; decision {:?}",
+                    s.ones[0], s.ones[1], s.reads[0], b.decision[k]
+                );
+            }
+        }
+    }
+}
+
+/// The pstate the hybrid trained and hands over (A7A_OPEN_OPTS bits 3-5;
+/// our WL and read training run at pstate 1 only).
+#[cfg(feature = "hybrid")]
+const fn hybrid_pstate() -> u32 {
+    match super::open::OPTS.only_pstate {
+        Some(ps) => ps,
+        None => PROBE_PSTATE,
+    }
+}
+
 /// Feature `hybrid`: after the PHY training firmware
 /// trained the pstate and our mission bring-up relocked the PHY (open
 /// backend, variant bit 7), PUBMODE back to 1 and our own stages from
@@ -1092,7 +1277,10 @@ pub fn hybrid_after_pmu(p: &mut Para) -> ! {
     csr_access(&mut hw, true);
     hw.write16(csr(0x2006e), 1);
     csr_access(&mut hw, false);
-    println!("[dram] HYBRID: PMU trained pstate {PROBE_PSTATE}; PUBMODE 1; our stages follow");
+    println!(
+        "[dram] HYBRID: PMU trained pstate {}; PUBMODE 1; our stages follow",
+        hybrid_pstate()
+    );
     if option_env!("A7A_HYBRID_ENDINIT").is_some() {
         let e = end_of_init(p);
         println!(
@@ -1100,8 +1288,11 @@ pub fn hybrid_after_pmu(p: &mut Para) -> ! {
             e.failure
         );
     }
+    if DCA_MODE.is_some() {
+        dca_stage();
+    }
     if option_env!("A7A_HYBRID_NO_WL").is_some() {
-        let r = blobless::mission_handover(&mut Bt0Hw, p, PROBE_PSTATE);
+        let r = blobless::mission_handover(&mut Bt0Hw, p, hybrid_pstate());
         println!("[dram] MISSION (hybrid, no leveling, no read training): {r:?}");
         if r.is_ok() {
             super::wrstage::run();

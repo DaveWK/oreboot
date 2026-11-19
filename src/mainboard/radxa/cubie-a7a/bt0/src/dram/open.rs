@@ -99,7 +99,9 @@ impl fmt::Display for ErrorText {
 /// the CPU answers dfi_init_start, bit 3 only one pstate trained, the one in
 /// bits 4-5, bit 6 no DRAM tests in bt0, bit 7 stop before the DFI init
 /// (feature `hybrid`: our stages follow), bits 8-11 the level of our mission
-/// bring-up before the DFI init, bits 16-31 SequenceCtrl + 1 (0: from the
+/// bring-up before the DFI init, bit 12 the PHY duty-cycle/receiver CSR
+/// snapshot before and after each pstate's training, bits 16-31
+/// SequenceCtrl + 1 (0: from the
 /// parameters).
 const OPTS_BITS: u32 = match option_env!("A7A_OPEN_OPTS") {
     Some(s) => match u32::from_str_radix(s, 16) {
@@ -124,6 +126,7 @@ pub const OPTS: ::cubie_a7a_dram::phy::init::Opts = ::cubie_a7a_dram::phy::init:
     no_quick_test: OPTS_BITS & 0x40 != 0,
     mission_level: (OPTS_BITS >> 8) & 0xf,
     stop_before_dfi: OPTS_BITS & 0x80 != 0,
+    snap: OPTS_BITS & 0x1000 != 0,
 };
 
 /// Bit 6 of `A7A_OPEN_OPTS`: no DRAM test in bt0 (quick test, address

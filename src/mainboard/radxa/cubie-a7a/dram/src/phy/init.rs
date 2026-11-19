@@ -165,6 +165,10 @@ pub struct Opts {
     /// controller timing and the DFI init (FEL lab hybrid: our own stages
     /// follow the training firmware's).
     pub stop_before_dfi: bool,
+    /// Log the PHY's duty-cycle, receiver and reference CSRs
+    /// (`crate::dca::log_snapshot`) before and after each pstate's
+    /// training (FEL lab measurement).
+    pub snap: bool,
 }
 
 impl Opts {
@@ -177,6 +181,7 @@ impl Opts {
         no_quick_test: false,
         mission_level: 0,
         stop_before_dfi: false,
+        snap: false,
     };
 }
 
@@ -216,7 +221,13 @@ pub fn init_opts<H: Hw>(
         prog::run(hw, tables::CA_REMAP, &c, freq::config);
         prog::run(hw, tables::DQ_REMAP, &c, freq::config);
         csr_access(hw, false);
+        if o.snap {
+            crate::dca::log_snapshot(hw, ps, "before");
+        }
         let mail = fw::run(hw, ps as u8)?;
+        if o.snap {
+            crate::dca::log_snapshot(hw, ps, "after");
+        }
         hw.log(format_args!(
             "[dram] pstate {ps}: training at {} MHz: message {mail:#x}\n",
             c.data_mhz

@@ -83,6 +83,7 @@ use crate::rd::{
     pattern_off, pattern_on, read_data_saved, rx_en, DataSaved, ReadStart, ALL_ZERO, EMPTY_POINT,
     EV_FIFO, EV_RXEN, EV_UPDATE, LANE_CTL, MRL_CSRS, RX_CLK, SEL_CSRS, VIS_DFE0, VREF_DAC,
 };
+use crate::rdvref::{VrefPlan, VrefResult};
 use crate::wl::{WlExec, WlFailure, LANES};
 
 /// Rows of the gate search, receive clock points per row, RxEnDly points of
@@ -699,6 +700,22 @@ pub fn train_block<H: Hw>(
     start: Option<&ReadStart>,
     cfg: &TrainConfig,
 ) {
+    train_block_with(hw, out, prev, start, cfg, None)
+}
+
+/// [`train_block`] with the read Vref sweep (`crate::rdvref`) after step 4
+/// when `vref` is given (FEL lab knob `A7A_RD_VREF`; with `plan.apply` on a
+/// rank-0 block the per-lane choice stays and the receive clocks are
+/// re-centred, otherwise the references go back as found).
+#[inline(never)]
+pub fn train_block_with<H: Hw>(
+    hw: &mut H,
+    out: &mut RdTrain,
+    prev: Option<Rank>,
+    start: Option<&ReadStart>,
+    cfg: &TrainConfig,
+    vref: Option<(&VrefPlan, &mut VrefResult)>,
+) {
     let (ch, rank) = (out.channel, out.rank);
     *out = RdTrain::empty(ch, rank);
     let dbs = dbytes(ch);
@@ -785,6 +802,15 @@ pub fn train_block<H: Hw>(
     let name = block_name(ch, rank);
 
     train(&mut ex, out, dbs, &prog, regs, cfg, name);
+    if let Some((plan, vr)) = vref {
+        *vr = VrefResult {
+            plan: *plan,
+            ..VrefResult::EMPTY
+        };
+        if out.stop.is_none() && ex.failure.is_none() {
+            vref_sweep(&mut ex, out, vr, dbs, &prog, regs, cfg);
+        }
+    }
     if out.stop.is_none() && ex.failure.is_none() {
         check(&mut ex, out, dbs, &prog, cfg, 0);
         mrr(&mut ex, out, dbs);
@@ -866,6 +892,118 @@ pub fn train_block<H: Hw>(
     out.failure = ex.failure;
     csr_access(hw, false);
     out.elapsed_us = hw.now_us().wrapping_sub(t0) as u32;
+}
+
+/// The read Vref sweep (module `crate::rdvref`): per point both selected
+/// VrefDACs of every lane (lane F) at the point's code, latched, then the
+/// step-4 receive clock sweep (T and C together) around each byte's
+/// `clk0`; per lane the longest passing run. Then the references and the
+/// trained receive clocks as found; with `apply` on rank 0 the per-lane
+/// choice (the byte's common choice for a lane without one) and a
+/// re-centring of the receive clocks at it.
+#[inline(never)]
+fn vref_sweep<H: Hw>(
+    ex: &mut WlExec<'_, H>,
+    out: &mut RdTrain,
+    vr: &mut VrefResult,
+    dbs: [u32; 2],
+    prog: &[Row],
+    regs: [u32; 2],
+    cfg: &TrainConfig,
+) {
+    let plan = vr.plan;
+    for (i, &db) in dbs.iter().enumerate() {
+        for (k, &off) in VREF_DAC.iter().enumerate() {
+            for lane in 0..LANES {
+                vr.found[i][k][lane] = ex.read(lane_csr(db, lane as u32, off));
+            }
+        }
+    }
+    let base = [
+        out.bytes[0].clk0.saturating_sub(cfg.lane_span),
+        out.bytes[1].clk0.saturating_sub(cfg.lane_span),
+    ];
+    let n = ((2 * cfg.lane_span / cfg.lane_step) as usize + 1).min(LANE_MAX);
+    let set_dacs = |ex: &mut WlExec<'_, H>, v: &[[u16; LANES]; 2]| {
+        for (i, &db) in dbs.iter().enumerate() {
+            for (k, &off) in VREF_DAC.iter().enumerate() {
+                if plan.dacs >> k & 1 != 0 {
+                    for (lane, &x) in v[i].iter().enumerate() {
+                        ex.write(lane_csr(db, lane as u32, off), x);
+                    }
+                }
+            }
+        }
+        fire(ex, dbs, EV_UPDATE);
+    };
+    for k in 0..(plan.n as usize).min(crate::rdvref::POINTS_MAX) {
+        if ex.failure.is_some() {
+            return;
+        }
+        let v = plan.code(k);
+        for &db in &dbs {
+            for (d, &off) in VREF_DAC.iter().enumerate() {
+                if plan.dacs >> d & 1 != 0 {
+                    ex.write(lane_f(db, off), v);
+                }
+            }
+        }
+        fire(ex, dbs, EV_UPDATE);
+        let m = sweep_lanes(ex, dbs, prog, &regs, base, cfg.lane_step, n);
+        for i in 0..2 {
+            for lane in 0..LANES {
+                vr.profile[i][lane][k] = Some(crate::rdvref::width(m[i][lane], n));
+            }
+        }
+    }
+    vr.ran = true;
+    crate::rdvref::choose_all(vr);
+    // Back: the references as found (per lane, both DACs), the trained
+    // receive clocks.
+    for (i, &db) in dbs.iter().enumerate() {
+        for (k, &off) in VREF_DAC.iter().enumerate() {
+            for lane in 0..LANES {
+                ex.write(lane_csr(db, lane as u32, off), vr.found[i][k][lane]);
+            }
+        }
+    }
+    let t: [[u16; LANES]; 2] =
+        core::array::from_fn(|i| core::array::from_fn(|l| out.bytes[i].lanes[l].t_eff));
+    let c: [[u16; LANES]; 2] =
+        core::array::from_fn(|i| core::array::from_fn(|l| out.bytes[i].lanes[l].c_eff));
+    set_lanes(ex, dbs, regs[0], &t);
+    set_lanes(ex, dbs, regs[1], &c);
+    fire(ex, dbs, EV_UPDATE);
+    if !plan.apply || out.rank != Rank::R0 {
+        return;
+    }
+    let pick: [[u16; LANES]; 2] = core::array::from_fn(|i| {
+        core::array::from_fn(|l| {
+            vr.chosen[i][l]
+                .or(vr.common[i])
+                .unwrap_or(vr.found[i][0][l])
+        })
+    });
+    set_dacs(ex, &pick);
+    let m = sweep_lanes(ex, dbs, prog, &regs, base, cfg.lane_step, n);
+    let mut t = t;
+    let mut c = c;
+    for i in 0..2 {
+        for lane in 0..LANES {
+            if let Some((w, ctr)) = window(m[i][lane], n, base[i], cfg.lane_step) {
+                out.bytes[i].lanes[lane].both = w;
+                out.bytes[i].lanes[lane].t_eff = ctr;
+                out.bytes[i].lanes[lane].c_eff = ctr;
+                t[i][lane] = ctr;
+                c[i][lane] = ctr;
+                vr.recentred[i][lane] = Some(ctr);
+            }
+        }
+    }
+    set_lanes(ex, dbs, regs[0], &t);
+    set_lanes(ex, dbs, regs[1], &c);
+    fire(ex, dbs, EV_UPDATE);
+    vr.applied = true;
 }
 
 /// "A0" etc.
