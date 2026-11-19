@@ -45,26 +45,26 @@ use util::mmio::{read16, read32, write16, write32};
 /// the DRAM lab mode may set them at run time. The hooks are compiled out
 /// of every other image (as before the probes existed).
 pub const ANY: bool = cfg!(feature = "dram-lab")
-    || option_env!("A7A_FETCH_PROBE").is_some()
-    || option_env!("A7A_SYS_SNAP").is_some()
-    || option_env!("A7A_RD_GAPS").is_some()
-    || option_env!("A7A_NO_BOOST").is_some();
+    || crate::knob!("A7A_FETCH_PROBE").is_some()
+    || crate::knob!("A7A_SYS_SNAP").is_some()
+    || crate::knob!("A7A_RD_GAPS").is_some()
+    || crate::knob!("A7A_NO_BOOST").is_some();
 
 #[allow(non_snake_case)]
 pub fn FETCH_PROBE() -> bool {
-    cubie_a7a_dram::knobs::env("A7A_FETCH_PROBE", option_env!("A7A_FETCH_PROBE")).is_some()
+    cubie_a7a_dram::knobs::env("A7A_FETCH_PROBE", crate::knob!("A7A_FETCH_PROBE")).is_some()
 }
 #[allow(non_snake_case)]
 pub fn SYS_SNAP() -> bool {
-    cubie_a7a_dram::knobs::env("A7A_SYS_SNAP", option_env!("A7A_SYS_SNAP")).is_some()
+    cubie_a7a_dram::knobs::env("A7A_SYS_SNAP", crate::knob!("A7A_SYS_SNAP")).is_some()
 }
 #[allow(non_snake_case)]
 pub fn NO_BOOST() -> bool {
-    cubie_a7a_dram::knobs::env("A7A_NO_BOOST", option_env!("A7A_NO_BOOST")).is_some()
+    cubie_a7a_dram::knobs::env("A7A_NO_BOOST", crate::knob!("A7A_NO_BOOST")).is_some()
 }
 #[allow(non_snake_case)]
 fn RD_GAPS() -> Option<u32> {
-    match cubie_a7a_dram::knobs::env("A7A_RD_GAPS", option_env!("A7A_RD_GAPS")) {
+    match cubie_a7a_dram::knobs::env("A7A_RD_GAPS", crate::knob!("A7A_RD_GAPS")) {
         Some(s) => match u32::from_str_radix(s, 16) {
             Ok(v) if v >= 1 && v <= 0x3f => Some(v),
             _ => panic!("A7A_RD_GAPS is a hex value 1..3f"),

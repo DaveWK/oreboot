@@ -174,6 +174,24 @@ fn main() {
     if env::var_os("CARGO_FEATURE_FEL").is_none() && env::var_os("CARGO_FEATURE_SPINOR").is_none() {
         println!("cargo:rustc-cfg=medium");
     }
+    // The firmware-free DRAM backend (src/dram.rs, src/dram/blobless.rs) is
+    // one code path under two names: the default feature `blobfree` (the
+    // boot, with a profile's settings) and the lab features (`blobless`:
+    // the stages up to the read training; `bl-mission`: the hand-over, the
+    // write stage and the boot as well), whose settings are the build's
+    // A7A_* knobs alone.
+    //   dram_blobfree: that backend is the DRAM backend;
+    //   dram_mission:  with the stages past the read training.
+    let blobfree = env::var_os("CARGO_FEATURE_BLOBFREE").is_some();
+    let blobless = env::var_os("CARGO_FEATURE_BLOBLESS").is_some();
+    println!("cargo:rustc-check-cfg=cfg(dram_blobfree)");
+    println!("cargo:rustc-check-cfg=cfg(dram_mission)");
+    if blobfree || blobless {
+        println!("cargo:rustc-cfg=dram_blobfree");
+    }
+    if blobfree || env::var_os("CARGO_FEATURE_BL_MISSION").is_some() {
+        println!("cargo:rustc-cfg=dram_mission");
+    }
     let fastboot = env::var_os("CARGO_FEATURE_FASTBOOT").is_some();
     let lab = env::var_os("CARGO_FEATURE_DRAM_LAB").is_some();
     let memory = if env::var_os("CARGO_FEATURE_FEL").is_some() {
@@ -207,7 +225,7 @@ fn main() {
 
     if env::var_os("CARGO_FEATURE_DRAMLIB").is_some() {
         link_dram_library();
-    } else if env::var_os("CARGO_FEATURE_BLOBLESS").is_none() {
+    } else if !(blobfree || blobless) {
         extract_phy_firmware(out);
         if lab {
             lab_firmware(out);

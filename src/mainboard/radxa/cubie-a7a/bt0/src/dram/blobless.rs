@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-only
 #![cfg_attr(feature = "hybrid", allow(dead_code))]
-//! Blobless DRAM backend (feature `blobless`): no PHY firmware is built in,
-//! loaded or run. Development stage: it runs the firmware-free PHY probe
-//! (crate `cubie-a7a-dram`, module `blobless`), prints what it found and
-//! halts. DRAM is not brought up yet, so the boot watchdog resets the board
-//! and, from the SD card, the next start enters FEL (README, Boot
-//! failures).
+//! Blob-free DRAM backend (cfg `dram_blobfree`): no PHY firmware is built in, loaded or run. It runs the stages
+//! of crate `cubie-a7a-dram`, module `blobless`, and prints each. The lab's `blobless` stops after the read
+//! training; with cfg `dram_mission` (the default build, the lab's `bl-mission`) the hand-over and the write
+//! stage follow, and with `A7A_BL_BOOT` (set by the boot profile) [`init_one`] then returns the size and bt0
+//! boots. Otherwise, or when a stage fails, bt0 halts: back to FEL in a FEL build, else the watchdog resets
+//! the board and, from the SD card, the next start enters FEL (README, Boot failures).
 
 #[cfg(not(feature = "wck-alias-probe"))]
 use cubie_a7a_dram::blobless::BlockTrain;
@@ -38,7 +38,7 @@ const _: () = assert!(
 /// The pstate our stages run at: the hybrid's trained pstate (A7A_OPEN_OPTS
 /// bits 3-5), else [`PROBE_PSTATE`].
 /// [`stage_pstate`] from the build's knobs (const contexts; the write stage).
-#[cfg(any(feature = "bl-mission", feature = "hybrid"))]
+#[cfg(any(dram_mission, feature = "hybrid"))]
 pub(super) const fn stage_pstate_build() -> u32 {
     #[cfg(feature = "hybrid")]
     {
@@ -66,7 +66,7 @@ pub(super) fn stage_pstate() -> u32 {
 /// runs them must have trained that pstate.
 #[cfg(feature = "hybrid")]
 const _: () = assert!(
-    (option_env!("A7A_HYBRID_NO_WL").is_some() && option_env!("A7A_HYBRID_ENDINIT").is_none())
+    (crate::knob!("A7A_HYBRID_NO_WL").is_some() && crate::knob!("A7A_HYBRID_ENDINIT").is_none())
         || hybrid_pstate_build() == cubie_a7a_dram::pstate::ACTIVE,
     "hybrid WL/RD at a pstate other than A7A_PSTATE (set A7A_PSTATE to the trained pstate)"
 );
@@ -103,7 +103,7 @@ fn clock_matches(p: &Para) -> bool {
 /// operating one (measured: WL must not run with FSP-WR = FSP-OP). The PMU
 /// leaves 0x04 at pstate 1; what it leaves at pstate 0 is read by the
 /// pstate-0 control run. Unset: nothing.
-const WL_MR16: Option<u8> = match option_env!("A7A_WL_MR16") {
+const WL_MR16: Option<u8> = match crate::knob!("A7A_WL_MR16") {
     Some(s) => match u8::from_str_radix(s, 16) {
         Ok(v) => Some(v),
         Err(_) => panic!("A7A_WL_MR16 is not a hex byte"),
@@ -397,7 +397,7 @@ fn wck_level(p: &mut Para) {
                 let f = blobless::mr16_all(&mut Bt0Hw, after);
                 println!("[dram] RD: MR16 {after:02x} to all ranks after the read training: failure {f:?}");
             }
-            #[cfg(any(feature = "bl-mission", feature = "hybrid"))]
+            #[cfg(any(dram_mission, feature = "hybrid"))]
             if applied {
                 let relock = cubie_a7a_dram::knobs::get().bl_relock;
                 let r = blobless::mission_handover_relock(&mut Bt0Hw, p, stage_pstate(), relock);
@@ -408,7 +408,7 @@ fn wck_level(p: &mut Para) {
                 );
                 if r.is_ok() {
                     let clean = super::wrstage::run();
-                    #[cfg(feature = "bl-mission")]
+                    #[cfg(dram_mission)]
                     // SAFETY: bt0 is single-threaded.
                     unsafe {
                         MISSION_OK = clean;
@@ -746,7 +746,7 @@ fn read_enable(bases: [Option<cubie_a7a_dram::phy::wcklevel::Mr18Base>; 4]) {
 /// `,<start>,<step>,<n>[,<dacs>]` in hex. Unset: no sweep (the default).
 #[cfg(all(not(feature = "wck-alias-probe"), not(feature = "rd-measure")))]
 const RD_VREF: Option<cubie_a7a_dram::rdvref::VrefPlan> =
-    match cubie_a7a_dram::rdvref::VrefPlan::parse(option_env!("A7A_RD_VREF")) {
+    match cubie_a7a_dram::rdvref::VrefPlan::parse(crate::knob!("A7A_RD_VREF")) {
         Ok(p) => p,
         Err(()) => panic!("A7A_RD_VREF: measure|apply[,start,step,n[,dacs]] (hex)"),
     };
@@ -1163,13 +1163,13 @@ fn print_ho_knobs() {
             cubie_a7a_dram::obs::HO_RDCSLAT()
         );
     }
-    if let Some(s) = cubie_a7a_dram::knobs::env("A7A_HO_CSRS", option_env!("A7A_HO_CSRS")) {
+    if let Some(s) = cubie_a7a_dram::knobs::env("A7A_HO_CSRS", crate::knob!("A7A_HO_CSRS")) {
         println!(
             "[dram] HO knobs: {} PHY CSR writes before the hand-over",
             s.split(',').count()
         );
     }
-    if let Some(s) = cubie_a7a_dram::knobs::env("A7A_HO_MRS", option_env!("A7A_HO_MRS")) {
+    if let Some(s) = cubie_a7a_dram::knobs::env("A7A_HO_MRS", crate::knob!("A7A_HO_MRS")) {
         println!("[dram] HO knobs: operating-set MRWs after the hand-over {s}");
     }
     if blobless::HO_EPILOGUE().is_some() || blobless::HO_FIFOINIT() || blobless::HO_PULSE_RESTORE()
@@ -1194,17 +1194,17 @@ fn print_ho_knobs() {
     }
 }
 
-/// Feature `bl-mission`, FEL lab knob `A7A_BL_BOOT`: when the lean
-/// hand-over succeeded and the write stage (`A7A_WR_STAGE`) left the probe
-/// blocks writing cleanly, [`init_one`] returns the size instead of
-/// halting, and bt0 goes on (its DRAM tests, then main): the blob-free
-/// boot attempt. Unset: the halt, as before.
-#[cfg(feature = "bl-mission")]
+/// Cfg `dram_mission`, knob `A7A_BL_BOOT` (the boot profile sets it): when
+/// the lean hand-over succeeded and the write stage (`A7A_WR_STAGE`) left
+/// the probe blocks writing cleanly, [`init_one`] returns the size instead
+/// of halting, and bt0 goes on (its DRAM tests, then main): the blob-free
+/// boot. Unset: the halt, as in the lab images built without it.
+#[cfg(dram_mission)]
 #[allow(non_snake_case)]
 fn BL_BOOT() -> bool {
-    cubie_a7a_dram::knobs::env("A7A_BL_BOOT", option_env!("A7A_BL_BOOT")).is_some()
+    cubie_a7a_dram::knobs::env("A7A_BL_BOOT", crate::knob!("A7A_BL_BOOT")).is_some()
 }
-#[cfg(feature = "bl-mission")]
+#[cfg(dram_mission)]
 static mut MISSION_OK: bool = false;
 
 /// Probe the PHY with `para`, print the result and stop (or, with
@@ -1309,7 +1309,7 @@ pub fn init_one(para: &[u32; 32]) -> Option<u32> {
                     // The reference's end of initialization (target
                     // FSP mode registers, FSP-OP switch) before WL.
                     if let Some(spec) =
-                        cubie_a7a_dram::knobs::env("A7A_FSP0_MRS", option_env!("A7A_FSP0_MRS"))
+                        cubie_a7a_dram::knobs::env("A7A_FSP0_MRS", crate::knob!("A7A_FSP0_MRS"))
                     {
                         let f = blobless::fsp0_mrs(&mut Bt0Hw, &mut p, PROBE_PSTATE);
                         println!("[dram] FSP0 MRs {spec} written (MR16 40 .. 00): failure {f:?}");
@@ -1329,7 +1329,7 @@ pub fn init_one(para: &[u32; 32]) -> Option<u32> {
             println!("[dram] blobless: pre-training failed after {ms} ms: {e:?}");
         }
     }
-    #[cfg(feature = "bl-mission")]
+    #[cfg(dram_mission)]
     // SAFETY: bt0 is single-threaded.
     if BL_BOOT() && unsafe { MISSION_OK } {
         match cubie_a7a_dram::size::boot_size_mib(&p) {
@@ -1361,7 +1361,7 @@ pub fn init_one(para: &[u32; 32]) -> Option<u32> {
 /// module `acsm_probe` (`ACSMP` lines), then the halt. Nothing reaches the
 /// DRAM. Unset: the normal blobless flow.
 #[cfg(not(feature = "wck-alias-probe"))]
-const ACSM_PROBE: bool = match option_env!("A7A_ACSM_PROBE") {
+const ACSM_PROBE: bool = match crate::knob!("A7A_ACSM_PROBE") {
     None => false,
     Some(s) if s.len() == 5 && s.as_bytes()[0] == b'r' => true,
     Some(_) => panic!("A7A_ACSM_PROBE must be reset"),
@@ -1406,7 +1406,7 @@ fn acsm_reset_probe() -> ! {
 /// fffc), `A7A_DCA_MRL=trace` (the reference's read latency during the stage),
 /// `A7A_DCA_ITER` (sweeps, 1-9), `A7A_DCA_SINGLE_FLIP=1`.
 #[cfg(feature = "hybrid")]
-const DCA_MODE: Option<cubie_a7a_dram::dca::Mode> = match option_env!("A7A_DCA") {
+const DCA_MODE: Option<cubie_a7a_dram::dca::Mode> = match crate::knob!("A7A_DCA") {
     None => None,
     Some(s) => match cubie_a7a_dram::dca::Mode::parse(s) {
         Some(m) => Some(m),
@@ -1428,7 +1428,7 @@ const fn hex_knob(s: Option<&str>, default: u32, max: u32, what: &str) -> u32 {
 #[cfg(feature = "hybrid")]
 const DCA_CONFIG: cubie_a7a_dram::dca::Config = {
     use cubie_a7a_dram::dca::{Config, DcaPolicy, Mode, VIS_TRACE};
-    let mr16_default = if option_env!("A7A_HYBRID_ENDINIT").is_some() {
+    let mr16_default = if crate::knob!("A7A_HYBRID_ENDINIT").is_some() {
         blobless::END_OF_INIT_VARIANT.mr16_switch as u32
     } else {
         0x04
@@ -1444,28 +1444,28 @@ const DCA_CONFIG: cubie_a7a_dram::dca::Config = {
             None => PROBE_PSTATE,
         },
         mr16_found: hex_knob(
-            option_env!("A7A_DCA_MR16"),
+            crate::knob!("A7A_DCA_MR16"),
             mr16_default,
             0xff,
             "A7A_DCA_MR16: hex byte",
         ) as u8,
         vis: hex_knob(
-            option_env!("A7A_DCA_VIS"),
+            crate::knob!("A7A_DCA_VIS"),
             VIS_TRACE as u32,
             0xffff,
             "A7A_DCA_VIS: hex halfword",
         ) as u16,
-        trace_mrl: match option_env!("A7A_DCA_MRL") {
+        trace_mrl: match crate::knob!("A7A_DCA_MRL") {
             None => false,
             Some(s) if s.len() == 5 && s.as_bytes()[0] == b't' => true,
             Some(_) => panic!("A7A_DCA_MRL must be trace"),
         },
-        iterations: hex_knob(option_env!("A7A_DCA_ITER"), 1, 9, "A7A_DCA_ITER: 1-9") as u8,
+        iterations: hex_knob(crate::knob!("A7A_DCA_ITER"), 1, 9, "A7A_DCA_ITER: 1-9") as u8,
         policy: DcaPolicy {
-            single_flip: option_env!("A7A_DCA_SINGLE_FLIP").is_some(),
+            single_flip: crate::knob!("A7A_DCA_SINGLE_FLIP").is_some(),
             ..DcaPolicy::DEFAULT
         },
-        timed_waits: option_env!("A7A_DCA_TIMED").is_some(),
+        timed_waits: crate::knob!("A7A_DCA_TIMED").is_some(),
         ..Config::DEFAULT
     }
 };
@@ -1527,7 +1527,7 @@ fn dca_stage() {
 /// r0-tg, rx-a, rx-b, rx-none, pre-nolo, pre-notg, pre-noft, pre-none,
 /// wait0, wait8), then the reference MRRs of MR5 and MR8. MRR only.
 #[cfg(feature = "hybrid")]
-const ACSM_FIELD: Option<cubie_a7a_dram::acsm_probe::Variant> = match option_env!("A7A_ACSM_FIELD")
+const ACSM_FIELD: Option<cubie_a7a_dram::acsm_probe::Variant> = match crate::knob!("A7A_ACSM_FIELD")
 {
     None => None,
     Some(s) => match cubie_a7a_dram::acsm_probe::Variant::parse(s) {
@@ -1609,7 +1609,7 @@ pub fn hybrid_after_pmu(p: &mut Para) -> ! {
         crate::halt()
     }
     if let Some(stage) =
-        cubie_a7a_dram::knobs::env("A7A_HYBRID_COLD", option_env!("A7A_HYBRID_COLD"))
+        cubie_a7a_dram::knobs::env("A7A_HYBRID_COLD", crate::knob!("A7A_HYBRID_COLD"))
     {
         // FEL lab: our DevInit / cold init / CBT over the
         // PMU-trained state (blobless::hybrid_cold).
@@ -1621,7 +1621,7 @@ pub fn hybrid_after_pmu(p: &mut Para) -> ! {
             t.devinit.failure, t.exec.failure, t.done, t.channels[0].delay, t.channels[1].delay
         );
     }
-    if let Some(spec) = cubie_a7a_dram::knobs::env("A7A_FSP0_MRS", option_env!("A7A_FSP0_MRS")) {
+    if let Some(spec) = cubie_a7a_dram::knobs::env("A7A_FSP0_MRS", crate::knob!("A7A_FSP0_MRS")) {
         let f = blobless::fsp0_mrs(&mut Bt0Hw, p, PROBE_PSTATE);
         println!("[dram] FSP0 MRs {spec} written (MR16 40 .. 00): failure {f:?}");
     }

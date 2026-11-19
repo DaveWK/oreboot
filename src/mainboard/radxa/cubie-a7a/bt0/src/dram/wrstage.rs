@@ -33,7 +33,7 @@ use super::bt0hw::Bt0Hw;
 
 #[allow(non_snake_case)]
 fn BITS() -> u32 {
-    match cubie_a7a_dram::knobs::env("A7A_WR_STAGE", option_env!("A7A_WR_STAGE")) {
+    match cubie_a7a_dram::knobs::env("A7A_WR_STAGE", crate::knob!("A7A_WR_STAGE")) {
         Some(s) => match u32::from_str_radix(s, 16) {
             Ok(v) if v < 0x20 => v,
             _ => panic!("A7A_WR_STAGE is a hex mask below 0x20"),
@@ -84,7 +84,7 @@ struct Port(Bt0Hw);
 /// `A7A_WR_APPLY` (module docs).
 #[allow(non_snake_case)]
 fn APPLY() -> bool {
-    cubie_a7a_dram::knobs::env("A7A_WR_APPLY", option_env!("A7A_WR_APPLY")).is_some()
+    cubie_a7a_dram::knobs::env("A7A_WR_APPLY", crate::knob!("A7A_WR_APPLY")).is_some()
 }
 /// TxDqDly written since the last compare (applied by the next one).
 static DIRTY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
@@ -181,7 +181,7 @@ pub fn run() -> bool {
                 if blind_clean
                     && cubie_a7a_dram::knobs::env(
                         "A7A_WR_BLIND_CENTER",
-                        option_env!("A7A_WR_BLIND_CENTER"),
+                        crate::knob!("A7A_WR_BLIND_CENTER"),
                     )
                     .is_some()
                 {

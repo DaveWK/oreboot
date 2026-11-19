@@ -113,7 +113,7 @@ pub const FULL: u16 = (1 << LANES) - 1;
 /// receive clock goes to the centre of its sweep, the byte's `clk0`.
 #[allow(non_snake_case)]
 pub fn PASS_LANES() -> u16 {
-    match crate::knobs::env("A7A_RD_LANES", option_env!("A7A_RD_LANES")) {
+    match crate::knobs::env("A7A_RD_LANES", crate::knob!("A7A_RD_LANES")) {
         Some(s) => {
             match lane_mask(s) {
                 Some(m) => m,
@@ -165,7 +165,7 @@ pub const MRR_MAS: [u8; 4] = [5, 8, 16, 2];
 /// values at pstate 1 (read on the board). Unset: the reference's.
 #[allow(non_snake_case)]
 pub fn EXIT_MRS() -> ModeMrs {
-    match crate::knobs::env("A7A_RD_EXIT", option_env!("A7A_RD_EXIT")) {
+    match crate::knobs::env("A7A_RD_EXIT", crate::knob!("A7A_RD_EXIT")) {
         Some(s) => match crate::blobless::hex_pair(s) {
             Some((mr18, mr10)) => ModeMrs {
                 mr18,
@@ -185,7 +185,7 @@ pub fn EXIT_MRS() -> ModeMrs {
 /// and our blobless MRRs read all-zero on the board.
 pub const VIS_MRR: [u16; 2] = [
     0x300,
-    match option_env!("A7A_RD_VIS") {
+    match crate::knob!("A7A_RD_VIS") {
         Some(s) => match u16::from_str_radix(s, 16) {
             Ok(v) => v,
             Err(_) => panic!("A7A_RD_VIS is not a hex halfword"),
@@ -263,7 +263,7 @@ pub struct TrainConfig {
 /// instead of the pstate's default (e.g. `82`, the reference's value during
 /// the pstate-0 read enable stage; it uses 3 at pstate 1). Unset: the
 /// pstate's [`TrainConfig`].
-pub const MRL_SEARCH: Option<u16> = match option_env!("A7A_RD_MRL_SEARCH") {
+pub const MRL_SEARCH: Option<u16> = match crate::knob!("A7A_RD_MRL_SEARCH") {
     Some(s) => match u16::from_str_radix(s, 16) {
         Ok(v) => Some(v),
         Err(_) => panic!("A7A_RD_MRL_SEARCH is not a hex number"),

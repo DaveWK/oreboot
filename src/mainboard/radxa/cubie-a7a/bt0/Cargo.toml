@@ -5,11 +5,38 @@ authors = ["oreboot authors"]
 edition = "2021"
 
 [features]
+# The default build is the blob-free boot. Every other DRAM backend and
+# every lab feature is built with --no-default-features, and then means
+# what it meant before the default existed.
+default = ["blobfree"]
+# The blob-free boot: this board's own driver (crate cubie-a7a-dram) with
+# no vendor library, no PHY training firmware and no PIE image built in,
+# loaded or run, and with the settings of its board runs built in
+# (cubie_a7a_dram::knobs::profile), so the build needs nothing from outside
+# this tree and no A7A_* knob. It trains, checks its writes and goes on to
+# load main and the payload; a stage that fails halts. With `fel`, `spinor`,
+# `fastboot`, `otp`, `wr-r1`; not with another backend or a lab feature.
+#
+# Build variable A7A_PROFILE picks the profile by its DRAM clock: 2400 (WCK
+# 2400 MHz, 4800 Mb/s per pin) or 1200 (2400 Mb/s); unset:
+# cubie_a7a_dram::knobs::profile::DEFAULT. An A7A_* knob in the build's
+# environment overrides the profile's value, `A7A_X=-` unsets one, and
+# A7A_PROFILE=none builds with no profile at all (the knobs alone: the
+# image `bl-mission` builds).
+blobfree = ["cubie-a7a-dram/boot-profile"]
 # DRAM init through Allwinner's closed library (A733_DRAM_LIB) instead of
-# the open driver. The library is not part of this tree; see the board README.
+# this board's driver: the comparison path. The library is not part of this
+# tree; see the board README.
 dramlib = []
-# DRAM without any PHY firmware (no PMU training firmware, no PIE images).
-# Development stage: probes the PHY and halts (src/dram/blobless.rs).
+# Lab: DRAM without any PHY firmware, every setting an A7A_* knob of the
+# build's environment and none built in. On its own it runs the stages up
+# to the read training and halts (src/dram/blobless.rs); `bl-mission` adds
+# the rest of the boot path.
+#
+# With --no-default-features and none of `dramlib`, `blobless` and their
+# dependents: the driver with the PHY's own training firmware and PIE
+# images, which run inside the PHY, loaded as data (A733_PHY_FW_OBJ, see
+# the board README; no vendor code is linked). The base of `hybrid`.
 blobless = []
 # One held-reset alias observation; bypass all ACSM/DevInit/CBT probes.
 wck-alias-probe = ["blobless"]
@@ -49,10 +76,12 @@ rd-train-only = ["blobless"]
 # The hand-over to the DDR controller without a PIE after the applied read
 # training (crate module handover; measurement image).
 handover = ["blobless"]
-# After the applied read training, the lean hand-over
+# Lab: the code of the blob-free boot with no settings built in. After the
+# applied read training, the lean hand-over
 # (cubie_a7a_dram::blobless::mission_handover: mission CSRs, read-data
-# enable, CPU-answered DFI init, ports), then the halt (back to FEL in a
-# FEL build) for the host's checks.
+# enable, CPU-answered DFI init, ports) and the write stage (A7A_WR_STAGE),
+# then the halt (back to FEL in a FEL build) for the host's checks, or
+# with A7A_BL_BOOT the rest of the boot.
 bl-mission = ["blobless"]
 # Hybrid: the open backend with the PHY training firmware for the pstate,
 # then our own stages (WCK2CK leveling, read training) and the lean
@@ -63,16 +92,20 @@ hybrid = []
 # bt0 linked at 0x90000, started by the mask ROM's FEL (xfel exec) instead
 # of from the SD card. Entry 1 brings up PMIC, clocks and DRAM and returns
 # to FEL; the host then writes main, the payload and the layout table;
-# entry 2 checks them and hands over to main as the SD path does. Combine
-# with a DRAM backend (e.g. dramlib).
+# entry 2 checks them and hands over to main as the SD path does. With any
+# DRAM backend.
 fel = ["cubie-a7a-dram/vendor-vdd2l"]
 # SPI NOR boot (src/spinor.rs): the mask ROM loads bt0 from NOR offset 0;
 # bt0 reads the layout table and the images from the NOR at the SD card's
-# offsets. Same DRAM rails as the FEL boot that runs on the board; combine
-# with the DRAM backend (dramlib). Excludes `fel`.
+# offsets. Same DRAM rails as the FEL boot that runs on the board; with any
+# DRAM backend. Excludes `fel`.
 spinor = ["cubie-a7a-dram/vendor-vdd2l"]
 # Boot from the eMMC module (SMHC2): the mask ROM loads bt0 from the eMMC,
-# bt0 reads the layout table and images from its user area.
+# bt0 reads the layout table and images from its user area. Every build
+# without `fel` and `spinor` does that already (it boots the SD card or the
+# eMMC, whichever the mask ROM loaded it from); the feature only keeps the
+# FEL boot's VDD2L for the backends that do not set it themselves (the
+# blob-free boot's profile does).
 emmc = ["cubie-a7a-dram/vendor-vdd2l"]
 # fastboot over FEL (src/fastboot.rs, src/musb.rs; scripts/fastboot-boot.sh
 # in radxa-a7a-workspace): FEL entry 4 at 0x9004c brings DRAM up (unless
@@ -95,14 +128,16 @@ fastboot-nor-write = ["fastboot"]
 # knobs (cubie_a7a_dram::knobs), the results stay in SRAM (run log, lab
 # op output, PHY CSR and controller register dumps) for `getvar`, `oem`
 # and `fetch`; `reboot` ends every run. Combine with the open driver and
-# `hybrid` or `bl-mission`.
+# `hybrid` or `bl-mission` (no settings are built in: the knobs are the
+# run's).
 dram-lab = ["fastboot", "cubie-a7a-dram/lab-knobs", "cubie-a7a-common/sram-log"]
 # eMMC flash/erase and the boot configuration (PARTITION_CONFIG bits 6:3,
 # BOOT_BUS_CONDITIONS) behind arming and content checks.
 fastboot-emmc-write = ["fastboot"]
 # The write stage's upper eight probe blocks in rank 1 instead of at
-# 0xbf000000 (src/dram/wrstage.rs `blocks`; with `bl-mission` or `hybrid`
-# and `A7A_WR_STAGE`): rank 1 is found from the address map the controller
+# 0xbf000000 (src/dram/wrstage.rs `blocks`; with the blob-free boot, or
+# with `bl-mission` or `hybrid` and `A7A_WR_STAGE`): rank 1 is found from
+# the address map the controller
 # holds (CXMT 4 GB: 0xc0100000; CXMT 6 GB, non-binary: 0x80100000), so the
 # stage's compares cover both ranks. Lab feature until a board run confirms
 # the rank layout; without it every image is built as before.

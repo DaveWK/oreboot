@@ -937,3 +937,8 @@ fn panic(info: &PanicInfo) -> ! {
     println!("[bt0]   {}", info.message());
     halt()
 }
+
+/// Every build-time `A7A_*` knob is read with `crate::knob!`: the build
+/// environment's value or the boot profile's (cubie_a7a_dram::knobs::profile).
+/// At the end of the file so that no line above moves.
+pub(crate) use cubie_a7a_dram::knob;

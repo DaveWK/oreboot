@@ -40,13 +40,13 @@ const fn digit(s: Option<&str>, default: u32) -> u32 {
     }
 }
 
-/// The pstate the firmware-free stages train (env `A7A_PSTATE` at build
-/// time; unset: 1, the pstate the blob-free flow was built at).
-pub const ACTIVE: u32 = digit(option_env!("A7A_PSTATE"), 1);
+/// The pstate the firmware-free stages train (`A7A_PSTATE` at build time,
+/// or the boot profile's; unset: 1, the pstate the flow was built at).
+pub const ACTIVE: u32 = digit(crate::knob!("A7A_PSTATE"), 1);
 
-/// Whether `A7A_PSTATE` was given (bt0 checks it against its other pstate
-/// knobs).
-pub const ACTIVE_FROM_ENV: bool = option_env!("A7A_PSTATE").is_some();
+/// Whether `A7A_PSTATE` was given, in the environment or by the boot
+/// profile (bt0 checks it against its other pstate knobs).
+pub const ACTIVE_FROM_ENV: bool = crate::knob!("A7A_PSTATE").is_some();
 
 /// The DfiClk (= CK) per pstate of the Cubie A7A 4 GB sets (dram_clk 2400,
 /// tpr2 0x170b0703: dividers 4, 8, 12, 24). VENDOR-BOARD-DATA; a unit test

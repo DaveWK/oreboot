@@ -74,7 +74,7 @@ pub struct EiSpec {
 
 /// The later lab knobs, read at run time through
 /// [`env`]: the lab mode's override when one was given (`NAME=value`, or
-/// `-NAME` for unset), else the build's `option_env!` value. Each knob's
+/// `-NAME` for unset), else the build's [`crate::knob!`] value. Each knob's
 /// parser runs where it is used, as at build time (a malformed value
 /// panics there; the lab mode turns a panic into a halted run).
 pub const EXTRA: [&str; 34] = [
@@ -195,26 +195,26 @@ const fn ei_variant(e: &EiSpec) -> Option<Variant> {
 /// The build environment's knobs (the former consts, same panics).
 pub const BUILD: Knobs = Knobs {
     extra: [None; EXTRA.len()],
-    open_opts: match option_env!("A7A_OPEN_OPTS") {
+    open_opts: match crate::knob!("A7A_OPEN_OPTS") {
         Some(s) => match hex_u32(s) {
             Some(v) => v,
             None => panic!("A7A_OPEN_OPTS is not a hex number"),
         },
         None => 0,
     },
-    hybrid_endinit: option_env!("A7A_HYBRID_ENDINIT").is_some(),
-    hybrid_no_wl: option_env!("A7A_HYBRID_NO_WL").is_some(),
-    hybrid_skip_wl: option_env!("A7A_HYBRID_SKIP_WL").is_some(),
-    hybrid_skip_rd: option_env!("A7A_HYBRID_SKIP_RD").is_some(),
-    bl_relock: option_env!("A7A_BL_RELOCK").is_some(),
-    rd_mrl: match option_env!("A7A_RD_MRL") {
+    hybrid_endinit: crate::knob!("A7A_HYBRID_ENDINIT").is_some(),
+    hybrid_no_wl: crate::knob!("A7A_HYBRID_NO_WL").is_some(),
+    hybrid_skip_wl: crate::knob!("A7A_HYBRID_SKIP_WL").is_some(),
+    hybrid_skip_rd: crate::knob!("A7A_HYBRID_SKIP_RD").is_some(),
+    bl_relock: crate::knob!("A7A_BL_RELOCK").is_some(),
+    rd_mrl: match crate::knob!("A7A_RD_MRL") {
         Some(s) => match dec_u16(s) {
             Some(v) => Some(v),
             None => panic!("A7A_RD_MRL is not a number"),
         },
         None => None,
     },
-    wl_mr18: match option_env!("A7A_HYBRID_WL_MR18") {
+    wl_mr18: match crate::knob!("A7A_HYBRID_WL_MR18") {
         Some(s) => match hex_u32(s) {
             Some(v) if v <= 0xff => Some(v as u8),
             _ => panic!("A7A_HYBRID_WL_MR18 is not a hex byte"),
@@ -228,25 +228,25 @@ pub const BUILD: Knobs = Knobs {
         None => panic!("A7A_HYBRID_EI_SKIP/_NO_MRW/_MR16/A7A_EI_FSPWR0 malformed"),
     },
     ei_spec: BUILD_EI,
-    init0: match option_env!("A7A_BL_INIT0") {
+    init0: match crate::knob!("A7A_BL_INIT0") {
         Some(s) => Some((s.as_bytes()[0] - b'0') as u32 & 3),
         None => None,
     },
-    wl_mr18_ops: match parse_mr18_ops(option_env!("A7A_HYBRID_WL_MR18_OPS")) {
+    wl_mr18_ops: match parse_mr18_ops(crate::knob!("A7A_HYBRID_WL_MR18_OPS")) {
         Some(o) => o,
         None => panic!("A7A_HYBRID_WL_MR18_OPS malformed (four fields: empty, -, or hex)"),
     },
 };
 
 const BUILD_EI: EiSpec = EiSpec {
-    skip: option_env!("A7A_HYBRID_EI_SKIP"),
-    no_mrw: option_env!("A7A_HYBRID_EI_NO_MRW"),
-    mr16: option_env!("A7A_HYBRID_EI_MR16"),
-    fspwr0: option_env!("A7A_EI_FSPWR0"),
+    skip: crate::knob!("A7A_HYBRID_EI_SKIP"),
+    no_mrw: crate::knob!("A7A_HYBRID_EI_NO_MRW"),
+    mr16: crate::knob!("A7A_HYBRID_EI_MR16"),
+    fspwr0: crate::knob!("A7A_EI_FSPWR0"),
 };
 
 /// The build's `A7A_BL_MRS` text (lenient, as before).
-pub const BUILD_BL_MRS: Option<&str> = option_env!("A7A_BL_MRS");
+pub const BUILD_BL_MRS: Option<&str> = crate::knob!("A7A_BL_MRS");
 
 #[cfg(feature = "lab-knobs")]
 static mut CURRENT: Option<Knobs> = None;
@@ -279,7 +279,7 @@ fn build() -> Knobs {
 }
 
 /// An [`EXTRA`] knob's value: the runtime override if the lab mode set
-/// one, else `build` (the caller's `option_env!`).
+/// one, else `build` (the caller's [`crate::knob!`]).
 #[cfg(feature = "lab-knobs")]
 pub fn env(name: &str, build: Option<&'static str>) -> Option<&'static str> {
     // SAFETY: written only by the boot CPU before the DRAM init.
@@ -387,6 +387,11 @@ impl Knobs {
         Ok(())
     }
 }
+
+/// The blob-free boot's settings as knob values, and [`crate::knob!`],
+/// through which every build-time knob is read (declared here, below the
+/// code, so that no line of it moves).
+pub mod profile;
 
 #[cfg(test)]
 mod tests {

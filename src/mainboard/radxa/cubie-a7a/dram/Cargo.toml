@@ -13,6 +13,12 @@ dwc-ddrctl = { path = "../../../../lib/dwc-ddrctl" }
 memtest = { path = "../../../../lib/memtest" }
 
 [features]
+# The blob-free boot's settings (profile.rs) as the value of every A7A_*
+# knob the build's environment leaves unset, and its VDD2L; build variable
+# A7A_PROFILE picks the DRAM clock (bt0's default feature `blobfree`). Off:
+# every knob from the build's environment alone, as the lab images are
+# built, and the crate compiles as it did before the profiles existed.
+boot-profile = []
 # VDD2L (ELDO1) at the vendor library's 1080 mV instead of 900 mV (power.rs).
 vendor-vdd2l = []
 # Runtime overrides of the lab knobs (knobs::get, knobs::env, knobs::set;

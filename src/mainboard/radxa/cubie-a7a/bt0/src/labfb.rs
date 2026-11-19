@@ -523,7 +523,7 @@ impl Device for Lab {
                 };
                 dram_run(text.trim_end_matches(['\n', '\r', ' '])).map(|_| None)
             }
-            #[cfg(not(feature = "blobless"))]
+            #[cfg(not(dram_blobfree))]
             "phyfw" => {
                 let img = image.ok_or("stage the build's phy-fw-lab.bin first")?;
                 crate::dram::open::lab_fw::load(img)?;
@@ -590,7 +590,7 @@ fn dram_run(text: &str) -> Result<(), &'static str> {
     if state() != State::Idle {
         return Err("one DRAM run per session: fastboot reboot first");
     }
-    #[cfg(not(feature = "blobless"))]
+    #[cfg(not(dram_blobfree))]
     if !crate::dram::open::lab_fw::loaded() {
         return Err("PHY firmware not loaded (stage phy-fw-lab.bin; oem phyfw)");
     }

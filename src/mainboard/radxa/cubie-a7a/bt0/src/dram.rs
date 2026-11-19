@@ -2,10 +2,10 @@
 //! LPDDR5 bring-up: parameter set selection, the init with fallbacks, and
 //! the quick checks around it.
 //!
-//! The init itself runs through the open driver (crate `cubie-a7a-dram`,
-//! the default: no vendor code, the PHY's firmware loaded as data), with
-//! the `dramlib` feature through Allwinner's closed library, or with the `blobless` feature without any PHY firmware
-//! (development stage, see `dram/blobless.rs`).
+//! The init itself runs through this board's driver (crate `cubie-a7a-dram`): by default without any PHY firmware
+//! (feature `blobfree`, `dram/blobless.rs`; the lab's `blobless`/`bl-mission` are the same code without built-in
+//! settings), without the default features with the PHY's firmware loaded as data (`dram/open.rs`), or with the
+//! `dramlib` feature through Allwinner's closed library. More at the end of this file.
 
 use util::mmio::read32;
 
@@ -17,20 +17,20 @@ use crate::soc;
 #[cfg(all(feature = "dramlib", feature = "blobless"))]
 compile_error!("features dramlib and blobless select different DRAM backends");
 
-#[cfg(any(feature = "blobless", feature = "hybrid"))]
+#[cfg(any(dram_blobfree, feature = "hybrid"))]
 mod blobless;
 #[cfg(any(not(feature = "dramlib"), feature = "av3g", feature = "av3h"))]
 mod bt0hw;
-#[cfg(not(any(feature = "dramlib", feature = "blobless")))]
+#[cfg(not(any(feature = "dramlib", dram_blobfree)))]
 pub mod open;
 #[cfg(feature = "dramlib")]
 mod vendor;
-#[cfg(any(feature = "bl-mission", feature = "hybrid"))]
+#[cfg(any(dram_mission, feature = "hybrid"))]
 mod wrstage;
 
-#[cfg(feature = "blobless")]
+#[cfg(dram_blobfree)]
 use blobless as backend;
-#[cfg(not(any(feature = "dramlib", feature = "blobless")))]
+#[cfg(not(any(feature = "dramlib", dram_blobfree)))]
 use open as backend;
 #[cfg(feature = "dramlib")]
 use vendor as backend;
@@ -39,11 +39,11 @@ use vendor as backend;
 pub use vendor::report_previous_trace;
 
 /// No DRAM test in bt0 after the init (FEL lab builds of the open backend).
-#[cfg(not(any(feature = "dramlib", feature = "blobless")))]
+#[cfg(not(any(feature = "dramlib", dram_blobfree)))]
 pub fn skip_tests() -> bool {
     open::skip_tests()
 }
-#[cfg(any(feature = "dramlib", feature = "blobless"))]
+#[cfg(any(feature = "dramlib", dram_blobfree))]
 pub fn skip_tests() -> bool {
     false
 }
@@ -205,3 +205,33 @@ pub fn dump_clocks(when: &str) {
     }
     println!();
 }
+
+// The DRAM backends (below the code, so that no line of it moves).
+//
+// - The default feature `blobfree` is the blob-free boot: `blobless.rs`
+//   with the settings of `cubie_a7a_dram::knobs::profile` built in, so it
+//   trains, checks its writes and returns the size, and bt0 boots.
+// - The lab features `blobless` (the stages up to the read training) and
+//   `bl-mission` (the hand-over and the write stage as well) are the same
+//   code with every setting an A7A_* knob of the build's environment.
+// - Without the default features and without those: `open.rs`, the driver
+//   with the PHY's own firmware loaded as data; feature `hybrid` runs our
+//   stages on its trained state.
+// - Feature `dramlib`: `vendor.rs`, Allwinner's closed library.
+//
+// build.rs turns the features into the cfgs used above: `dram_blobfree`
+// (`blobfree` or `blobless`: blobless.rs is the backend) and `dram_mission`
+// (`blobfree` or `bl-mission`: with the stages past the read training).
+#[cfg(all(
+    feature = "blobfree",
+    any(
+        feature = "dramlib",
+        feature = "blobless",
+        feature = "hybrid",
+        feature = "dram-lab",
+        feature = "dram-trace"
+    )
+))]
+compile_error!(
+    "another DRAM backend or a lab feature together with the default feature `blobfree` (the blob-free boot): build it with --no-default-features"
+);

@@ -7,11 +7,11 @@ use crate::para::Para;
 /// VDD2L in mV: the schematic's 900, or with feature `vendor-vdd2l` the
 /// 1080 mV the vendor library programs on ELDO1 on this board (its serial
 /// log: "set eldo1 to 1080 mV"), so that runs compared against the vendor
-/// path see the same rails.
-pub const VDD2L_MV: u32 = if cfg!(feature = "vendor-vdd2l") {
-    1080
-} else {
-    900
+/// path see the same rails; a boot profile names its own (`knobs::profile`).
+pub const VDD2L_MV: u32 = match crate::knobs::profile::ACTIVE {
+    Some(p) => p.vdd2l_mv,
+    None if cfg!(feature = "vendor-vdd2l") => 1080,
+    None => 900,
 };
 
 /// Switch on VDD2H (1080 mV, or 1200 mV with tpr0[16]), VDD2L at

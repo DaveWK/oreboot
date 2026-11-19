@@ -155,7 +155,7 @@ pub enum WlFailure {
 /// update pulses are written 1 then 0 back to back.
 #[allow(non_snake_case)]
 pub fn EXEC_HOLD_US() -> u32 {
-    match crate::knobs::env("A7A_EXEC_HOLD_US", option_env!("A7A_EXEC_HOLD_US")) {
+    match crate::knobs::env("A7A_EXEC_HOLD_US", crate::knob!("A7A_EXEC_HOLD_US")) {
         Some(s) => {
             let b = s.as_bytes();
             let mut v = 0u32;

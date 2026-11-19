@@ -33,7 +33,7 @@ use crate::phy::{csr, csr_access};
 /// observation CSRs before the DFI init and after the hand-over. Unset: 0.
 #[allow(non_snake_case)]
 pub fn OBS_ARM() -> u16 {
-    obs_knob(crate::knobs::env("A7A_OBS_ARM", option_env!("A7A_OBS_ARM")))
+    obs_knob(crate::knobs::env("A7A_OBS_ARM", crate::knob!("A7A_OBS_ARM")))
 }
 /// Arm the RX FIFO pointer check.
 pub const ARM_CHECK: u16 = 1;
@@ -47,7 +47,7 @@ pub const ARM_SNAP: u16 = 2;
 /// dfi_t_rddata_en). Unset: unchanged.
 #[allow(non_snake_case)]
 pub fn HO_RDCSLAT() -> Option<u32> {
-    match crate::knobs::env("A7A_HO_RDCSLAT", option_env!("A7A_HO_RDCSLAT")) {
+    match crate::knobs::env("A7A_HO_RDCSLAT", crate::knob!("A7A_HO_RDCSLAT")) {
         Some(s) => match u32::from_str_radix(s, 16) {
             Ok(v) if v <= 0x7f => Some(v),
             _ => panic!("A7A_HO_RDCSLAT is a hex value up to 0x7f"),
@@ -184,10 +184,10 @@ mod tests {
 
     #[test]
     fn defaults_off() {
-        if crate::knobs::env("A7A_OBS_ARM", option_env!("A7A_OBS_ARM")).is_none() {
+        if crate::knobs::env("A7A_OBS_ARM", crate::knob!("A7A_OBS_ARM")).is_none() {
             assert_eq!(OBS_ARM(), 0);
         }
-        if crate::knobs::env("A7A_HO_RDCSLAT", option_env!("A7A_HO_RDCSLAT")).is_none() {
+        if crate::knobs::env("A7A_HO_RDCSLAT", crate::knob!("A7A_HO_RDCSLAT")).is_none() {
             assert_eq!(HO_RDCSLAT(), None);
         }
     }
