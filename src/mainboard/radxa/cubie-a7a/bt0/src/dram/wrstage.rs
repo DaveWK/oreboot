@@ -194,9 +194,16 @@ pub fn run() -> bool {
         return true;
     }
     let (mstr, am1) = probe::read_live(&mut Bt0Hw);
-    let Some(plan) = Plan::from_live(crate::mem::DRAM_BASE as u32, mstr, am1) else {
-        println!("[dram] WR: unsupported geometry MSTR0 {mstr:08x?} ADDRMAP1 {am1:08x?}; stopping");
-        return false;
+    // Reads only: nothing is stored to DRAM before the plan is accepted.
+    let plan = match Plan::from_live(crate::mem::DRAM_BASE as u32, mstr, am1) {
+        Ok(plan) => plan,
+        Err(refusal) => {
+            println!(
+                "[dram] WR: {}: MSTR0 {mstr:08x?} ADDRMAP1 {am1:08x?}; stopping",
+                refusal.reason()
+            );
+            return false;
+        }
     };
     let mut p = Port(Bt0Hw, Ledger::new(), &plan);
     let mut mp = Port(Bt0Hw, Ledger::new(), &plan);

@@ -1929,7 +1929,7 @@ mod tests {
         ));
     }
 
-    fn plan(active: u32, am1: u32) -> Option<probe::Plan> {
+    fn plan(active: u32, am1: u32) -> Result<probe::Plan, probe::Refusal> {
         probe::Plan::from_live(0x4000_0000, [active << 24; 2], [am1; 2])
     }
     fn probe_discover(s: &mut Sim, start: &BlindStart, before: &Snapshot) -> BlindRun<()> {
@@ -1952,10 +1952,11 @@ mod tests {
     }
     #[test]
     fn probe119_single_rank_from_geometry_only() {
-        let p = plan(1, 0x3f3f).unwrap();
-        assert_eq!(p.required, 0x0f);
+        // One enabled rank and no CS field is not proof of a single-rank
+        // board: no plan, so TG1 is never exempt.
+        assert_eq!(plan(1, 0x3f3f).err(), Some(probe::Refusal::SingleRank));
         // Same absent CS field, but both ranks enabled: no usable plan.
-        assert!(plan(3, 0x3f3f).is_none());
+        assert_eq!(plan(3, 0x3f3f).err(), Some(probe::Refusal::Geometry));
     }
     #[test]
     fn probe119_no_tg1_refuses_clean_blind_start() {
