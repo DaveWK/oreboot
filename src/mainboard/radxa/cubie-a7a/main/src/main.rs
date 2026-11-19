@@ -327,32 +327,42 @@ extern "C" fn primary_main(mpidr: u64, core: usize) -> ! {
     }
     #[cfg(feature = "memtest")]
     memtest::run(&h).unwrap_or_else(|e| panic!("memtest failed: {e}"));
-    if h.dtb_addr != 0 {
-        println!("[main] note: DTB from boot media is not used yet, generating one");
-    }
-    if cfg!(feature = "gmac") {
-        gmac::init();
-    }
-    // Before usb::init(): sets the shared serdes config clock to 100 MHz.
-    if cfg!(feature = "pcie") {
-        pcie::init();
-    }
-    if cfg!(feature = "usb") {
-        usb::init();
-    }
-    let dtb_size = build_dtb(&h);
-    println!(
-        "[main] DTB @ {:#x} ({dtb_size} bytes), payload memory from {:#x}",
-        mem::DTB_ADDR,
-        mem::PAYLOAD_RAM_BASE
-    );
-    println!(
-        "[main] PSCI 1.0 ready; entering payload @ {:#x} in EL2",
-        h.payload_addr
-    );
+    if cfg!(feature = "memtest-cached") {
+        #[cfg(feature = "memtest-cached")]
+        {
+            memtest_cached::run(&h).unwrap_or_else(|e| panic!("memtest-cached failed: {e}"));
+            println!("[main] memtest-cached: payload withheld; halting for watchdog reset");
+            Uart::attach(soc::UART0_BASE).drain();
+        }
+        halt()
+    } else {
+        if h.dtb_addr != 0 {
+            println!("[main] note: DTB from boot media is not used yet, generating one");
+        }
+        if cfg!(feature = "gmac") {
+            gmac::init();
+        }
+        // Before usb::init(): sets the shared serdes config clock to 100 MHz.
+        if cfg!(feature = "pcie") {
+            pcie::init();
+        }
+        if cfg!(feature = "usb") {
+            usb::init();
+        }
+        let dtb_size = build_dtb(&h);
+        println!(
+            "[main] DTB @ {:#x} ({dtb_size} bytes), payload memory from {:#x}",
+            mem::DTB_ADDR,
+            mem::PAYLOAD_RAM_BASE
+        );
+        println!(
+            "[main] PSCI 1.0 ready; entering payload @ {:#x} in EL2",
+            h.payload_addr
+        );
 
-    unsafe { write_volatile(addr_of_mut!(BOOT_STATE), BOOT_WARM) };
-    enter_nonsecure(h.payload_addr, mem::DTB_ADDR as u64)
+        unsafe { write_volatile(addr_of_mut!(BOOT_STATE), BOOT_WARM) };
+        enter_nonsecure(h.payload_addr, mem::DTB_ADDR as u64)
+    }
 }
 
 extern "C" fn secondary_main(mpidr: u64, core: usize) -> ! {
@@ -428,3 +438,8 @@ fn panic(info: &PanicInfo) -> ! {
     println!("[main]   {}", info.message());
     halt()
 }
+
+#[cfg(feature = "memtest-cached")]
+mod memtest_cached;
+#[cfg(feature = "memtest-cached")]
+mod memtest_cached_core;

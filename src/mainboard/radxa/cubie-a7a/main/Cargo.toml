@@ -26,6 +26,9 @@ gmac = []
 pcie = []
 usb = []
 memtest = []
+# Opt-in cached full-burst DRAM stress, bit-37 beat-shape and cross-rank copy
+# test before any DMA peripheral starts; withholds payload and halts afterwards.
+memtest-cached = []
 # SMCCC TRNG (DEN0098) on the CE TRNG. Off until the A733 sequence has been
 # checked on the board (see src/trng.rs); without it every TRNG call answers
 # NOT_SUPPORTED. trng-byte-addr: no effect since the CE v5 hash/RBG task

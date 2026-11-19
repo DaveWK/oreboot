@@ -144,7 +144,7 @@ pub fn watchdog_reset() -> ! {
 }
 
 /// Reload the watchdog already armed by bt0; retain its interval/recovery marker.
-#[cfg(feature = "memtest")]
+#[cfg(any(feature = "memtest", feature = "memtest-cached"))]
 pub fn watchdog_kick() {
     write32(WDT0_BASE + 0x0c, (0x0a57 << 1) | 1);
 }

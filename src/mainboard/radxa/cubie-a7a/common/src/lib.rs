@@ -476,3 +476,7 @@ mod tests {
         assert_eq!(super::crc32(b"123456789"), 0xcbf4_3926);
     }
 }
+
+#[cfg(test)]
+#[path = "../../main/src/memtest_cached_core.rs"]
+mod main_memtest_cached_core;
