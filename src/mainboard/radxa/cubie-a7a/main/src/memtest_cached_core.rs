@@ -7,6 +7,7 @@
 //! - `1 0 x 0` beat-shape pattern pass targeting bits 5, 21, 37 and 53;
 //! - 16 MiB cross-rank and above-4-GiB copy pass with chained SHA-256 compare.
 
+use ::memtest::arch::aarch64::{ATTR1, BLOCK};
 use ::memtest::stress::{splitmix64, Record};
 use ::memtest::{Memory, Plan, Region};
 
@@ -69,6 +70,36 @@ pub const COPY_SEED_BASE: u64 = 0xc097_a733_2400_0000;
 const HASH_CHUNK_BYTES: usize = 1024;
 /// Maximum candidate 16 MiB blocks scanned per pool when planning copies.
 const MAX_POOL_BLOCKS: usize = 256;
+
+/// Descriptor field masks matching `memtest::arch::aarch64::l1_table`.
+const L1_DESC_TYPE_MASK: u64 = 0b11;
+const L1_ATTR_INDX_MASK: u64 = 0b111 << 2;
+
+/// Compute the contiguous `[start, end)` virtual/physical address range of all
+/// 1 GiB blocks mapped Normal write-back (`ATTR1`) in a level-1 flat-map table.
+/// Used by cache teardown to `DC CIVAC` every cacheable-mapped block to PoC.
+pub fn wb_mapped_range(table: &[u64; 512]) -> Result<(u64, u64), &'static str> {
+    let mut range: Option<(usize, usize)> = None;
+    let mut closed = false;
+    for (gib, &desc) in table.iter().enumerate() {
+        let is_wb = (desc & L1_DESC_TYPE_MASK) == BLOCK && (desc & L1_ATTR_INDX_MASK) == ATTR1;
+        if is_wb {
+            if closed {
+                return Err("discontiguous cacheable L1 blocks");
+            }
+            range = match range {
+                None => Some((gib, gib + 1)),
+                Some((s, _)) => Some((s, gib + 1)),
+            };
+        } else if range.is_some() {
+            closed = true;
+        }
+    }
+    match range {
+        Some((s, e)) => Ok(((s as u64) << 30, (e as u64) << 30)),
+        None => Err("no cacheable L1 blocks mapped"),
+    }
+}
 
 /// Decode the DRAM-offset rank bit from an ADDRMAP1 register value, matching
 /// `cubie_a7a_dram::ctrl::RankMap::bit_from_addrmap1`.
@@ -1384,5 +1415,29 @@ mod tests {
         assert_eq!(effective_rank_bit(Some(32), 4 * GIB), None);
         assert_eq!(effective_rank_bit(Some(63), 4 * GIB), None);
         assert_eq!(effective_rank_bit(None, 4 * GIB), None);
+    }
+
+    #[test]
+    fn teardown_wb_range_covers_every_cacheable_block_at_4g_and_6g() {
+        // 4 GB map: 0x4000_0000..0x1_4000_0000 (blocks 1..=4).
+        let mut t4 = [0u64; 512];
+        l1_table(&mut t4, 0x1_4000_0000, Some(1)).unwrap();
+        let (s4, e4) = wb_mapped_range(&t4).unwrap();
+        assert_eq!((s4, e4), (0x4000_0000, 0x1_4000_0000));
+        // Every WB block is inside [s4, e4), and block 0 (Device MMIO) is not.
+        assert!(0x3fff_ffc0 < s4);
+        assert!(0x4000_0000 >= s4 && 0x1_3fff_ffc0 < e4);
+
+        // 6 GB map: 0x4000_0000..0x1_c000_0000 (blocks 1..=6).
+        let mut t6 = [0u64; 512];
+        l1_table(&mut t6, 0x1_c000_0000, Some(1)).unwrap();
+        assert_eq!(wb_mapped_range(&t6).unwrap(), (0x4000_0000, 0x1_c000_0000));
+
+        // Empty table and discontiguous WB blocks are rejected.
+        let empty = [0u64; 512];
+        assert!(wb_mapped_range(&empty).is_err());
+        let mut gap = t4;
+        gap[6] = (6u64 << 30) | BLOCK | AF | SH_INNER | ATTR1 | XN;
+        assert!(wb_mapped_range(&gap).is_err());
     }
 }

@@ -11,14 +11,15 @@
 use ::memtest::arch::aarch64::{l1_table, TCR};
 use ::memtest::{Memory, Runner, PROFILE_FAST};
 use core::arch::asm;
-use cubie_a7a_common::{mem, uart::Uart, Handoff};
+use cubie_a7a_common::{uart::Uart, Handoff};
 use util::mmio::read32;
 
 use crate::memtest_cached_core::{
     build_copy_plan, cached_plan_from_handoff, effective_rank_bit, rank_bit_from_addrmap1,
-    rank_of_addr, run_bit37_pass, run_copy_leg, Bit37Shape, CopyLegStats, ErrorDecode, PassReport,
-    ABOVE_4G, ADDRMAP1_CH0, BIT37_SEED_1000, BIT37_SEED_1010, COPY_BLOCK_BYTES, COPY_SEED_BASE,
-    DUAL_CH_SHIFT, MAIR_WB, SCTLR_C, SCTLR_I, SCTLR_M, STRESS_BLOCK_BYTES,
+    rank_of_addr, run_bit37_pass, run_copy_leg, wb_mapped_range, Bit37Shape, CopyLegStats,
+    ErrorDecode, PassReport, ABOVE_4G, ADDRMAP1_CH0, BIT37_SEED_1000, BIT37_SEED_1010,
+    COPY_BLOCK_BYTES, COPY_SEED_BASE, DUAL_CH_SHIFT, MAIR_WB, SCTLR_C, SCTLR_I, SCTLR_M,
+    STRESS_BLOCK_BYTES,
 };
 
 /// Level-1 table of the cached EL3 flat map (4 KiB aligned).
@@ -37,13 +38,15 @@ fn dcache_line_size() -> u64 {
 }
 
 /// Active cached EL3 flat map; restores SCTLR/TTBR0/TCR/MAIR on drop after
-/// cleaning and invalidating EL3's own memory range back to DRAM (PoC).
+/// cleaning and invalidating every Normal WB cacheable-mapped block to PoC.
 struct CachedEl3FlatMap {
     sctlr: u64,
     mair: u64,
     tcr: u64,
     ttbr: u64,
     line_size: u64,
+    wb_start: u64,
+    wb_end: u64,
 }
 
 impl CachedEl3FlatMap {
@@ -54,6 +57,7 @@ impl CachedEl3FlatMap {
     /// EL3 on the boot core with no secondary cores running; `table` must
     /// outlive the returned guard and map `EXEC_BLOCK` executable.
     unsafe fn enter(table: &[u64; 512], line_size: u64) -> Result<Self, &'static str> {
+        let (wb_start, wb_end) = wb_mapped_range(table)?;
         let (sctlr, mair, tcr, ttbr): (u64, u64, u64, u64);
         asm!(
             "mrs {s}, sctlr_el3",
@@ -95,20 +99,34 @@ impl CachedEl3FlatMap {
             tcr,
             ttbr,
             line_size,
+            wb_start,
+            wb_end,
         })
     }
-}
 
-impl Drop for CachedEl3FlatMap {
-    fn drop(&mut self) {
-        let el3_start = mem::EL3_BASE as u64;
-        let el3_end = (mem::EL3_BASE + mem::EL3_SIZE) as u64;
-        // Clear C while keeping M set so no new D-cache allocations happen
-        // while DC CIVAC flushes EL3's stack, .data, .bss and L1 table to PoC;
-        // all values stay in registers inside one asm! block (no stack writes).
+    /// Tear down the cached EL3 flat map in one register-only `asm!` block:
+    /// 1. Clear `SCTLR_EL3.C` (keeping `M=1` so the flat VA=PA map stays active
+    ///    and `I=1` so the 4-instruction loop finishes well within WDT0) to
+    ///    prevent any further data-cache allocation.
+    /// 2. `DC CIVAC` every cache line across `[wb_start, wb_end)` — all Normal
+    ///    WB DRAM blocks mapped by `L1_CACHED` — reaching PoC across L1/L2/L3.
+    /// 3. `dsb sy`, restore original `SCTLR_EL3` (`M=0, C=0`), `isb`,
+    ///    `tlbi alle3`, `ic iallu`, `dsb sy`, `isb`, restore `TTBR0/TCR/MAIR`,
+    ///    `isb`.
+    #[inline(never)]
+    fn teardown(&self) {
         let sctlr_no_c = (self.sctlr | SCTLR_M | SCTLR_I) & !SCTLR_C;
-        // SAFETY: restores the EL3 translation/control registers saved in enter
-        // after draining all dirty EL3 lines to DRAM.
+        let wb_start = self.wb_start;
+        let wb_end = self.wb_end;
+        let step = self.line_size;
+        let s = self.sctlr;
+        let b = self.ttbr;
+        let t = self.tcr;
+        let m = self.mair;
+        // SAFETY: all values are loaded into registers before the first
+        // `msr sctlr_el3`; `options(nostack)` and no memory operands ensure
+        // zero stack or other loads/stores occur across the transition. Only
+        // the boot core is running (`main.rs` prepared all other cores off).
         unsafe {
             asm!(
                 "dsb sy",
@@ -131,15 +149,25 @@ impl Drop for CachedEl3FlatMap {
                 "msr mair_el3, {m}",
                 "isb",
                 no_c = in(reg) sctlr_no_c,
-                p = inout(reg) el3_start => _,
-                end = in(reg) el3_end,
-                step = in(reg) self.line_size,
-                s = in(reg) self.sctlr,
-                b = in(reg) self.ttbr,
-                t = in(reg) self.tcr,
-                m = in(reg) self.mair,
+                p = inout(reg) wb_start => _,
+                end = in(reg) wb_end,
+                step = in(reg) step,
+                s = in(reg) s,
+                b = in(reg) b,
+                t = in(reg) t,
+                m = in(reg) m,
+                options(nostack),
             );
         }
+    }
+}
+
+impl Drop for CachedEl3FlatMap {
+    fn drop(&mut self) {
+        // Reload WDT0 (Device-nGnRnE block 0) before the full-DRAM DC CIVAC
+        // sweep so the entire teardown has a fresh 16 s watchdog window.
+        crate::soc::watchdog_kick();
+        self.teardown();
     }
 }
 
