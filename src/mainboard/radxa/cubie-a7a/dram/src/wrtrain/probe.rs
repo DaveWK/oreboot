@@ -1,14 +1,23 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! A733 two-channel write-stage probes. Channel n drives DBYTE 2n and 2n+1
 //! (the board's `rdtrain`/`wrtrain` DBYTE layout). Timing group = rank.
-use super::{BLOCKS, DBYTES};
-use crate::ctrl::RankMap;
+use super::{pattern, Folds, BLOCKS, DBYTES};
+use crate::ctrl::{addrmap, ddrc, RankMap, MSTR0};
+use crate::hw::RegIo;
 
 /// Original bt0 write-stage footprint: one 128 B block on either side of
 /// each possible interleave bit (128 B through 8 KiB), 1 MiB into a stripe.
 pub const BLOCK_BYTES: usize = 128;
 const OFF: [u32; BLOCKS / 2] = [0, 0x80, 0x100, 0x200, 0x400, 0x800, 0x1000, 0x2000];
 const INSET: u32 = 1 << 20;
+
+/// MSTR0 and ADDRMAP1 of both controllers, as they are programmed.
+pub fn read_live<H: RegIo>(hw: &mut H) -> ([u32; 2], [u32; 2]) {
+    (
+        [0, 1].map(|ch| hw.read32(ddrc(ch, MSTR0))),
+        [0, 1].map(|ch| hw.read32(addrmap(ch, 1))),
+    )
+}
 
 pub struct Plan {
     pub blocks: [usize; BLOCKS],
@@ -48,5 +57,25 @@ impl Plan {
             ((if i < OFF.len() { lo } else { hi }) + OFF[i % OFF.len()]) as usize
         });
         Some(Self { blocks, required })
+    }
+
+    /// Store the seed's pattern to every block, then read every block
+    /// back: per block the OR of `got ^ want`, and the mask of the blocks
+    /// compared.
+    pub fn compare<H: RegIo>(&self, hw: &mut H, seed: u32) -> (Folds, u32) {
+        for &b in self.blocks.iter() {
+            for a in (b..b + BLOCK_BYTES).step_by(4) {
+                hw.write32(a, pattern(a, seed));
+            }
+        }
+        let mut f = [0u32; BLOCKS];
+        let mut compared = 0;
+        for (k, &b) in self.blocks.iter().enumerate() {
+            for a in (b..b + BLOCK_BYTES).step_by(4) {
+                f[k] |= hw.read32(a) ^ pattern(a, seed);
+            }
+            compared |= 1 << k;
+        }
+        (f, compared)
     }
 }

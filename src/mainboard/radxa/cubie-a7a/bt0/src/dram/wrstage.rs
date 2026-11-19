@@ -31,8 +31,8 @@
 
 use cubie_a7a_dram::phy::{csr, csr_access};
 use cubie_a7a_dram::wrtrain::{
-    self, pattern, BlindRun, BlindStart, Delays, Folds, LaneFit, Ledger, MrPort, Snapshot,
-    WritePort, BLOCKS, DBYTES, LANES,
+    self, BlindRun, BlindStart, Delays, Folds, LaneFit, Ledger, MrPort, Snapshot, WritePort,
+    DBYTES, LANES,
 };
 use cubie_a7a_dram::{Error, RegIo};
 
@@ -49,7 +49,7 @@ fn BITS() -> u32 {
     }
 }
 
-use wrtrain::probe::{Plan, BLOCK_BYTES};
+use wrtrain::probe::{self, Plan, BLOCK_BYTES};
 /// Vref codes of the sweep (10 % + 0.5 % of VDDQ per code: 26 %..41 %;
 /// at VDDQ 560 mV 146..230 mV, inside the 75..350 mV DQ Vref range at a
 /// WCK up to 1600 MHz) and the code that identifies each MR's byte (15 %,
@@ -144,25 +144,11 @@ impl Port<'_> {
             self.1
                 .apply(&mut || cubie_a7a_dram::blobless::apply_delays(hw, DBYTES / 2))?;
         }
-        for &b in self.2.blocks.iter() {
-            for a in (b..b + BLOCK_BYTES).step_by(4) {
-                // SAFETY: DRAM in mission mode; bt0 runs from SRAM and
-                // nothing else uses these blocks.
-                unsafe { core::ptr::write_volatile(a as *mut u32, pattern(a, seed)) };
-            }
-        }
-        let mut f = [0u32; BLOCKS];
-        let mut compared = 0;
-        for (k, &b) in self.2.blocks.iter().enumerate() {
-            for a in (b..b + BLOCK_BYTES).step_by(4) {
-                // SAFETY: as above.
-                let got = unsafe { core::ptr::read_volatile(a as *const u32) };
-                f[k] |= got ^ pattern(a, seed);
-            }
-            compared |= 1 << k;
-        }
+        // DRAM in mission mode; bt0 runs from SRAM and nothing else uses
+        // the plan's blocks.
+        let r = self.2.compare(&mut self.0, seed);
         crate::recovery::kick();
-        Ok((f, compared))
+        Ok(r)
     }
 }
 
@@ -207,9 +193,7 @@ pub fn run() -> bool {
     if BITS() == 0 {
         return true;
     }
-    use cubie_a7a_dram::ctrl::{addrmap, ddrc, MSTR0};
-    let mstr = [0, 1].map(|ch| Bt0Hw.read32(ddrc(ch, MSTR0)));
-    let am1 = [0, 1].map(|ch| Bt0Hw.read32(addrmap(ch, 1)));
+    let (mstr, am1) = probe::read_live(&mut Bt0Hw);
     let Some(plan) = Plan::from_live(crate::mem::DRAM_BASE as u32, mstr, am1) else {
         println!("[dram] WR: unsupported geometry MSTR0 {mstr:08x?} ADDRMAP1 {am1:08x?}; stopping");
         return false;
