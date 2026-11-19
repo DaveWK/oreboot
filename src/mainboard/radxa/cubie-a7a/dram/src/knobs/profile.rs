@@ -60,6 +60,8 @@ pub struct Profile {
 ///
 /// The write Vref stays at the parameter set's 0x2e (measured on the 4 GB
 /// board: clean from 0x10 to 0x4a at this clock).
+///
+/// On the 4 GB board, loaded over USB FEL: Linux boots.
 pub const BOOT_1200: Profile = Profile {
     mhz: 1200,
     vdd2l_mv: 1080,
@@ -88,6 +90,11 @@ pub const BOOT_1200: Profile = Profile {
 /// - the write stage's clean start moved to the middle of its clean run
 ///   (at this clock the first clean delay sits within a few 1/64 UI of
 ///   the window's early edge).
+///
+/// On the 4 GB board, loaded over USB FEL: the bring-up, bt0's own DRAM
+/// test and the host's memory tests pass and the firmware runs, but the
+/// kernel then fails to decompress (rare data errors under load). Not a
+/// boot clock yet; selectable for that work.
 pub const BOOT_2400: Profile = Profile {
     mhz: 2400,
     vdd2l_mv: 1080,
@@ -110,8 +117,9 @@ pub const BOOT_2400: Profile = Profile {
 };
 
 /// The profile of a build that names none (`A7A_PROFILE` unset). This
-/// line is the default DRAM clock of the blob-free boot.
-pub const DEFAULT: &Profile = &BOOT_2400;
+/// line is the default DRAM clock of the blob-free boot: the clock Linux
+/// boots at.
+pub const DEFAULT: &Profile = &BOOT_1200;
 
 /// Whether this build has a boot profile at all (module docs).
 pub const AVAILABLE: bool = cfg!(feature = "boot-profile");

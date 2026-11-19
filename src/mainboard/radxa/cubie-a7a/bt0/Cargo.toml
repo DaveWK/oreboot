@@ -17,12 +17,12 @@ default = ["blobfree"]
 # load main and the payload; a stage that fails halts. With `fel`, `spinor`,
 # `fastboot`, `otp`, `wr-r1`; not with another backend or a lab feature.
 #
-# Build variable A7A_PROFILE picks the profile by its DRAM clock: 2400 (WCK
-# 2400 MHz, 4800 Mb/s per pin) or 1200 (2400 Mb/s); unset:
-# cubie_a7a_dram::knobs::profile::DEFAULT. An A7A_* knob in the build's
-# environment overrides the profile's value, `A7A_X=-` unsets one, and
-# A7A_PROFILE=none builds with no profile at all (the knobs alone: the
-# image `bl-mission` builds).
+# Build variable A7A_PROFILE picks the profile by its DRAM clock: 1200 (WCK
+# 1200 MHz, 2400 Mb/s per pin) or 2400 (4800 Mb/s per pin; it does not boot
+# Linux yet); unset: cubie_a7a_dram::knobs::profile::DEFAULT. An A7A_* knob
+# in the build's environment overrides the profile's value, `A7A_X=-`
+# unsets one, and A7A_PROFILE=none builds with no profile at all (the
+# knobs alone: the image `bl-mission` builds).
 blobfree = ["cubie-a7a-dram/boot-profile"]
 # DRAM init through Allwinner's closed library (A733_DRAM_LIB) instead of
 # this board's driver: the comparison path. The library is not part of this

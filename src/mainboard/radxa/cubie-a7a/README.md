@@ -26,12 +26,12 @@ No vendor binary is part of this tree, and the default build reads none.
   failures). The settings are built in, one profile per DRAM clock
   (`dram/src/knobs/profile.rs`):
 
-  | `A7A_PROFILE` | DRAM clock | state |
+  | `A7A_PROFILE` | DRAM clock | state on the 4 GB board, over USB FEL |
   |---|---|---|
-  | `2400` | WCK 2400 MHz, 4800 Mb/s | memory tests over USB FEL on the 4 GB board |
-  | `1200` | WCK 1200 MHz, 2400 Mb/s | booted Linux over USB FEL on the 4 GB board |
+  | `1200` | WCK 1200 MHz, 2400 Mb/s | boots Linux |
+  | `2400` | WCK 2400 MHz, 4800 Mb/s | does not boot Linux yet: the bring-up, bt0's DRAM test and memory tests from the host pass and the firmware runs, then the kernel fails to decompress (rare data errors under load) |
 
-  Unset, the profile is the line `pub const DEFAULT` in that file (2400).
+  Unset, the profile is the line `pub const DEFAULT` in that file (1200).
   The profiles were made on the CXMT 4 GB board; the same image selects the
   6 GB part's parameters by the strap, and has not run there yet. The
   parameter sets with another DRAM clock (8 and 12 GB) are refused: use
@@ -74,7 +74,7 @@ measurement builds; see `bt0/Cargo.toml`.
 cd src/mainboard/radxa/cubie-a7a/bt0
 cargo build --release                   # SD card and eMMC, blob-free DRAM
 cargo build --release --features fel    # the same, loaded over USB FEL
-A7A_PROFILE=1200 cargo build --release  # at the lower DRAM clock
+A7A_PROFILE=2400 cargo build --release  # at the higher DRAM clock (no Linux boot yet)
 # with the vendor DRAM library instead:
 A733_DRAM_LIB=/path/to/libdram-a733.a cargo build --release --no-default-features --features dramlib
 
