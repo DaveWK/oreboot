@@ -243,6 +243,78 @@ pub fn mr16_all<H: Hw>(hw: &mut H, mr16: u8) -> Option<crate::wl::WlFailure> {
     f
 }
 
+/// The results a mission hand-over needs, collected in one place so that a
+/// failure of any single step leaves the gate unset. Fail-closed: the gate is
+/// the conjunction of every field, and the write stage's own verdict is one
+/// of them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StageResults {
+    /// The read training applied on every block.
+    pub read_training: bool,
+    /// The MR16 window write before the read training reached every rank.
+    pub mr16_before: bool,
+    /// The MR16 window write after the read training reached every rank.
+    pub mr16_after: bool,
+    /// The lean hand-over succeeded.
+    pub handover: bool,
+    /// The write stage's final compare was clean.
+    pub write_stage: bool,
+}
+
+impl StageResults {
+    /// No mode-register step was requested: only the read training and the
+    /// hand-over are required.
+    pub const fn new() -> Self {
+        Self {
+            read_training: false,
+            mr16_before: true,
+            mr16_after: true,
+            handover: false,
+            write_stage: false,
+        }
+    }
+
+    /// Record the MR16 window write before the read training: `None` is a
+    /// failure, and a failure here blocks the hand-over.
+    pub const fn mr16_before_result(mut self, failure: Option<crate::wl::WlFailure>) -> Self {
+        self.mr16_before = failure.is_none();
+        self
+    }
+
+    /// Record the MR16 window write after the read training.
+    pub const fn mr16_after_result(mut self, failure: Option<crate::wl::WlFailure>) -> Self {
+        self.mr16_after = failure.is_none();
+        self
+    }
+
+    /// Record whether the read training applied on every block.
+    pub const fn read_training_result(mut self, applied: bool) -> Self {
+        self.read_training = applied;
+        self
+    }
+
+    /// Record whether the lean hand-over succeeded.
+    pub const fn handover_result(mut self, ok: bool) -> Self {
+        self.handover = ok;
+        self
+    }
+
+    /// Record the write stage's verdict.
+    pub const fn write_stage_result(mut self, clean: bool) -> Self {
+        self.write_stage = clean;
+        self
+    }
+
+    /// Every required step completed; only then may the mission gate be set.
+    pub const fn mission_ok(&self) -> bool {
+        self.read_training
+            && self.mr16_before
+            && self.mr16_after
+            && self.handover
+            && self.write_stage
+    }
+}
+
 const fn hex_nib(c: u8) -> Option<u8> {
     match c {
         b'0'..=b'9' => Some(c - b'0'),
@@ -1832,5 +1904,61 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A register model that answers every read with zero: the first launch
+    /// of [`super::mr16_all`] then sees MicroResetL/MemResetL not in the
+    /// required state and reports a failure.
+    struct ZeroHw;
+
+    impl crate::hw::RegIo for ZeroHw {
+        fn read32(&mut self, _: usize) -> u32 {
+            0
+        }
+        fn write32(&mut self, _: usize, _: u32) {}
+        fn read16(&mut self, _: usize) -> u16 {
+            0
+        }
+        fn write16(&mut self, _: usize, _: u16) {}
+        fn udelay(&mut self, _: u32) {}
+        fn now_us(&mut self) -> u64 {
+            0
+        }
+        fn log(&mut self, _: core::fmt::Arguments) {}
+    }
+
+    impl crate::hw::Hw for ZeroHw {
+        fn set_voltage(&mut self, _: crate::hw::Rail, _: u32) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn mr16_failure_blocks_the_mission_gate() {
+        use super::StageResults;
+        let failure = super::mr16_all(&mut ZeroHw, 0x04);
+        assert!(
+            failure.is_some(),
+            "the fault injection must make the MR16 launch fail"
+        );
+        let stages = StageResults::new()
+            .read_training_result(true)
+            .mr16_before_result(failure)
+            .mr16_after_result(None)
+            .handover_result(true)
+            .write_stage_result(true);
+        assert!(!stages.mission_ok());
+        // Every field is load-bearing.
+        let clean = StageResults::new()
+            .read_training_result(true)
+            .mr16_before_result(None)
+            .mr16_after_result(None)
+            .handover_result(true)
+            .write_stage_result(true);
+        assert!(clean.mission_ok());
+        assert!(!clean.write_stage_result(false).mission_ok());
+        assert!(!clean.handover_result(false).mission_ok());
+        assert!(!clean.read_training_result(false).mission_ok());
+        assert!(!clean.mr16_after_result(Some(failure.unwrap())).mission_ok());
     }
 }
