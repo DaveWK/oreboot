@@ -290,14 +290,18 @@ impl TrainConfig {
 }
 
 /// The read latency when the formula fails its vendor cross-check and no
-/// override is given. The vendor firmware trains 4 at 1200 MHz CK
-/// (HwtMRL 4, DFIMRL 4), and 4 reads isolated bursts correctly;
-/// measured: with our trained gate, back-to-back reads (CPU line fills,
-/// 64 B = two gapless BL16) need 5. At 4 every line fill read wrong data
-/// and main never started; 5 passed every fetch probe (16, 1024 and 16384
-/// instructions at four addresses on both channels, before and after the
-/// CPU/DSU boost); 6 and 8 failed. The PIE-trained state also has 5.
-pub const MRL_FALLBACK: u16 = 5;
+/// override is given: the vendor firmware's trained value at 1200 MHz CK
+/// (HwtMRL 4, DFIMRL 4). Measured: training at 5 instead
+/// moves the trained gate with it and the mission line fills fail as at 4;
+/// what line fills need is the trained 4 plus one at the hand-over
+/// (`blobless::HO_MRL_ADD`).
+pub const MRL_FALLBACK: u16 = 4;
+
+/// The read latency the last read-training block applied (0: none yet).
+/// Later ACSM launches re-select channels and rewrite DFIMRL with the
+/// select's 8 (`phy::coldinit::select`, e.g. the post-training MR16 of
+/// `A7A_RD_FSPWR`), so the hand-over takes the trained value from here.
+pub static APPLIED_MRL: core::sync::atomic::AtomicU16 = core::sync::atomic::AtomicU16::new(0);
 /// The vendor's trained RxEnDly the formula is cross-checked against
 /// (1200 MHz CK) and the value it must give there.
 pub const MRL_CHECK_RX_EN: u16 = 0x369;
@@ -1340,6 +1344,7 @@ fn mrl_sweep<H: Hw>(
     let (m, src) = choose_mrl(rx_en_max, cfg);
     out.mrl = m;
     out.mrl_source = src;
+    APPLIED_MRL.store(m, core::sync::atomic::Ordering::Relaxed);
     if out.mrl_pass >> m & 1 == 0 {
         out.stop = Some(TrainStop::NoMrl);
     }

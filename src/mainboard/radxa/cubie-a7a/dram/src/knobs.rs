@@ -75,7 +75,7 @@ pub struct EiSpec {
 /// `-NAME` for unset), else the build's `option_env!` value. Each knob's
 /// parser runs where it is used, as at build time (a malformed value
 /// panics there; the lab mode turns a panic into a halted run).
-pub const EXTRA: [&str; 32] = [
+pub const EXTRA: [&str; 33] = [
     "A7A_BL_BOOT",
     "A7A_CBT_CA_ADD",
     "A7A_EXEC_HOLD_US",
@@ -88,6 +88,7 @@ pub const EXTRA: [&str; 32] = [
     "A7A_HO_FIFOINIT",
     "A7A_HO_FIU",
     "A7A_HO_MR2",
+    "A7A_HO_MRL_ADD",
     "A7A_HO_MRS",
     "A7A_HO_PULSE_RESTORE",
     "A7A_HO_RDCSLAT",

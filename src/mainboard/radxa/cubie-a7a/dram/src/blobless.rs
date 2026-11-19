@@ -1235,7 +1235,23 @@ pub fn mission_handover_relock<H: Hw>(
             }
         }
     }
-    if crate::knobs::env("A7A_HO_FIU", option_env!("A7A_HO_FIU")).is_some() {
+    let mrl_add = HO_MRL_ADD();
+    if mrl_add != 0 {
+        // The mission read latency: the read training's applied DFIMRL plus
+        // `mrl_add` on every DBYTE, applied by the held update below. Not
+        // the CSR as found: launches after the training (the select's 8)
+        // overwrite it (measured: 8 found, 5 = trained 4 + 1 needed).
+        let trained = crate::rdtrain::APPLIED_MRL.load(core::sync::atomic::Ordering::Relaxed);
+        let base = if trained != 0 {
+            trained
+        } else {
+            crate::rdtrain::MRL_FALLBACK
+        };
+        for db in 0..4u32 {
+            hw.write16(csr(0x10000 + 0x1000 * db), base + mrl_add);
+        }
+    }
+    if mrl_add != 0 || crate::knobs::env("A7A_HO_FIU", option_env!("A7A_HO_FIU")).is_some() {
         // FEL lab: ForceInternalUpdate with the DFI still offline, held
         // well over 32 DFICLKs (TRM), so every delay CSR is applied.
         hw.write16(csr(0x200a3), 1);
@@ -1402,6 +1418,23 @@ pub fn HO_CDD() -> Option<u32> {
             _ => panic!("A7A_HO_CDD is a hex value up to 0x1f"),
         },
         None => None,
+    }
+}
+
+/// `A7A_HO_MRL_ADD=<hex>`: every DBYTE's DFIMRL (0x1n000) set to the read
+/// training's applied latency plus this by the lean hand-over, with the
+/// held ForceInternalUpdate. Measured:
+/// our read training's DFIMRL 4 reads isolated bursts but not the CPU's
+/// line fills (two gapless BL16); 4 + 1 passes every fetch probe, while
+/// training at 5 does not (the gate follows). Unset: 0.
+#[allow(non_snake_case)]
+pub fn HO_MRL_ADD() -> u16 {
+    match crate::knobs::env("A7A_HO_MRL_ADD", option_env!("A7A_HO_MRL_ADD")) {
+        Some(s) => match u16::from_str_radix(s, 16) {
+            Ok(v) if v <= 3 => v,
+            _ => panic!("A7A_HO_MRL_ADD is 0-3"),
+        },
+        None => 0,
     }
 }
 
