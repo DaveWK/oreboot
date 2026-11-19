@@ -64,6 +64,8 @@ mod extcheck;
 mod fastboot;
 #[cfg(feature = "fel")]
 mod fel;
+#[cfg(not(feature = "fel"))]
+mod felreboot;
 mod gpadc;
 mod gpio;
 #[cfg(feature = "fel")]
@@ -155,6 +157,16 @@ bt0_vectors:
 pub unsafe extern "C" fn start() -> ! {
     naked_asm!(
         ".arm",
+        // The ROM's VBAR, SCTLR, SP and CPSR as it called us, for a return
+        // to its FEL (felreboot.rs).
+        "ldr    r0, ={rom_state}",
+        "mrc    p15, 0, r1, c12, c0, 0",
+        "str    r1, [r0]",
+        "mrc    p15, 0, r1, c1, c0, 0",
+        "str    r1, [r0, #4]",
+        "str    sp, [r0, #8]",
+        "mrs    r1, cpsr",
+        "str    r1, [r0, #12]",
         // SVC mode, IRQ and FIQ masked
         "mrs    r0, cpsr",
         "bic    r0, r0, #0x1f",
@@ -197,6 +209,7 @@ pub unsafe extern "C" fn start() -> ! {
         "wfi",
         "b      2b",
         main = sym main,
+        rom_state = sym felreboot::ROM_ENTRY_STATE,
         led_cfg = const gpio::POWER_LED_CFG,
         led_dat = const gpio::POWER_LED_DAT,
         led_shift = const gpio::POWER_LED_CFG_SHIFT,
@@ -453,6 +466,9 @@ pub struct Pre {
 /// [`bring_up`] in every image without the lab mode, as before the split.
 #[cfg_attr(not(feature = "dram-lab"), inline(always))]
 fn bring_up_pre() -> Pre {
+    // Before the diagnostics below overwrite RTC GP_DATA_REG0..3.
+    #[cfg(not(feature = "fel"))]
+    let fel_reboot = felreboot::take();
     soc::set_cntfrq();
     soc::stage(1);
     soc::diag(1, ccu::apb_uart_clk());
@@ -469,6 +485,10 @@ fn bring_up_pre() -> Pre {
     soc::board_common_init(version);
     init_uart();
     soc::stage(3);
+    #[cfg(not(feature = "fel"))]
+    if fel_reboot {
+        felreboot::enter_fel();
+    }
 
     println!();
     println!("oreboot 🦀 bt0 | Radxa Cubie A7A | Allwinner A733");
