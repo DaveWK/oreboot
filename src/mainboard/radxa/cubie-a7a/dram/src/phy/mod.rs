@@ -116,3 +116,6 @@ pub fn read_latency_csrs<H: Hw>(hw: &mut H) -> (u32, u32) {
     csr_access(hw, false);
     (a, b)
 }
+
+#[cfg(test)]
+mod dfs_table_tests;
