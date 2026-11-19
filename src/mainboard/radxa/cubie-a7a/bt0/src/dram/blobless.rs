@@ -843,7 +843,7 @@ fn read_training(bases: [Option<cubie_a7a_dram::phy::wcklevel::Mr18Base>; 4]) ->
         }
     };
     println!(
-        "[dram] RDT: read training ({}, pstate {}): order {:?}; config {:x?}; latch events (CSR, read at, bits) {:05x?} held {} us; receive clock effective delay 64 x coarse + fine (fine < 0x40 written); VrefDAC {}; check patterns (MR33, MR34) {:x?} then the first inverted (negative control); MRR {:?} with RxFifoVisibility {:x?}; no PState flip, no refresh; ps = taps x UI / 64; MRL = ceil((RxEnDly/64 UI + {} UI + {} ps) / {} UI) + {}, cross-checked at the vendor's RxEnDly {:x} (must give {}), fallback {}; vendor (av3c) RxEnDly {:x}",
+        "[dram] RDT: read training ({}, pstate {}): order {:?}; config {:x?}; latch events (CSR, read at, bits) {:05x?} held {} us; receive clock effective delay 64 x coarse + fine (fine < 0x40 written); VrefDAC {}; check patterns (MR33, MR34) {:x?} then the first inverted (negative control); MRR {:?} with RxFifoVisibility {:x?}; no PState flip, no refresh; ps = taps x UI / 64; MRL = ceil((RxEnDly/64 UI + {} UI + {} ps) / {} UI) + {}, search {}, sweep {}..={}",
         if TRAIN_ONLY { "measurement image" } else { "applied" },
         ps,
         runs,
@@ -858,10 +858,9 @@ fn read_training(bases: [Option<cubie_a7a_dram::phy::wcklevel::Mr18Base>; 4]) ->
         base_cfg.fifo_ps,
         base_cfg.dficlk_ui,
         base_cfg.mrl_margin,
-        base_cfg.mrl_check.0,
-        base_cfg.mrl_check.1,
-        base_cfg.mrl_fallback,
-        rd::VENDOR_RX_EN,
+        base_cfg.search_mrl(),
+        base_cfg.mrl_min,
+        base_cfg.mrl_max,
     );
     if rdtrain::PASS_LANES() != rdtrain::FULL {
         println!(
@@ -933,8 +932,8 @@ fn read_training(bases: [Option<cubie_a7a_dram::phy::wcklevel::Mr18Base>; 4]) ->
             }
         };
         println!(
-            "[dram] RDT {nm} run {n} TABLE block: ok {} applied {} stop {:?} failure {:?} restored {} live {:?}; MRL applied {} ({:?}; formula {} from RxEnDly max {:03x}, vendor check {} want {}; sweep pass set {:#x}); {} launches, {} writes, max {} us, {} us",
-            t.ok(), t.applied, t.stop, t.failure, t.restored, t.live_ok, t.mrl, t.mrl_source, t.mrl_formula, t.bytes[0].rx_en.max(t.bytes[1].rx_en), t.mrl_check, cfg.mrl_check.1, t.mrl_pass, t.launches, t.writes, t.max_launch_us, t.elapsed_us
+            "[dram] RDT {nm} run {n} TABLE block: ok {} applied {} stop {:?} failure {:?} restored {} live {:?}; MRL applied {} ({:?}; formula {:?} from RxEnDly max {:03x}; sweep pass set {:#x}); {} launches, {} writes, max {} us, {} us",
+            t.ok(), t.applied, t.stop, t.failure, t.restored, t.live_ok, t.mrl, t.mrl_source, t.mrl_formula, t.bytes[0].rx_en.max(t.bytes[1].rx_en), t.mrl_pass, t.launches, t.writes, t.max_launch_us, t.elapsed_us
         );
         for (i, b) in t.bytes.iter().enumerate() {
             let w = span(b.en_win, cfg.en_step);

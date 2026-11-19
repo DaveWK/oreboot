@@ -678,10 +678,11 @@ mod tests {
             (0x908f3, [0x58, 0x58, 0x40, 0x40]),
             (0x908f4, [0x0f, 0x07, 0x05, 0x02]),
         ];
-        // DevInit's gains, and the mission read latency the read training
-        // falls back to (DFIMRL of every DBYTE).
+        // DevInit's gains, and the test-only saved-state (RxEnDly, DFIMRL)
+        // oracles per pstate for checking derive_mrl().
         const DLL_GAIN: [u16; 4] = [0x7353, 0x7342, 0x5331, 0x5331];
         const RX_REPLICA_DLL_GAIN: [u16; 4] = [0x73, 0x73, 0x53, 0x53];
+        const RX_EN_ORACLE: [u16; 4] = [0x497, 0x369, 0x307, 0x2a5];
         const DFIMRL: [u16; 4] = [5, 4, 4, 3];
         // The table's write of `csr` (its constant bits), else a bare one.
         let op_of = |table: &[prog::Op], csr: u32| {
@@ -709,7 +710,11 @@ mod tests {
                 assert_eq!(rx_replica_dll_gain(gain), RX_REPLICA_DLL_GAIN[ps]);
                 let rd = crate::rdtrain::TrainConfig::for_pstate(ps as u32)
                     .unwrap_or(crate::rdtrain::below_pstate1(ps as u32));
-                assert_eq!(rd.mrl_fallback, DFIMRL[ps], "ps {ps}");
+                assert_eq!(
+                    crate::rdtrain::derive_mrl(RX_EN_ORACLE[ps], &rd),
+                    Some(DFIMRL[ps]),
+                    "ps {ps}"
+                );
                 assert_eq!(rd.ui_ps as u32, Point::of(&p, ps as u32).ui_ps());
             }
         }

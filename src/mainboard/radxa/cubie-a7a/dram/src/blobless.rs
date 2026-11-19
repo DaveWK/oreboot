@@ -1263,6 +1263,19 @@ fn init0_skip() -> Option<u32> {
     crate::knobs::get().init0
 }
 
+/// Compute the mission `DFIMRL` (`trained + mrl_add`) for handover.
+/// Fails closed if read training did not record an applied MRL (`0`) or
+/// if the sum exceeds the 5-bit `DFIMRL` CSR width.
+pub(crate) const fn handover_mrl(trained: u16, mrl_add: u16) -> Result<u16, Error> {
+    if trained == 0 {
+        return Err(Error::Config("no trained MRL for mission handover"));
+    }
+    match trained.checked_add(mrl_add) {
+        Some(v) if v <= crate::rdtrain::MRL_CSR_MAX => Ok(v),
+        _ => Err(Error::Config("mission MRL out of CSR range")),
+    }
+}
+
 /// [`mission_handover`]; with `relock`, first the training firmware's end
 /// state (PLL powered down, ClockingCtrl 1, TxRdPtrInit 1) and then our
 /// mission bring-up (`phy::devinit::mission_bringup` level 3) before the
@@ -1312,15 +1325,17 @@ pub fn mission_handover_relock<H: Hw>(
         // The mission read latency: the read training's applied DFIMRL plus
         // `mrl_add` on every DBYTE, applied by the held update below. Not
         // the CSR as found: launches after the training (the select's 8)
-        // overwrite it (measured: 8 found, 5 = trained 4 + 1 needed).
+        // overwrite it. Fail closed if read training did not apply an MRL.
         let trained = crate::rdtrain::APPLIED_MRL.load(core::sync::atomic::Ordering::Relaxed);
-        let base = if trained != 0 {
-            trained
-        } else {
-            crate::rdtrain::MRL_FALLBACK
+        let mission = match handover_mrl(trained, mrl_add) {
+            Ok(v) => v,
+            Err(e) => {
+                csr_access(hw, false);
+                return Err(e);
+            }
         };
         for db in 0..4u32 {
-            hw.write16(csr(0x10000 + 0x1000 * db), base + mrl_add);
+            hw.write16(csr(0x10000 + 0x1000 * db), mission);
         }
     }
     if mrl_add != 0 || crate::knobs::env("A7A_HO_FIU", crate::knob!("A7A_HO_FIU")).is_some() {

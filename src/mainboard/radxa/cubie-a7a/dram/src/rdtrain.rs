@@ -52,16 +52,18 @@
 //!    FIFO with ObsSel 1 as the reference reads it (RxFifoVisibility 0x300,
 //!    then 0x3fc per lane), decoded through Dq0..7LnSel when every lane
 //!    reads 0x00 or 0xff. Reported, not judged.
-//! 7. **MRL:** the diagnostic sweep from [`TrainConfig::mrl_search`] up to
+//! 7. **MRL:** the diagnostic sweep from [`TrainConfig::search_mrl`] up to
 //!    `mrl_max`, then down to `mrl_min`, each value followed by a probe at
 //!    the search latency (on hardware, after a sweep from 1 nothing
 //!    compared any more); going down stops after a value the probe does not survive.
 //!    The applied value is **not** taken from the pass set (on hardware
-//!    1-6 all pass; the PHY compare cannot see the controller's timing): it is the
-//!    formula [`derive_mrl`] from the block's largest trained RxEnDly,
-//!    cross-checked once against the vendor's trained point
-//!    ([`choose_mrl`]), or the build-time override. Then the data
-//!    check again at that latency.
+//!    several values pass; the PHY compare cannot see the controller's timing):
+//!    it is derived from the block's largest trained RxEnDly via [`derive_mrl`]
+//!    (or the build-time `A7A_RD_MRL` lab override via [`choose_mrl`]), then
+//!    confirmed against the sweep pass set and checked again with the full
+//!    data check. Any derivation inconsistency or sweep miss fails closed
+//!    with [`TrainStop::MrlDerive`] or [`TrainStop::NoMrl`] (no silent
+//!    fallback). Then the data check runs again at that latency.
 //!
 //! With [`TrainConfig::apply`] the trained delays and the read latency stay
 //! (the default read training; nothing is kept from a stopped or failed
@@ -231,38 +233,31 @@ pub struct TrainConfig {
     pub lane_span: u16,
     /// Half-span of the T-alone and C-alone diagnostic sweeps.
     pub diag_span: u16,
-    /// Read latency during the searches; the range of the diagnostic sweep.
-    pub mrl_search: u16,
+    /// Range of the diagnostic read-latency sweep (in DfiClk cycles).
     pub mrl_min: u16,
     pub mrl_max: u16,
     /// The read latency formula ([`derive_mrl`]): DfiClk in UI, the PHY's
-    /// receive FIFO delay in UI and ps, the margin added.
+    /// receive-path delay in UI and ps (TX/RX insertion plus RX FIFO), and
+    /// the DfiClk margin added.
     pub dficlk_ui: u16,
     pub fifo_ui: u16,
     pub fifo_ps: u16,
     pub mrl_margin: u16,
-    /// A build-time read latency instead of the formula (measurement
-    /// images; None: the formula, or [`MRL_FALLBACK`] when its vendor
-    /// cross-check fails).
+    /// Optional lab build-time read latency (`A7A_RD_MRL`) instead of
+    /// [`derive_mrl`]; None uses [`derive_mrl`] and fails closed on error.
     pub mrl_override: Option<u16>,
     /// Leave the trained delays and the read latency applied (the default
     /// read training); false puts everything back (a measurement image).
     pub apply: bool,
     /// Launches per data-check pattern.
     pub check_n: u16,
-    /// The data UI in ps (only for the printed table).
+    /// The data UI in ps (used by [`derive_mrl`] and for the printed table).
     pub ui_ps: u16,
-    /// The vendor's trained point the formula is cross-checked against at
-    /// this pstate: (RxEnDly, the read latency it must give), and the read
-    /// latency applied when the check fails and no override is given.
-    pub mrl_check: (u16, u16),
-    pub mrl_fallback: u16,
 }
 
 /// FEL lab `A7A_RD_MRL_SEARCH` (hex): the read latency during the searches
-/// instead of the pstate's default (e.g. `82`, the reference's value during
-/// the pstate-0 read enable stage; it uses 3 at pstate 1). Unset: the
-/// pstate's [`TrainConfig`].
+/// instead of the sweep-range midpoint (`(mrl_min + mrl_max) / 2`). Unset:
+/// the midpoint.
 pub const MRL_SEARCH: Option<u16> = match crate::knob!("A7A_RD_MRL_SEARCH") {
     Some(s) => match u16::from_str_radix(s, 16) {
         Ok(v) => Some(v),
@@ -272,8 +267,12 @@ pub const MRL_SEARCH: Option<u16> = match crate::knob!("A7A_RD_MRL_SEARCH") {
 };
 
 impl TrainConfig {
-    /// pstate 1 (WCK 1200 MHz, 2400 MT/s, UI 417 ps): the reference's mode
-    /// launches, read latency 4 (as the `rd` searches).
+    /// pstate 1 (WCK 1200 MHz, 2400 MT/s, DfiClk 300 MHz, UI 417 ps):
+    /// LPDDR5 4:1 WCK:CK at DFI 1:4 ratio (`DfiFreqRatio = 2'b10`), so
+    /// 1 DfiClk = 4 WCK = 8 UI. Fixed PHY receive-path terms (`fifo_ui = 4`,
+    /// `fifo_ps = 600` ps = 200 ps TX insertion + 200 ps RX insertion +
+    /// 200 ps RX FIFO, `mrl_margin = 1`) follow the public BSD-3 STM32MP2
+    /// skip-training `dfimrl_program`.
     pub const PSTATE1: TrainConfig = TrainConfig {
         next: ModeMrs::NEXT_PSTATE1,
         // The reference's; the bt0 read training sets EXIT_MRS() (A7A_RD_EXIT).
@@ -287,49 +286,44 @@ impl TrainConfig {
         lane_step: 2,
         lane_span: 64,
         diag_span: 96,
-        mrl_search: 4,
         mrl_min: 1,
         mrl_max: 7,
-        dficlk_ui: 16,
+        dficlk_ui: 8,
         fifo_ui: 4,
-        fifo_ps: 200,
+        fifo_ps: 600,
         mrl_margin: 1,
         mrl_override: None,
         apply: false,
         check_n: 16,
         ui_ps: 417,
-        mrl_check: (MRL_CHECK_RX_EN, MRL_CHECK_WANT),
-        mrl_fallback: MRL_FALLBACK,
     };
 
-    /// pstate 0 (WCK 2400 MHz, 4800 MT/s, UI 208 ps). The grid is in UI
-    /// units and stays; the mode launches are the pstate-1 ones (the
-    /// reference's read enable launches at pstate 0 write the same MR18/MR10/
-    /// MR20/MR31-34 values, REFERENCE-DERIVED); the read latency during the
-    /// searches is the vendor's mission value at pstate 0 (DFIMRL and HwtMRL
-    /// 5, feature `av3h` dump, MEASURED), as 4 is at pstate 1; the formula's
-    /// cross-check is that dump's RxEnDly 0x497 (lane-0 DBYTE 0, Tg0) against MRL 5,
-    /// with 5 as the fallback.
+    /// pstate 0 (WCK 2400 MHz, 4800 MT/s, DfiClk 600 MHz, UI 208 ps).
+    /// The grid and PHY ratios are in UI units and stay; only `ui_ps` changes.
     pub const PSTATE0: TrainConfig = TrainConfig {
-        mrl_search: 5,
         ui_ps: 208,
-        mrl_check: (0x497, 5),
-        mrl_fallback: 5,
         ..TrainConfig::PSTATE1
     };
 
     /// The configuration of `pstate` 0 or 1 (None for the others; they have
-    /// [`below_pstate1`]), with [`MRL_SEARCH`] applied.
+    /// [`below_pstate1`]).
     pub const fn for_pstate(pstate: u32) -> Option<TrainConfig> {
-        let mut c = match pstate {
-            0 => TrainConfig::PSTATE0,
-            1 => TrainConfig::PSTATE1,
-            _ => return None,
-        };
-        if let Some(m) = MRL_SEARCH {
-            c.mrl_search = m;
+        match pstate {
+            0 => Some(TrainConfig::PSTATE0),
+            1 => Some(TrainConfig::PSTATE1),
+            _ => None,
         }
-        Some(c)
+    }
+
+    /// Training-time read latency used during the gate/clock searches and as
+    /// the diagnostic sweep's pivot: `A7A_RD_MRL_SEARCH` when set (lab builds),
+    /// else the midpoint of `mrl_min..=mrl_max` (4 for 1..=7, centred inside
+    /// every pstate's PHY-compare pass window).
+    pub const fn search_mrl(&self) -> u16 {
+        match MRL_SEARCH {
+            Some(m) => m,
+            None => (self.mrl_min + self.mrl_max) / 2,
+        }
     }
 
     /// Launches of the gate search.
@@ -338,47 +332,77 @@ impl TrainConfig {
     }
 }
 
-/// The read latency when the formula fails its vendor cross-check and no
-/// override is given: the vendor firmware's trained value at 1200 MHz CK
-/// (HwtMRL 4, DFIMRL 4). Measured: training at 5 instead
-/// moves the trained gate with it and the mission line fills fail as at 4;
-/// what line fills need is the trained 4 plus one at the hand-over
-/// (`blobless::HO_MRL_ADD`).
-pub const MRL_FALLBACK: u16 = 4;
+/// Maximum valid value of the 11-bit `RxEnDlyTg0/1_pX` CSR field
+/// (`[10:6]` coarse 1 UI/step, `[5:0]` fine 1/64 UI/step; public EIC7700X TRM).
+pub const RX_EN_MAX: u16 = 0x7ff;
 
-/// The read latency the last read-training block applied (0: none yet).
+/// Maximum valid value of the 5-bit `DFIMRL_pX` / `HwtMRL_pX` CSR field
+/// (public EIC7700X TRM).
+pub const MRL_CSR_MAX: u16 = 0x1f;
+
+/// The maximum read latency applied across passing read-training blocks in
+/// the current run (0: none applied yet or training failed).
 /// Later ACSM launches re-select channels and rewrite DFIMRL with the
 /// select's 8 (`phy::coldinit::select`, e.g. the post-training MR16 of
 /// `A7A_RD_FSPWR`), so the hand-over takes the trained value from here.
 pub static APPLIED_MRL: core::sync::atomic::AtomicU16 = core::sync::atomic::AtomicU16::new(0);
-/// The vendor's trained RxEnDly the formula is cross-checked against
-/// (1200 MHz CK) and the value it must give there.
-pub const MRL_CHECK_RX_EN: u16 = 0x369;
-pub const MRL_CHECK_WANT: u16 = 4;
 
-/// The skip-training read latency formula (the STM32MP2 phyinit
-/// progCsrSkipTrain, BSD-3, as the reference; LPDDR5 field widths from the
-/// SiMa map): DFIMRL = ceil((RxEnDly + PHY_Rx_Fifo_dly) / DfiClk) + margin,
-/// with RxEnDly in UI (0x40 = 1 UI; it already holds ARdPtrInitVal, the tx
-/// and rx insertion delays, tDQSCK and tstaoff), PHY_Rx_Fifo_dly =
-/// `fifo_ui` UI + `fifo_ps` ps, DfiClk = `dficlk_ui` UI. Computed in 1/64 UI.
-pub const fn derive_mrl(rx_en: u16, cfg: &TrainConfig) -> u16 {
+/// Derive the read latency (`DFIMRL` / `HwtMRL`, in `DfiClk` cycles) from
+/// the trained receive-enable delay `rx_en` (11-bit CSR in 1/64 UI,
+/// `0x40 = 1 UI`) and the pstate's clock/FIFO geometry:
+///
+///   DFIMRL = ceil((rx_en/64 UI + fifo_ui UI + fifo_ps ps) / dficlk_ui UI) + mrl_margin
+///
+/// Public basis:
+/// - DFI 1:4 ratio (`DfiFreqRatio = 2'b10`, LPDDR5 WCK:CK 4:1): 1 DfiClk =
+///   4 WCK = 8 UI (`dficlk_ui = 8`).
+/// - Fixed PHY receive-path terms from the public BSD-3 STM32MP2
+///   `ddrphy_phyinit_progcsrskiptrain.c` (`dfimrl_program`):
+///   `phy_tx_insertion_dly` (200 ps) + `phy_rx_insertion_dly` (200 ps) +
+///   `phy_rx_fifo_dly` (4 UI + 200 ps) = `4 UI + 600 ps`, plus
+///   `dfimrlmargin = 1`.
+///
+/// Returns `None` on inconsistent inputs (zero or out-of-CSR `rx_en`,
+/// invalid clock/range config, or a derived value outside
+/// `cfg.mrl_min..=cfg.mrl_max` / 5-bit CSR width).
+pub const fn derive_mrl(rx_en: u16, cfg: &TrainConfig) -> Option<u16> {
+    if rx_en == 0
+        || rx_en > RX_EN_MAX
+        || cfg.ui_ps == 0
+        || cfg.dficlk_ui == 0
+        || cfg.mrl_min == 0
+        || cfg.mrl_min > cfg.mrl_max
+        || cfg.mrl_max > MRL_CSR_MAX
+    {
+        return None;
+    }
     let fifo_ps_64 = (cfg.fifo_ps as u32 * 64).div_ceil(cfg.ui_ps as u32);
     let num = rx_en as u32 + cfg.fifo_ui as u32 * 64 + fifo_ps_64;
     let den = cfg.dficlk_ui as u32 * 64;
-    (num.div_ceil(den) + cfg.mrl_margin as u32) as u16
+    let m = num.div_ceil(den) + cfg.mrl_margin as u32;
+    if m < cfg.mrl_min as u32 || m > cfg.mrl_max as u32 {
+        return None;
+    }
+    Some(m as u16)
 }
 
-/// The read latency to apply: the override, else the formula when its
-/// vendor cross-check holds, else [`MRL_FALLBACK`]; with the source.
-pub const fn choose_mrl(rx_en_max: u16, cfg: &TrainConfig) -> (u16, MrlSource) {
-    if let Some(m) = cfg.mrl_override {
-        return (m, MrlSource::Override);
+/// The read latency to apply: the lab override (`A7A_RD_MRL`) when set and
+/// within `cfg.mrl_min..=cfg.mrl_max`, else [`derive_mrl`]; with its source.
+/// Returns `None` on any invalid or out-of-range input so callers fail closed
+/// with no fallback to vendor constants.
+pub const fn choose_mrl(rx_en_max: u16, cfg: &TrainConfig) -> Option<(u16, MrlSource)> {
+    if cfg.mrl_min == 0 || cfg.mrl_min > cfg.mrl_max || cfg.mrl_max > MRL_CSR_MAX {
+        return None;
     }
-    if derive_mrl(cfg.mrl_check.0, cfg) == cfg.mrl_check.1 {
-        (derive_mrl(rx_en_max, cfg), MrlSource::Formula)
-    } else {
-        (cfg.mrl_fallback, MrlSource::FallbackFormulaWrong)
+    if let Some(m) = cfg.mrl_override {
+        if m >= cfg.mrl_min && m <= cfg.mrl_max {
+            return Some((m, MrlSource::Override));
+        }
+        return None;
+    }
+    match derive_mrl(rx_en_max, cfg) {
+        Some(m) => Some((m, MrlSource::Formula)),
+        None => None,
     }
 }
 
@@ -387,8 +411,6 @@ pub const fn choose_mrl(rx_en_max: u16, cfg: &TrainConfig) -> (u16, MrlSource) {
 pub enum MrlSource {
     Override,
     Formula,
-    /// The formula did not give [`MRL_CHECK_WANT`] at [`MRL_CHECK_RX_EN`].
-    FallbackFormulaWrong,
 }
 
 /// One lane's receive clock windows (effective taps, first and last
@@ -450,6 +472,8 @@ pub enum TrainStop {
     NoRxEn(u8),
     /// No receive clock eye on this byte and lane.
     NoLane(u8, u8),
+    /// The read latency could not be derived or is out of range.
+    MrlDerive,
     /// The applied read latency does not pass the PHY compare.
     NoMrl,
 }
@@ -532,12 +556,11 @@ pub struct RdTrain {
     /// Bit m: read latency m passed (the diagnostic sweep).
     pub mrl_pass: u16,
     /// The read latency applied for check 1 (and left applied with
-    /// `apply`), its source, the formula's value for this block's largest
-    /// RxEnDly and for the vendor cross-check point.
+    /// `apply`), its source, and the formula's value for this block's
+    /// largest RxEnDly.
     pub mrl: u16,
-    pub mrl_source: MrlSource,
-    pub mrl_formula: u16,
-    pub mrl_check: u16,
+    pub mrl_source: Option<MrlSource>,
+    pub mrl_formula: Option<u16>,
     /// Per read latency value: what the sweep saw.
     pub mrl_obs: [MrlObs; MRL_OBS],
     /// The data check at the search latency (before the MRL sweep) and at
@@ -571,9 +594,8 @@ impl RdTrain {
             bytes: [ByteTrain::EMPTY; 2],
             mrl_pass: 0,
             mrl: NONE,
-            mrl_source: MrlSource::FallbackFormulaWrong,
-            mrl_formula: NONE,
-            mrl_check: NONE,
+            mrl_source: None,
+            mrl_formula: None,
             mrl_obs: [MrlObs::EMPTY; MRL_OBS],
             check: [DataCheck::EMPTY; 2],
             mrr: [MrrRead::EMPTY; MRR_MAS.len()],
@@ -863,6 +885,9 @@ pub fn train_block_with<H: Hw>(
 ) {
     let (ch, rank) = (out.channel, out.rank);
     *out = RdTrain::empty(ch, rank);
+    if prev.is_none() {
+        APPLIED_MRL.store(0, core::sync::atomic::Ordering::Relaxed);
+    }
     let dbs = dbytes(ch);
     let t0 = hw.now_us();
     out.start_us = t0;
@@ -941,7 +966,8 @@ pub fn train_block_with<H: Hw>(
         CHECK_PATTERNS[0],
         expected(CHECK_PATTERNS[0]),
     );
-    latency_group(&mut ex, None, ch, cfg.mrl_search);
+    let search_mrl = cfg.search_mrl();
+    latency_group(&mut ex, None, ch, search_mrl);
     let prog = rxen::centring_program(rank);
     let regs = own_clk(rank);
     let name = block_name(ch, rank);
@@ -964,12 +990,24 @@ pub fn train_block_with<H: Hw>(
             check(&mut ex, out, dbs, &prog, cfg, 1);
         }
     }
-    // Apply: the trained delays and the read latency stay (a stopped or
-    // failed block keeps nothing); else everything goes back.
-    let keep = cfg.apply && out.stop.is_none() && ex.failure.is_none();
+    // Apply: the trained delays and the read latency stay only when every
+    // stage, MRL derivation/confirmation and both data checks succeeded;
+    // otherwise everything goes back and APPLIED_MRL is cleared.
+    let keep = cfg.apply
+        && out.stop.is_none()
+        && ex.failure.is_none()
+        && out.check.iter().all(DataCheck::passed);
     out.applied = keep;
-    if !keep {
-        latency_group(&mut ex, None, ch, cfg.mrl_search);
+    if keep {
+        let prev_mrl = APPLIED_MRL.load(core::sync::atomic::Ordering::Relaxed);
+        if out.mrl > prev_mrl {
+            APPLIED_MRL.store(out.mrl, core::sync::atomic::Ordering::Relaxed);
+        }
+    } else {
+        if cfg.apply {
+            APPLIED_MRL.store(0, core::sync::atomic::Ordering::Relaxed);
+        }
+        latency_group(&mut ex, None, ch, search_mrl);
     }
 
     // Back: receive clock delays (latched), latency, selects, visibility,
@@ -1348,8 +1386,36 @@ fn train<H: Hw>(
     }
 }
 
-/// Step 5: read latency from `mrl_search` up to `mrl_max`, then down to
-/// `mrl_min`; after each value a probe at `mrl_search` (on hardware,
+/// Choose and confirm the read latency for `out` against its trained
+/// per-byte `RxEnDly` values and the diagnostic sweep pass mask `out.mrl_pass`.
+/// Returns `Some(m)` when a valid latency is chosen and confirmed; otherwise
+/// records [`TrainStop::MrlDerive`] (inconsistent inputs or out-of-range
+/// result) or [`TrainStop::NoMrl`] (not confirmed by `out.mrl_pass`) and
+/// returns `None` so the caller fails closed.
+fn confirm_mrl(out: &mut RdTrain, cfg: &TrainConfig) -> Option<u16> {
+    let b0 = out.bytes[0].rx_en;
+    let b1 = out.bytes[1].rx_en;
+    if b0 == 0 || b0 > RX_EN_MAX || b1 == 0 || b1 > RX_EN_MAX {
+        out.stop = Some(TrainStop::MrlDerive);
+        return None;
+    }
+    let rx_en_max = b0.max(b1);
+    out.mrl_formula = derive_mrl(rx_en_max, cfg);
+    let Some((m, src)) = choose_mrl(rx_en_max, cfg) else {
+        out.stop = Some(TrainStop::MrlDerive);
+        return None;
+    };
+    out.mrl = m;
+    out.mrl_source = Some(src);
+    if m >= MRL_OBS as u16 || (out.mrl_pass >> m) & 1 == 0 {
+        out.stop = Some(TrainStop::NoMrl);
+        return None;
+    }
+    Some(m)
+}
+
+/// Step 5: read latency from `search_mrl` up to `mrl_max`, then down to
+/// `mrl_min`; after each value a probe at `search_mrl` (on hardware,
 /// after the sweep from 1 nothing compared). Going down stops at the first value
 /// after which the probe fails.
 fn mrl_sweep<H: Hw>(
@@ -1359,15 +1425,17 @@ fn mrl_sweep<H: Hw>(
     prog: &[Row],
     cfg: &TrainConfig,
 ) {
-    let up = cfg.mrl_search..=cfg.mrl_max.min(MRL_OBS as u16 - 1);
-    let down = (cfg.mrl_min..cfg.mrl_search).rev();
+    let search = cfg.search_mrl();
+    let hi = cfg.mrl_max.min(MRL_OBS as u16 - 1);
+    let up = search..=hi;
+    let down = (cfg.mrl_min..search.min(hi + 1)).rev();
     for m in up.chain(down) {
         if ex.failure.is_some() {
             return;
         }
         latency_group(ex, None, out.channel, m);
         let (p, _, n) = point_counts(ex, dbs, prog);
-        latency_group(ex, None, out.channel, cfg.mrl_search);
+        latency_group(ex, None, out.channel, search);
         let (b, _) = point(ex, dbs, prog);
         let o = &mut out.mrl_obs[m as usize];
         *o = MrlObs {
@@ -1380,24 +1448,17 @@ fn mrl_sweep<H: Hw>(
         if o.pass {
             out.mrl_pass |= 1 << m;
         }
-        if m < cfg.mrl_search && !o.back {
+        if m < search && !o.back {
             break;
         }
     }
-    // The applied read latency is not taken from the pass set (1-6 all
-    // pass the PHY compare, which cannot see the controller's timing):
-    // the formula, the override or the fallback.
-    let rx_en_max = out.bytes[0].rx_en.max(out.bytes[1].rx_en);
-    out.mrl_formula = derive_mrl(rx_en_max, cfg);
-    out.mrl_check = derive_mrl(cfg.mrl_check.0, cfg);
-    let (m, src) = choose_mrl(rx_en_max, cfg);
-    out.mrl = m;
-    out.mrl_source = src;
-    APPLIED_MRL.store(m, core::sync::atomic::Ordering::Relaxed);
-    if out.mrl_pass >> m & 1 == 0 {
-        out.stop = Some(TrainStop::NoMrl);
+    // The applied read latency is not taken from the pass set (several values
+    // pass the PHY compare, which cannot see controller timing): derive it
+    // from the largest trained RxEnDly (or use A7A_RD_MRL) and fail closed
+    // unless the sweep confirms it.
+    if let Some(m) = confirm_mrl(out, cfg) {
+        latency_group(ex, None, out.channel, m);
     }
-    latency_group(ex, None, out.channel, m);
 }
 
 /// Step 6: the data check at the trained point, into `out.check[k]`.
@@ -1532,44 +1593,28 @@ pub fn live_summary<H: Hw>(hw: &mut H, lane: u16) -> [[u16; 3]; 4] {
     v
 }
 
-/// pstate 2 (WCK 800 MHz, 1600 MT/s, UI 625 ps): as pstate 1 (the
-/// reference's read enable and read centring launches are the pstate-1
-/// rows, REFERENCE-DERIVED), with the training firmware's mission read
-/// latency at this pstate during the searches and as the fallback (DFIMRL 4
-/// and RxEnDly 0x307 of DBYTE 0 in the PHY's saved pstate-2 copy on the
-/// board, MEASURED). Not run on a board.
+/// pstate 2 (WCK 800 MHz, 1600 MT/s, DfiClk 200 MHz, UI 625 ps): as pstate 1
+/// with `ui_ps = 625` ps; all UI-relative PHY parameters stay the same.
 pub const PSTATE2: TrainConfig = TrainConfig {
-    mrl_search: 4,
     ui_ps: 625,
-    mrl_check: (0x307, 4),
-    mrl_fallback: 4,
     ..TrainConfig::PSTATE1
 };
 
-/// pstate 3 (WCK 400 MHz, 800 MT/s, UI 1250 ps): as [`PSTATE2`] with the
-/// saved pstate-3 copy's values (DFIMRL 3, RxEnDly 0x2a5, MEASURED). Not run
-/// on a board.
+/// pstate 3 (WCK 400 MHz, 800 MT/s, DfiClk 100 MHz, UI 1250 ps): as pstate 1
+/// with `ui_ps = 1250` ps; all UI-relative PHY parameters stay the same.
 pub const PSTATE3: TrainConfig = TrainConfig {
-    mrl_search: 3,
     ui_ps: 1250,
-    mrl_check: (0x2a5, 3),
-    mrl_fallback: 3,
     ..TrainConfig::PSTATE1
 };
 
 /// The configuration of a pstate [`TrainConfig::for_pstate`] has none for:
-/// [`PSTATE2`] or [`PSTATE3`] with [`MRL_SEARCH`] applied; for any other,
-/// pstate 1's.
+/// [`PSTATE2`] or [`PSTATE3`]; for any other, pstate 1's.
 pub const fn below_pstate1(pstate: u32) -> TrainConfig {
-    let mut c = match pstate {
+    match pstate {
         2 => PSTATE2,
         3 => PSTATE3,
-        _ => return TrainConfig::PSTATE1,
-    };
-    if let Some(m) = MRL_SEARCH {
-        c.mrl_search = m;
+        _ => TrainConfig::PSTATE1,
     }
-    c
 }
 
 /// [`below_pstate1`] of the build's pstate ([`crate::pstate::ACTIVE`]): what
@@ -1604,40 +1649,47 @@ mod lane_mask_tests {
 mod pstate_config_tests {
     use super::*;
 
+    /// Test-only vendor PState-SRAM `(pstate, RxEnDly, DFIMRL)` oracle pairs
+    /// dumped from the 4 GB board; never compiled into the default firmware.
+    const VENDOR_ORACLES: [(u32, u16, u16); 4] = [
+        (0, 0x497, 5), // 2400 MHz WCK, 4800 MT/s, UI 208 ps
+        (1, 0x369, 4), // 1200 MHz WCK, 2400 MT/s, UI 417 ps
+        (2, 0x307, 4), //  800 MHz WCK, 1600 MT/s, UI 625 ps
+        (3, 0x2a5, 3), //  400 MHz WCK,  800 MT/s, UI 1250 ps
+    ];
+
+    fn cfg_for(ps: u32) -> TrainConfig {
+        TrainConfig::for_pstate(ps).unwrap_or_else(|| below_pstate1(ps))
+    }
+
     #[test]
-    fn pstate0_config_and_its_latency_choice() {
+    fn pstate_configs_differ_only_in_ui_ps() {
         let c1 = TrainConfig::PSTATE1;
-        let c0 = TrainConfig::PSTATE0;
-        // Only the latency inputs and the UI differ; the grid (UI units)
-        // and the mode launches are the pstate-1 ones.
-        assert_eq!(
-            TrainConfig {
-                mrl_search: c1.mrl_search,
-                ui_ps: c1.ui_ps,
-                mrl_check: c1.mrl_check,
-                mrl_fallback: c1.mrl_fallback,
-                ..c0
-            },
-            c1
-        );
-        assert_eq!(c0.ui_ps as u32, crate::pstate::Point::board(0).ui_ps());
-        assert_eq!(c1.ui_ps as u32, crate::pstate::Point::board(1).ui_ps());
-        // The search grid reaches the vendor's pstate-0 RxEnDly (0x497).
-        assert!(c0.gate_step * (c0.gate_n - 1) > 0x497 + c0.en_margin);
-        // The formula misses both vendor points (it gives 3 at each), so
-        // each pstate falls back to the vendor's mission latency.
-        assert_eq!(derive_mrl(c1.mrl_check.0, &c1), 3);
-        assert_eq!(derive_mrl(c0.mrl_check.0, &c0), 3);
-        assert_eq!(choose_mrl(0x2f0, &c1), (4, MrlSource::FallbackFormulaWrong));
-        assert_eq!(choose_mrl(0x497, &c0), (5, MrlSource::FallbackFormulaWrong));
-        // The pstate-1 path is unchanged.
-        assert_eq!(c1.mrl_check, (MRL_CHECK_RX_EN, MRL_CHECK_WANT));
-        assert_eq!(c1.mrl_fallback, MRL_FALLBACK);
-        if MRL_SEARCH.is_none() {
-            assert_eq!(TrainConfig::for_pstate(1), Some(c1));
-            assert_eq!(TrainConfig::for_pstate(0), Some(c0));
+        assert_eq!(c1.dficlk_ui, 8);
+        assert_eq!(c1.fifo_ui, 4);
+        assert_eq!(c1.fifo_ps, 600);
+        assert_eq!(c1.mrl_margin, 1);
+        for ps in 0..4u32 {
+            let c = cfg_for(ps);
+            assert_eq!(
+                TrainConfig {
+                    ui_ps: c1.ui_ps,
+                    ..c
+                },
+                c1,
+                "ps {ps}"
+            );
+            assert_eq!(c.ui_ps as u32, crate::pstate::Point::board(ps).ui_ps());
+            if MRL_SEARCH.is_none() {
+                assert_eq!(c.search_mrl(), 4);
+            }
         }
+        assert_eq!(TrainConfig::for_pstate(0), Some(TrainConfig::PSTATE0));
+        assert_eq!(TrainConfig::for_pstate(1), Some(TrainConfig::PSTATE1));
         assert_eq!(TrainConfig::for_pstate(2), None);
+        assert_eq!(TrainConfig::for_pstate(3), None);
+        assert_eq!(below_pstate1(2), PSTATE2);
+        assert_eq!(below_pstate1(3), PSTATE3);
         assert_eq!(below_pstate1(1), c1);
         assert_eq!(below_pstate1(4), c1);
         if crate::pstate::ACTIVE < 2 {
@@ -1646,39 +1698,142 @@ mod pstate_config_tests {
     }
 
     #[test]
-    fn pstate2_and_pstate3_configs() {
-        let c1 = TrainConfig::PSTATE1;
-        for (ps, c, rx_en, mrl) in [(2, PSTATE2, 0x307, 4), (3, PSTATE3, 0x2a5, 3)] {
-            // Only the latency inputs and the UI differ from pstate 1.
-            assert_eq!(
-                TrainConfig {
-                    mrl_search: c1.mrl_search,
-                    ui_ps: c1.ui_ps,
-                    mrl_check: c1.mrl_check,
-                    mrl_fallback: c1.mrl_fallback,
-                    ..c
-                },
-                c1
-            );
-            assert_eq!(c.ui_ps as u32, crate::pstate::Point::board(ps).ui_ps());
-            assert_eq!(
-                (c.mrl_check, c.mrl_search, c.mrl_fallback),
-                ((rx_en, mrl), mrl, mrl)
-            );
-            // Inside the diagnostic sweep's range and the search grid.
-            assert!(c.mrl_min <= mrl && mrl <= c.mrl_max);
+    fn derive_mrl_matches_all_four_pstates_from_first_principles() {
+        // Formula: ceil((rx_en + 4*64 + ceil(600*64 / ui_ps)) / (8*64)) + 1
+        // where 1 DfiClk = 4 WCK = 8 UI = 512 (1/64 UI) at DFI 1:4 ratio,
+        // 4 UI + 600 ps = phy_tx_insertion (200 ps) + phy_rx_insertion (200 ps)
+        // + phy_rx_fifo (4 UI + 200 ps), and margin = 1 DfiClk.
+        //
+        // Test-only vendor oracles at all four pstates:
+        // - ps0 (208 ps):  0x497 (1175) + 256 + 185 = 1616; ceil(1616/512) + 1 = 4 + 1 = 5
+        // - ps1 (417 ps):  0x369 ( 873) + 256 +  93 = 1222; ceil(1222/512) + 1 = 3 + 1 = 4
+        // - ps2 (625 ps):  0x307 ( 775) + 256 +  62 = 1093; ceil(1093/512) + 1 = 3 + 1 = 4
+        // - ps3 (1250 ps): 0x2a5 ( 677) + 256 +  31 =  964; ceil( 964/512) + 1 = 2 + 1 = 3
+        for (ps, rx_en, want_mrl) in VENDOR_ORACLES {
+            let c = cfg_for(ps);
+            assert!(c.mrl_min <= want_mrl && want_mrl <= c.mrl_max);
             assert!(c.gate_step * (c.gate_n - 1) > rx_en + c.en_margin);
-            // The formula misses these points too (one below), so the
-            // training firmware's mission latency is what is applied.
-            assert_eq!(derive_mrl(rx_en, &c), mrl - 1);
+            assert_eq!(derive_mrl(rx_en, &c), Some(want_mrl), "ps {ps}");
             assert_eq!(
                 choose_mrl(rx_en, &c),
-                (mrl, MrlSource::FallbackFormulaWrong)
+                Some((want_mrl, MrlSource::Formula)),
+                "ps {ps}"
             );
-            if MRL_SEARCH.is_none() {
-                assert_eq!(below_pstate1(ps), c);
-            }
         }
+
+        // Our own board-measured RxEnDly values (2 UI earlier than vendor due
+        // to WL TxWckDly phase):
+        // - ps0 (208 ps, 049/rl0 max 0x420 = 1056): 1056 + 256 + 185 = 1497;
+        //   ceil(1497/512) + 1 = 3 + 1 = 4 (centre of 049 sweep 2..=6; +1 at
+        //   handover gives mission 5, inside the 2026-11-18 clean window 5..=6).
+        assert_eq!(derive_mrl(0x420, &TrainConfig::PSTATE0), Some(4));
+        assert_eq!(derive_mrl(0x40c, &TrainConfig::PSTATE0), Some(4));
+        // - ps1 (417 ps, 052 A0 max 0x2f8 = 760): 760 + 256 + 93 = 1109;
+        //   ceil(1109/512) + 1 = 3 + 1 = 4 (inside sweep 1..=6; +1 at handover
+        //   gives mission 5, proven on Fedora soaks).
+        assert_eq!(derive_mrl(0x2f8, &TrainConfig::PSTATE1), Some(4));
+        assert_eq!(derive_mrl(0x2ec, &TrainConfig::PSTATE1), Some(4));
+        // - ps2 (625 ps, 052 A1 max 0x28c = 652): 652 + 256 + 62 = 970;
+        //   ceil(970/512) + 1 = 2 + 1 = 3 (inside sweep 1..=7; +1 at handover
+        //   gives mission 4).
+        assert_eq!(derive_mrl(0x28c, &PSTATE2), Some(3));
+        assert_eq!(derive_mrl(0x280, &PSTATE2), Some(3));
+        // - ps3 (1250 ps, estimated ~0x225 = 549): 549 + 256 + 31 = 836;
+        //   ceil(836/512) + 1 = 2 + 1 = 3.
+        assert_eq!(derive_mrl(0x225, &PSTATE3), Some(3));
+    }
+
+    #[test]
+    fn choose_mrl_override_respects_bounds() {
+        let mut c = TrainConfig::PSTATE0;
+        c.mrl_override = Some(5);
+        assert_eq!(choose_mrl(0x420, &c), Some((5, MrlSource::Override)));
+        // Out-of-range overrides fail closed (None), never silently clamp.
+        c.mrl_override = Some(0);
+        assert_eq!(choose_mrl(0x420, &c), None);
+        c.mrl_override = Some(8);
+        assert_eq!(choose_mrl(0x420, &c), None);
+    }
+
+    #[test]
+    fn derive_mrl_and_confirm_fail_closed_on_inconsistent_input() {
+        let c0 = TrainConfig::PSTATE0;
+        // Invalid RxEnDly: zero, above 11-bit CSR max, or NONE sentinel.
+        assert_eq!(derive_mrl(0, &c0), None);
+        assert_eq!(derive_mrl(RX_EN_MAX + 1, &c0), None);
+        assert_eq!(derive_mrl(NONE, &c0), None);
+        assert_eq!(choose_mrl(0, &c0), None);
+        assert_eq!(choose_mrl(NONE, &c0), None);
+
+        // Invalid config parameters: zero UI, zero DfiClk, inverted or over-CSR range.
+        assert_eq!(derive_mrl(0x420, &TrainConfig { ui_ps: 0, ..c0 }), None);
+        assert_eq!(derive_mrl(0x420, &TrainConfig { dficlk_ui: 0, ..c0 }), None);
+        assert_eq!(derive_mrl(0x420, &TrainConfig { mrl_min: 0, ..c0 }), None);
+        assert_eq!(
+            derive_mrl(
+                0x420,
+                &TrainConfig {
+                    mrl_min: 6,
+                    mrl_max: 5,
+                    ..c0
+                }
+            ),
+            None
+        );
+        assert_eq!(
+            derive_mrl(
+                0x420,
+                &TrainConfig {
+                    mrl_max: MRL_CSR_MAX + 1,
+                    ..c0
+                }
+            ),
+            None
+        );
+        // Derived MRL outside configured sweep range fails closed.
+        assert_eq!(derive_mrl(0x420, &TrainConfig { mrl_max: 3, ..c0 }), None);
+        assert_eq!(derive_mrl(0x420, &TrainConfig { mrl_min: 5, ..c0 }), None);
+
+        // confirm_mrl: invalid byte RxEnDly fails closed with TrainStop::MrlDerive.
+        let mut out = RdTrain::empty(Channel::A, Rank::R0);
+        out.bytes[0].rx_en = 0x420;
+        out.bytes[1].rx_en = NONE;
+        out.mrl_pass = 0x7c;
+        assert_eq!(confirm_mrl(&mut out, &c0), None);
+        assert_eq!(out.stop, Some(TrainStop::MrlDerive));
+        assert_eq!(out.mrl, NONE);
+        assert_eq!(out.mrl_source, None);
+        assert!(!out.ok());
+
+        // confirm_mrl: valid derivation that fails the sweep pass set fails
+        // closed with TrainStop::NoMrl.
+        let mut out = RdTrain::empty(Channel::A, Rank::R0);
+        out.bytes[0].rx_en = 0x420;
+        out.bytes[1].rx_en = 0x410;
+        // Sweep passed only at 2 and 3; derived MRL is 4 -> must fail closed.
+        out.mrl_pass = (1 << 2) | (1 << 3);
+        assert_eq!(confirm_mrl(&mut out, &c0), None);
+        assert_eq!(out.stop, Some(TrainStop::NoMrl));
+        assert_eq!(out.mrl, 4);
+        assert_eq!(out.mrl_source, Some(MrlSource::Formula));
+        assert!(!out.ok());
+
+        // confirm_mrl: valid derivation inside sweep pass set confirms cleanly.
+        let mut out = RdTrain::empty(Channel::A, Rank::R0);
+        out.bytes[0].rx_en = 0x420;
+        out.bytes[1].rx_en = 0x410;
+        out.mrl_pass = 0x7c; // 2..=6
+        assert_eq!(confirm_mrl(&mut out, &c0), Some(4));
+        assert_eq!(out.stop, None);
+        assert_eq!(out.mrl, 4);
+        assert_eq!(out.mrl_formula, Some(4));
+        assert_eq!(out.mrl_source, Some(MrlSource::Formula));
+
+        // handover_mrl: fails closed when no MRL was applied (0) or when the
+        // sum exceeds the 5-bit DFIMRL CSR width.
+        assert!(crate::blobless::handover_mrl(0, 1).is_err());
+        assert!(crate::blobless::handover_mrl(MRL_CSR_MAX, 1).is_err());
+        assert_eq!(crate::blobless::handover_mrl(4, 1), Ok(5));
     }
 }
 
