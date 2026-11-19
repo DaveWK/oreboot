@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-only
-//! Allwinner SMHC (SD/MMC host) driver for SD cards, polled PIO, read-only.
+//! Allwinner SMHC (SD/MMC host) driver, polled PIO: the microSD card in
+//! SMHC0 (read-only) and the eMMC module in SMHC2.
 //!
-//! Just enough to read the boot layout and images from the microSD card in
-//! SMHC0: SD v2 identification, 1-bit bus, default speed. The module clock
+//! SD: just enough to read the boot layout and images from the card: SD v2
+//! identification, 1-bit bus, default speed. The module clock
 //! comes straight from the 24 MHz oscillator; in "new timing" mode the
 //! controller halves it, so data transfers run at 12 MHz.
 //!
@@ -14,10 +15,18 @@
 //! it is a GPIO output held high (the card's DAT3 pull-up) and the bus runs
 //! 1-bit on D0 only (no ACMD6, CTYPE stays 0).
 //!
-//! Read-only by construction: `cmd_data`, the only writer of the command
-//! register, refuses every command index outside
+//! eMMC (SMHC2, `new_smhc2`): the controller side of
+//! `cubie_a7a_fastboot::emmc` (identification, EXT_CSD, partition access,
+//! bus width): PC0..PC16 function 3 except the SPI0 pins PC2/3/4/12, 1-bit
+//! then up to 8-bit, at the same 12 MHz legacy rate.
+//!
+//! Read-only by construction for SD: `cmd_data`, the only writer of the
+//! command register for reads, refuses every command index outside
 //! `cubie_a7a_fastboot::sd::ALLOWED` (identification and read commands;
 //! no write, erase, lock, switch or programming command), in every build.
+//! For the eMMC it applies `cubie_a7a_fastboot::emmc::command_allowed`
+//! (index and argument: CMD6 only to PARTITION_ACCESS and BUS_WIDTH); there
+//! is no block write path.
 
 use util::mmio::{read32, write32};
 
@@ -29,6 +38,12 @@ const GCTRL: usize = 0x00;
 const CLKDIV: usize = 0x04;
 const TMOUT: usize = 0x08;
 const CTYPE: usize = 0x0c;
+#[cfg(any(feature = "emmc", feature = "fastboot"))]
+const HWRST: usize = 0x78;
+/// EMMC_DDR_SBIT_DET: HALF_START_BIT, set for eMMC 4.5 and later, clear
+/// for SD.
+#[cfg(any(feature = "emmc", feature = "fastboot"))]
+const EMMC_DDR_SBIT_DET: usize = 0x10c;
 const BLKSZ: usize = 0x10;
 const BYTECNT: usize = 0x14;
 const CMD: usize = 0x18;
@@ -125,7 +140,23 @@ pub struct Smhc {
     base: usize,
     rca: u32,
     high_capacity: bool,
+    /// SMHC2 with an eMMC: the eMMC allow-list applies.
+    #[cfg(any(feature = "emmc", feature = "fastboot"))]
+    emmc: bool,
+    /// The eMMC module detect (GPADC0) is consulted.
+    #[cfg(any(feature = "emmc", feature = "fastboot"))]
+    detect: bool,
 }
+
+/// The eMMC write commands exist in this build (none yet).
+#[cfg(any(feature = "emmc", feature = "fastboot"))]
+const EMMC_WRITE: bool = false;
+
+/// SDC2 pins on port C, function 3 (SoC pinout): DS PC0, RST PC1, CLK PC5,
+/// CMD PC6, D0 PC10, D1 PC13, D2 PC15, D3 PC8, D4 PC9, D5 PC11, D6 PC14,
+/// D7 PC16. PC2/3/4/12 are SPI0 (the NOR), PC7 the EEPROM write protect.
+#[cfg(any(feature = "emmc", feature = "fastboot"))]
+const SDC2_PINS: [u32; 12] = [0, 1, 5, 6, 8, 9, 10, 11, 13, 14, 15, 16];
 
 impl Smhc {
     /// Clock, reset and pin setup for SMHC0 on PF0..PF3 and PF5; PF4 (D3)
@@ -153,7 +184,47 @@ impl Smhc {
             base,
             rca: 0,
             high_capacity: false,
+            #[cfg(any(feature = "emmc", feature = "fastboot"))]
+            emmc: false,
+            #[cfg(any(feature = "emmc", feature = "fastboot"))]
+            detect: false,
         }
+    }
+
+    /// Clock, reset and pin setup for SMHC2 and the eMMC module (VCC-PC,
+    /// 1.8 V, CLDO5; the module's VCC is SWOUT2, on from power-up and
+    /// switched on again by `axp` as dc1sw2). `detect`: consult the
+    /// module detect (BOOT-SEL on GPADC0) before identification; the eMMC
+    /// boot leaves it off (the mask ROM just loaded bt0 from the module).
+    #[cfg(any(feature = "emmc", feature = "fastboot"))]
+    pub fn new_smhc2(base: usize, detect: bool) -> Self {
+        for pin in SDC2_PINS {
+            // CLK unpulled; DS (unused below HS400) pulled down; CMD, data
+            // and RST pulled up.
+            let pull = match pin {
+                5 => Pull::None,
+                0 => Pull::Down,
+                _ => Pull::Up,
+            };
+            gpio::set_pull(Port::C, pin, pull);
+            gpio::set_drive(Port::C, pin, if pin == 5 { 3 } else { 2 });
+            gpio::set_function(Port::C, pin, 3);
+        }
+        // Module clock: gate on, source OSC24M, N = M = 1 (12 MHz card
+        // clock in new timing mode, as SMHC0).
+        write32(ccu::SMHC2_CLK, 1 << 31);
+        ccu::bus_enable(ccu::SMHC2_BGR).unwrap_or_else(|error| crate::clock_failure(error));
+        let s = Self {
+            base,
+            rca: 0,
+            high_capacity: false,
+            emmc: true,
+            detect,
+        };
+        // RST_n high (the card ignores it unless RST_n_FUNCTION enables it;
+        // never set here).
+        s.w(HWRST, 1);
+        s
     }
 
     fn r(&self, off: usize) -> u32 {
@@ -215,7 +286,18 @@ impl Smhc {
         resp: Resp,
         data: Option<&mut [u32]>,
     ) -> Result<[u32; 4], Error> {
+        #[cfg(not(any(feature = "emmc", feature = "fastboot")))]
         if !cubie_a7a_fastboot::sd::command_allowed(idx) {
+            return Err(Error::Unsupported("SD command not allowed (read-only)"));
+        }
+        #[cfg(any(feature = "emmc", feature = "fastboot"))]
+        if self.emmc {
+            if !cubie_a7a_fastboot::emmc::command_allowed(idx, arg, EMMC_WRITE)
+                || matches!(idx, 24 | 25)
+            {
+                return Err(Error::Unsupported("eMMC command not allowed"));
+            }
+        } else if !cubie_a7a_fastboot::sd::command_allowed(idx) {
             return Err(Error::Unsupported("SD command not allowed (read-only)"));
         }
         let mut c = CMD_START | idx;
@@ -388,6 +470,85 @@ impl Smhc {
     }
 }
 
+/// The eMMC controller for cubie_a7a_fastboot::emmc (the eMMC boot path
+/// and fastboot's eMMC targets; the gate in `cmd_data` applies).
+#[cfg(any(feature = "emmc", feature = "fastboot"))]
+impl cubie_a7a_fastboot::emmc::MmcBus for Smhc {
+    fn present(&mut self) -> Option<bool> {
+        if !self.detect {
+            return None;
+        }
+        // BOOT-SEL-ADC: R1 10K to 1.8 V; an eMMC module grounds eMMC_PLUG
+        // through R216 3.9K (~505 mV, the mask ROM's EMMC_BOOT/EMMC_USER
+        // band 0x22c..0x57b); none: ~1800 mV (schematic sheets 2 and 9).
+        let mv = crate::gpadc::read_mv(0)?;
+        println!("[bt0] eMMC detect: BOOT-SEL (GPADC0) {mv} mV");
+        match mv {
+            200..=700 => Some(true),
+            1600.. => Some(false),
+            _ => None,
+        }
+    }
+
+    fn clock(&mut self, ident: bool) -> Result<(), cubie_a7a_fastboot::sd::BusError> {
+        let r = if ident {
+            self.reset_controller().and_then(|()| {
+                self.w(NTSR, self.r(NTSR) | NTSR_MODE_NEW);
+                self.w(TMOUT, 0xffff_ff40);
+                self.w(IMASK, 0);
+                self.w(RINT, 0xffff_ffff);
+                self.w(CTYPE, 0);
+                self.w(EMMC_DDR_SBIT_DET, 1);
+                self.set_card_clock(30)
+            })
+        } else {
+            self.set_card_clock(0)
+        };
+        udelay(1000);
+        r.map_err(|_| cubie_a7a_fastboot::sd::BusError::Error)
+    }
+
+    fn set_width(&mut self, width: u32) -> Result<(), cubie_a7a_fastboot::sd::BusError> {
+        let v = match width {
+            1 => 0,
+            4 => 1,
+            8 => 2,
+            _ => return Err(cubie_a7a_fastboot::sd::BusError::Error),
+        };
+        self.w(CTYPE, v);
+        Ok(())
+    }
+
+    fn cmd(
+        &mut self,
+        idx: u32,
+        arg: u32,
+        resp: cubie_a7a_fastboot::sd::Resp,
+    ) -> Result<[u32; 4], cubie_a7a_fastboot::sd::BusError> {
+        self.cmd_data(idx, arg, map_resp(resp), None)
+            .map_err(bus_error)
+    }
+
+    fn read(
+        &mut self,
+        idx: u32,
+        arg: u32,
+        buf: &mut [u32],
+    ) -> Result<(), cubie_a7a_fastboot::sd::BusError> {
+        self.cmd_data(idx, arg, Resp::R1, Some(buf))
+            .map(|_| ())
+            .map_err(bus_error)
+    }
+
+    fn delay_ms(&mut self, ms: u32) {
+        udelay(ms as u64 * 1000);
+    }
+
+    fn kick(&mut self) {
+        crate::recovery::kick();
+    }
+}
+
 /// The controller for fastboot's `fetch:sd` (cubie_a7a_fastboot::sd runs
 /// identification and reads over it; the same gate in `cmd_data` applies).
 #[cfg(feature = "fastboot")]
@@ -446,7 +607,7 @@ impl cubie_a7a_fastboot::sd::SdBus for Smhc {
 #[cfg(feature = "fastboot")]
 const SD_CD_PIN: u32 = 6;
 
-#[cfg(feature = "fastboot")]
+#[cfg(any(feature = "emmc", feature = "fastboot"))]
 fn map_resp(r: cubie_a7a_fastboot::sd::Resp) -> Resp {
     use cubie_a7a_fastboot::sd::Resp as R;
     match r {
@@ -460,7 +621,7 @@ fn map_resp(r: cubie_a7a_fastboot::sd::Resp) -> Resp {
     }
 }
 
-#[cfg(feature = "fastboot")]
+#[cfg(any(feature = "emmc", feature = "fastboot"))]
 fn bus_error(e: Error) -> cubie_a7a_fastboot::sd::BusError {
     use cubie_a7a_fastboot::sd::BusError;
     match e {

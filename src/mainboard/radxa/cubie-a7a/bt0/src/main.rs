@@ -9,17 +9,25 @@
 //! With feature `fel` the same bring-up runs from the mask ROM's USB FEL
 //! mode instead, and the host supplies what the SD card would (fel.rs).
 //! With feature `spinor` the mask ROM loads it from the SPI NOR, and bt0
-//! reads the layout table and the images from there (spinor.rs). Feature
+//! reads the layout table and the images from there (spinor.rs). With
+//! feature `emmc` the mask ROM loads it from the eMMC module (SMHC2), and
+//! bt0 reads the layout table and the images from the eMMC's user area at
+//! the SD card's offsets (smhc.rs, cubie_a7a_fastboot::emmc). Feature
 //! `fastboot` (with `fel`) adds FEL entry 4: bt0 serves the stock fastboot
 //! tool on the USB-C port (fastboot.rs, musb.rs).
 #![no_std]
 #![no_main]
 #![cfg_attr(feature = "dramlib", feature(c_variadic))]
 // The FEL and SPI NOR builds have no SD boot path; its helpers stay compiled.
-#![cfg_attr(any(feature = "fel", feature = "spinor"), allow(dead_code))]
+#![cfg_attr(
+    any(feature = "fel", feature = "spinor", feature = "emmc"),
+    allow(dead_code)
+)]
 
 #[cfg(all(feature = "fel", feature = "spinor"))]
 compile_error!("features `fel` and `spinor` exclude each other");
+#[cfg(all(feature = "emmc", any(feature = "fel", feature = "spinor")))]
+compile_error!("feature `emmc` excludes `fel` and `spinor`");
 
 #[macro_use]
 extern crate log;
@@ -458,7 +466,7 @@ fn bring_up() -> Bringup {
     dram::report_previous_trace();
     // The vendor recovery reads the SD card and replaces bt0 at 0x47000,
     // the FEL code's memory; the FEL boot starts its attempt in entry 2.
-    #[cfg(not(any(feature = "fel", feature = "spinor")))]
+    #[cfg(not(any(feature = "fel", feature = "spinor", feature = "emmc")))]
     {
         if recovery::previous_boot_failed() {
             println!("[bt0] the previous boot never reached EDK2's boot manager");
@@ -473,9 +481,9 @@ fn bring_up() -> Bringup {
         }
         recovery::begin_attempt();
     }
-    // No vendor SPL on the NOR (and the SD slot of the board under test is
-    // dead): report the failed attempt and try oreboot again.
-    #[cfg(feature = "spinor")]
+    // No vendor SPL on the NOR or the eMMC (and the SD slot of the board
+    // under test is dead): report the failed attempt and try oreboot again.
+    #[cfg(any(feature = "spinor", feature = "emmc"))]
     {
         if recovery::previous_boot_failed() {
             println!("[bt0] the previous boot never reached EDK2's boot manager; trying again");
@@ -597,7 +605,7 @@ fn enter_main(b: &Bringup, mut handoff: Handoff, main_entry: u32) -> ! {
     rmr_switch(main_entry)
 }
 
-#[cfg(not(any(feature = "fel", feature = "spinor")))]
+#[cfg(not(any(feature = "fel", feature = "spinor", feature = "emmc")))]
 #[unsafe(no_mangle)]
 extern "C" fn main() -> ! {
     let b = bring_up();
@@ -686,6 +694,103 @@ extern "C" fn main() -> ! {
         }
         println!(
             "[bt0] loaded kind {} ({} KiB) from SPI NOR to 0x{addr:08x} in {ms} ms{}",
+            e.kind,
+            e.size / 1024,
+            if e.crc32 != 0 { ", CRC ok" } else { "" }
+        );
+        if let Some(entry) = place(&mut handoff, e, addr) {
+            main_entry = Some(entry);
+        }
+    }) {
+        println!("[bt0] invalid boot layout: {error:?}");
+        halt();
+    }
+    let Some(main_entry) = main_entry else {
+        println!("[bt0] layout: no oreboot main image");
+        halt();
+    };
+    enter_main(&b, handoff, main_entry)
+}
+
+/// eMMC boot: the SD path with the eMMC module (SMHC2) as the medium. The
+/// mask ROM loaded bt0 from the eMMC (user area at 128 KiB, or a boot
+/// partition); the layout table and the images are always read from the
+/// user area at the SD card's offsets (firmware gap 128 KiB..8 MiB).
+#[cfg(feature = "emmc")]
+#[unsafe(no_mangle)]
+extern "C" fn main() -> ! {
+    use cubie_a7a_fastboot::emmc::{Card, WORDS};
+    use cubie_a7a_fastboot::emmcarm::Part;
+    // eGON boot_media byte, written by the mask ROM into the copy it ran
+    // (sunxi: 0x02 SMHC2 at 8 KiB or a boot partition, 0x12 at 128 KiB).
+    let media = unsafe { core::ptr::read_volatile((SRAM_BASE as usize + 0x28) as *const u8) };
+    let b = bring_up();
+    println!("[bt0] boot media byte from the mask ROM: {media:#04x}");
+    if let Some(mv) = gpadc::read_mv(0) {
+        println!("[bt0] BOOT-SEL (GPADC0): {mv} mV");
+    }
+
+    let mut host = smhc::Smhc::new_smhc2(soc::SMHC2_BASE, false);
+    let mut ext = [0u32; WORDS];
+    let t0 = soc::time_us();
+    let mut card = match Card::identify(&mut host, &mut ext, 8, false) {
+        Ok(c) => c,
+        Err(e) => {
+            println!("[bt0] eMMC init failed: {e:?}");
+            halt();
+        }
+    };
+    let f = card.fields;
+    println!(
+        "[bt0] eMMC: CID {:08x}, {} MiB, boot partitions 2 x {} KiB, EXT_CSD rev {}, PARTITION_CONFIG {:#04x}, {}-bit, {} ms",
+        card.cid[0],
+        card.user_blocks >> 11,
+        card.boot_blocks / 2,
+        f.rev,
+        f.part_config,
+        card.width,
+        (soc::time_us() - t0) / 1000
+    );
+    soc::stage(8);
+
+    let mut frame = [0u32; WORDS];
+    if let Err(e) = card.read(
+        &mut host,
+        Part::User,
+        (layout::TABLE_OFFSET / 512) as u64,
+        &mut frame,
+    ) {
+        println!("[bt0] eMMC: reading layout table failed: {e:?}");
+        halt();
+    }
+    let bytes =
+        unsafe { core::slice::from_raw_parts(frame.as_ptr().cast::<u8>(), smhc::BLOCK_SIZE) };
+    let table = match layout::decode(bytes) {
+        Ok(table) => table,
+        Err(error) => {
+            println!("[bt0] invalid boot layout frame: {error:?}");
+            halt();
+        }
+    };
+
+    let mut handoff = handoff(&b);
+    let mut main_entry = None;
+    if let Err(error) = layout::load_entries(&table, b.dram_end as u64, |e, addr, padded| {
+        let t0 = soc::time_us();
+        // SAFETY: whole-table preflight checked bounds, alignment and disjoint loads.
+        let dst = unsafe { core::slice::from_raw_parts_mut(addr as *mut u32, padded / 4) };
+        if let Err(err) = card.read(&mut host, Part::User, (e.offset / 512) as u64, dst) {
+            println!("[bt0] eMMC: read of kind {} failed: {err:?}", e.kind);
+            halt();
+        }
+        let ms = (soc::time_us() - t0) / 1000;
+        let data = unsafe { core::slice::from_raw_parts(addr as *const u8, e.size as usize) };
+        if e.crc32 != 0 && crc32(data) != e.crc32 {
+            println!("[bt0] kind {}: CRC mismatch", e.kind);
+            halt();
+        }
+        println!(
+            "[bt0] loaded kind {} ({} KiB) from eMMC to 0x{addr:08x} in {ms} ms{}",
             e.kind,
             e.size / 1024,
             if e.crc32 != 0 { ", CRC ok" } else { "" }

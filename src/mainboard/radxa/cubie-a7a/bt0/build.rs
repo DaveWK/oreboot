@@ -39,6 +39,7 @@ const DRAM_EXT: &str = "
         *(.text.*18cubie_a7a_fastboot3gpt*)
         *(.text.*18cubie_a7a_fastboot7usbhost*)
         *(.text.*18cubie_a7a_fastboot2sd*)
+        *(.text.*18cubie_a7a_fastboot4emmc*)
         . = ALIGN(4);
         _dram_end = .;
     } > DRAMX
@@ -50,6 +51,7 @@ const DRAM_EXT: &str = "
         *(.ARM.exidx.text.*18cubie_a7a_fastboot3gpt*)
         *(.ARM.exidx.text.*18cubie_a7a_fastboot7usbhost*)
         *(.ARM.exidx.text.*18cubie_a7a_fastboot2sd*)
+        *(.ARM.exidx.text.*18cubie_a7a_fastboot4emmc*)
     }
 ";
 

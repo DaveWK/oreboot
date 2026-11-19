@@ -13,8 +13,11 @@
 //! - [`usb`]: chapter 9 descriptors and requests of the fastboot function;
 //! - read-only dumps (`fetch`): [`fetch`] (targets and ranges), [`sd`]
 //!   (SD identification and reads), [`msc`] (Bulk-Only/SCSI reads),
-//!   [`usbhost`] (enumeration requests), [`gpt`] (partitions), each with
-//!   its command allow-list.
+//!   [`usbhost`] (enumeration requests), [`gpt`] (partitions), [`emmc`]
+//!   (the eMMC module: identification, EXT_CSD, partitions), each with
+//!   its command allow-list;
+//! - eMMC writes (`fastboot-emmc-write` builds): [`emmcarm`] (targets and
+//!   arming) and the guarded writer in [`emmc`].
 //!
 //! The structure follows the shared `fastboot` crate of the SpacemiT K1 bt0
 //! (kept outside this tree:
@@ -29,6 +32,8 @@ extern crate std;
 pub mod bootimg;
 pub mod bundle;
 pub mod egon;
+pub mod emmc;
+pub mod emmcarm;
 pub mod fetch;
 pub mod gpt;
 pub mod msc;

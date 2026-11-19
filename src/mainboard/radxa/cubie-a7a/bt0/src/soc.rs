@@ -14,6 +14,9 @@ pub const WDT0_BASE: usize = 0x0205_0000;
 pub const SYSCTRL_BASE: usize = 0x0300_0000;
 pub const SID_BASE: usize = 0x0300_6000;
 pub const SMHC0_BASE: usize = 0x0402_0000;
+/// SMHC2: the eMMC/UFS module connector's eMMC (schematic sheet 9).
+#[cfg(any(feature = "emmc", feature = "fastboot"))]
+pub const SMHC2_BASE: usize = 0x0402_2000;
 pub const R_PRCM_BASE: usize = 0x0701_0000;
 pub const R_PIO_BASE: usize = 0x0702_5000;
 pub const RTC_BASE: usize = 0x0709_0000;

@@ -71,6 +71,9 @@ fel = ["cubie-a7a-dram/vendor-vdd2l"]
 # offsets. Same DRAM rails as the FEL boot that runs on the board; combine
 # with the DRAM backend (dramlib). Excludes `fel`.
 spinor = ["cubie-a7a-dram/vendor-vdd2l"]
+# Boot from the eMMC module (SMHC2): the mask ROM loads bt0 from the eMMC,
+# bt0 reads the layout table and images from its user area.
+emmc = ["cubie-a7a-dram/vendor-vdd2l"]
 # fastboot over FEL (src/fastboot.rs, src/musb.rs; scripts/fastboot-boot.sh
 # in radxa-a7a-workspace): FEL entry 4 at 0x9004c brings DRAM up (unless
 # entry 1 did), takes USB0 over from the mask ROM and serves the stock
