@@ -205,3 +205,344 @@ pub fn set_address_map<H: Hw>(hw: &mut H, p: &Para, ch: usize) -> Result<(), Err
     validate_address_map(p, ch)?;
     dwc_ddrctl::addrmap::set_address_map(hw, &MAP, ch, &geometry(p)).map_err(Error::Config)
 }
+
+/// HIF bit of ADDRMAP1's chip-select bit 0 field at value 0 (DesignWare
+/// DDRCTL: each ADDRMAP field holds its HIF bit minus the field's base).
+#[cfg(any(test, feature = "rank-map"))]
+const CS_BIT0_BASE: u32 = 6;
+
+/// Where the address map puts the ranks in the system address space: the
+/// stages that reach the DRAM through the controller (write training, the
+/// memory tests) see a rank only at the addresses that select it.
+///
+/// One HIF word is one 16-bit word of one channel; the two channels make
+/// one 32-bit system word, so HIF bit n is bit n + 2 of the DRAM offset
+/// (system address minus the DRAM base), n + 1 with one half-width channel.
+///
+/// - Binary densities: the rank bit is the top HIF bit. CXMT 4 GB: offset
+///   bit 31, rank 1 at 0xc0000000-0x13fffffff.
+/// - Non-binary densities: the vendor map puts the two top row bits above
+///   the rank bit, so that the invalid quarter (both top row bits set) is
+///   the top of the address space and the usable part is contiguous (the
+///   6 GB board runs Linux on 6144 contiguous MiB with this map). CXMT
+///   6 GB: offset bit 30, the ranks alternate every GiB and rank 1 starts
+///   at 0x80000000.
+///
+/// Derived from the map's encodings (the unit tests check that the field
+/// bases give a dense layout for every parameter set); not yet measured on
+/// a board.
+///
+/// Feature `rank-map` (and the unit tests): images without it are built
+/// from exactly the code they had before.
+#[cfg(any(test, feature = "rank-map"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RankMap {
+    /// Bit of the DRAM offset that selects the rank; `None` with one rank.
+    pub rank_bit: Option<u32>,
+    /// Usable size in bytes (from [`crate::size::boot_size_mib`]).
+    pub size: u64,
+}
+
+#[cfg(any(test, feature = "rank-map"))]
+impl RankMap {
+    /// From the ADDRMAP1 write of the shared writer for `p`'s geometry;
+    /// `size` is the usable size in bytes (the caller's
+    /// [`crate::size::boot_size_mib`]).
+    pub fn of(p: &Para, size: u64) -> Result<Self, Error> {
+        use dwc_ddrctl::addrmap::{address_map, Target};
+        let w = address_map(&geometry(p)).map_err(Error::Config)?;
+        let mut cs = 0x3f;
+        for &(t, v) in w.as_slice() {
+            if t == Target::AddrMap(1) {
+                cs = v & 0x3f;
+            }
+        }
+        // As size::checked_size_mib: a 32-bit system word unless a single
+        // half-width channel is populated.
+        let half_width = p.para2() & 0xf != 0;
+        let shift = if !half_width || p.channels() == 2 {
+            2
+        } else {
+            1
+        };
+        Ok(Self {
+            rank_bit: Self::bit_from_addrmap1(cs, shift),
+            size,
+        })
+    }
+
+    /// The DRAM offset bit that selects the rank, from an ADDRMAP1 value
+    /// (as written, or read back from a controller): `None` when the
+    /// chip-select field is unused (one rank). `shift` is 2 for a 32-bit
+    /// system word (two 16-bit channels), 1 for one half-width channel.
+    pub const fn bit_from_addrmap1(addrmap1: u32, shift: u32) -> Option<u32> {
+        let cs = addrmap1 & 0x3f;
+        if cs == 0x3f {
+            None
+        } else {
+            Some(cs + CS_BIT0_BASE + shift)
+        }
+    }
+
+    /// The rank that DRAM offset `off` selects.
+    pub fn rank(&self, off: u64) -> u32 {
+        match self.rank_bit {
+            Some(b) => ((off >> b) & 1) as u32,
+            None => 0,
+        }
+    }
+
+    /// The lowest block of `rank`: its DRAM offset and length, or `None`
+    /// when the rank is not fitted or lies above the usable size.
+    pub fn first_block(&self, rank: u32) -> Option<(u64, u64)> {
+        let (start, len) = match (self.rank_bit, rank) {
+            (None, 0) => (0, self.size),
+            (Some(b), 0 | 1) => ((rank as u64) << b, 1u64 << b),
+            _ => return None,
+        };
+        if start >= self.size {
+            return None;
+        }
+        Some((start, len.min(self.size - start)))
+    }
+
+    /// Bytes of `rank` below DRAM offset `limit` (what a 32-bit stage
+    /// reaches with `limit` = 4 GiB minus the DRAM base).
+    pub fn reach(&self, rank: u32, limit: u64) -> u64 {
+        let end = limit.min(self.size);
+        let Some(b) = self.rank_bit else {
+            return if rank == 0 { end } else { 0 };
+        };
+        if rank > 1 {
+            return 0;
+        }
+        let block = 1u64 << b;
+        let mut n = 0;
+        let mut at = (rank as u64) << b;
+        while at < end {
+            n += block.min(end - at);
+            at += 2 * block;
+        }
+        n
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    extern crate std;
+    use super::*;
+    use crate::sets::{CXMT_4G, CXMT_6G, HYNIX_4G, PARAM_SETS};
+    use dwc_ddrctl::addrmap::{address_map, Target};
+    use std::collections::BTreeMap;
+    use std::vec::Vec;
+
+    const GIB: u64 = 1 << 30;
+
+    fn set(i: usize) -> Para {
+        Para::from_sysconfig(&PARAM_SETS[i].para)
+    }
+
+    fn rank_map(p: &Para) -> RankMap {
+        let mib = crate::size::boot_size_mib(p).unwrap();
+        RankMap::of(p, (mib as u64) << 20).unwrap()
+    }
+
+    /// The final ADDRMAPn values for `p`.
+    fn addrmaps(p: &Para) -> BTreeMap<usize, u32> {
+        let mut m = BTreeMap::new();
+        for &(t, v) in address_map(&geometry(p)).unwrap().as_slice() {
+            if let Target::AddrMap(n) = t {
+                m.insert(n, v);
+            }
+        }
+        m
+    }
+
+    /// (name, HIF bit) of every mapped address bit, from the ADDRMAP
+    /// fields: register, shift, width, base (DesignWare DDRCTL layout; an
+    /// all-ones field is unused). Column bits 0..2 are fixed at HIF 0..2.
+    fn hif_bits(p: &Para) -> Vec<(std::string::String, u32)> {
+        const FIELDS: [(&str, usize, u32, u32, u32); 30] = [
+            ("cs0", 1, 0, 6, 6),
+            ("ba0", 3, 0, 6, 3),
+            ("ba1", 3, 8, 6, 4),
+            ("ba2", 3, 16, 6, 5),
+            ("bg0", 4, 0, 6, 3),
+            ("bg1", 4, 8, 6, 4),
+            ("col7", 5, 0, 5, 7),
+            ("col8", 5, 8, 5, 8),
+            ("col9", 5, 16, 5, 9),
+            ("col10", 5, 24, 5, 10),
+            ("col3", 6, 0, 4, 3),
+            ("col4", 6, 8, 4, 4),
+            ("col5", 6, 16, 4, 5),
+            ("col6", 6, 24, 4, 6),
+            ("row14", 7, 0, 5, 20),
+            ("row15", 7, 8, 5, 21),
+            ("row16", 7, 16, 5, 22),
+            ("row17", 7, 24, 5, 23),
+            ("row10", 8, 0, 5, 16),
+            ("row11", 8, 8, 5, 17),
+            ("row12", 8, 16, 5, 18),
+            ("row13", 8, 24, 5, 19),
+            ("row6", 9, 0, 5, 12),
+            ("row7", 9, 8, 5, 13),
+            ("row8", 9, 16, 5, 14),
+            ("row9", 9, 24, 5, 15),
+            ("row2", 10, 0, 5, 8),
+            ("row3", 10, 8, 5, 9),
+            ("row4", 10, 16, 5, 10),
+            ("row5", 10, 24, 5, 11),
+        ];
+        let m = addrmaps(p);
+        let mut out: Vec<(std::string::String, u32)> =
+            (0..3).map(|c| (std::format!("col{c}"), c)).collect();
+        let mut field = |name: &str, reg: usize, shift: u32, width: u32, base: u32| {
+            let mask = (1u32 << width) - 1;
+            let v = (m[&reg] >> shift) & mask;
+            if v != mask {
+                out.push((name.into(), v + base));
+            }
+        };
+        for (name, reg, shift, width, base) in FIELDS {
+            field(name, reg, shift, width, base);
+        }
+        field("row0", 11, 0, 5, 6);
+        field("row1", 11, 8, 5, 7);
+        out
+    }
+
+    #[test]
+    fn every_sets_address_map_is_a_dense_hif_layout() {
+        // Checks the field bases used here and in RankMap: with a wrong
+        // base two address bits would share a HIF bit or leave a gap.
+        for (i, s) in PARAM_SETS.iter().enumerate() {
+            let p = set(i);
+            let bits = hif_bits(&p);
+            let want =
+                p.col_bits() + p.bg_bits() + p.bank_bits() + p.row_bits() + p.dual_rank() as u32;
+            assert_eq!(bits.len() as u32, want, "{}: {bits:?}", s.name);
+            let mut hif: Vec<u32> = bits.iter().map(|b| b.1).collect();
+            hif.sort_unstable();
+            assert_eq!(hif, (0..want).collect::<Vec<_>>(), "{}: {bits:?}", s.name);
+        }
+    }
+
+    #[test]
+    fn cxmt_4gb_address_map_and_ranks() {
+        let p = set(CXMT_4G);
+        let m = addrmaps(&p);
+        assert_eq!(
+            (m[&1], m[&3], m[&4], m[&5], m[&6], m[&7]),
+            (
+                0x3f17,
+                0x003f_0909,
+                0x0101,
+                0x1f02_0202,
+                0x0202_0200,
+                0x1f1f_1f08
+            )
+        );
+        assert!(!m.contains_key(&12));
+        let r = rank_map(&p);
+        assert_eq!(
+            r,
+            RankMap {
+                rank_bit: Some(31),
+                size: 4 * GIB
+            }
+        );
+        assert_eq!((r.rank(0), r.rank(2 * GIB - 4), r.rank(2 * GIB)), (0, 0, 1));
+        // System addresses: rank 0 0x40000000-0xbfffffff, rank 1 from
+        // 0xc0000000; a 32-bit stage reaches all of rank 0 and half of
+        // rank 1.
+        assert_eq!(r.first_block(0), Some((0, 2 * GIB)));
+        assert_eq!(r.first_block(1), Some((2 * GIB, 2 * GIB)));
+        assert_eq!(RankMap::bit_from_addrmap1(m[&1], 2), Some(31));
+        assert_eq!(RankMap::bit_from_addrmap1(0x3f3f, 2), None);
+        assert_eq!((r.reach(0, 3 * GIB), r.reach(1, 3 * GIB)), (2 * GIB, GIB));
+        // The window bt0 tests today (to 0xbfffffff) has none of rank 1.
+        assert_eq!(r.reach(1, 2 * GIB), 0);
+    }
+
+    #[test]
+    fn cxmt_6gb_address_map_and_ranks() {
+        let p = set(CXMT_6G);
+        let m = addrmaps(&p);
+        // Against the 4 GB map: ADDRMAP7 (row 14 and 15 one HIF bit up),
+        // ADDRMAP1 (the rank bit below them) and ADDRMAP12 (non-binary
+        // density) differ; nothing else.
+        assert_eq!(
+            (m[&1], m[&3], m[&4], m[&5], m[&6], m[&7], m[&12]),
+            (
+                0x3f16,
+                0x003f_0909,
+                0x0101,
+                0x1f02_0202,
+                0x0202_0200,
+                0x1f1f_0909,
+                3
+            )
+        );
+        let m4 = addrmaps(&set(CXMT_4G));
+        for n in [3, 4, 5, 6, 8, 9, 10, 11] {
+            assert_eq!(m[&n], m4[&n], "ADDRMAP{n}");
+        }
+        // Rows 0..13 at HIF 14..27, the rank at 28, rows 14 and 15 at 29
+        // and 30.
+        let bits = hif_bits(&p);
+        let at = |n: &str| bits.iter().find(|b| b.0 == n).unwrap().1;
+        assert_eq!(
+            (at("row13"), at("cs0"), at("row14"), at("row15")),
+            (27, 28, 29, 30)
+        );
+
+        let r = rank_map(&p);
+        assert_eq!(
+            r,
+            RankMap {
+                rank_bit: Some(30),
+                size: 6 * GIB
+            }
+        );
+        // The ranks alternate every GiB: system 0x40000000 rank 0,
+        // 0x80000000 rank 1, 0xc0000000 rank 0, 0x100000000 rank 1, ...
+        for g in 0..6 {
+            assert_eq!(r.rank(g * GIB), (g & 1) as u32);
+            assert_eq!(r.rank(g * GIB + GIB - 4), (g & 1) as u32);
+        }
+        assert_eq!(r.first_block(0), Some((0, GIB)));
+        assert_eq!(r.first_block(1), Some((GIB, GIB)));
+        assert_eq!(RankMap::bit_from_addrmap1(m[&1], 2), Some(30));
+        // 3 GiB per rank; a 32-bit stage reaches 2 GiB of rank 0 and 1 GiB
+        // of rank 1, and the window bt0 tests today (to 0xbfffffff) already
+        // holds 1 GiB of each.
+        assert_eq!(
+            (r.reach(0, 8 * GIB), r.reach(1, 8 * GIB)),
+            (3 * GIB, 3 * GIB)
+        );
+        assert_eq!((r.reach(0, 3 * GIB), r.reach(1, 3 * GIB)), (2 * GIB, GIB));
+        assert_eq!((r.reach(0, 2 * GIB), r.reach(1, 2 * GIB)), (GIB, GIB));
+        // The invalid quarter (rows 14 and 15 both set) is exactly the
+        // offsets from 6 GiB up: the usable 6144 MiB are contiguous.
+        let invalid = (1u64 << (at("row14") + 2)) | (1u64 << (at("row15") + 2));
+        assert_eq!(invalid, 6 * GIB);
+        assert_eq!(1u64 << (bits.len() as u32 + 2), 8 * GIB);
+    }
+
+    #[test]
+    fn one_rank_has_no_rank_bit() {
+        let r = rank_map(&set(HYNIX_4G));
+        assert_eq!(
+            r,
+            RankMap {
+                rank_bit: None,
+                size: 4 * GIB
+            }
+        );
+        assert_eq!(r.rank(3 * GIB), 0);
+        assert_eq!(r.first_block(0), Some((0, 4 * GIB)));
+        assert_eq!(r.first_block(1), None);
+        assert_eq!((r.reach(0, 3 * GIB), r.reach(1, 3 * GIB)), (3 * GIB, 0));
+    }
+}
