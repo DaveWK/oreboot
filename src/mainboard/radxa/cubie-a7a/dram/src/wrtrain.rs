@@ -410,6 +410,181 @@ pub fn blind_center<P: WritePort>(
     Ok((v, run, left))
 }
 
+/// A staged TxDqDly write ledger. Delay writes land in PHY CSRs at once but
+/// take effect only when the controller applies them, so a stage tracks what
+/// it wrote and applies on the next compare.
+///
+/// Fail-closed: [`apply`](Ledger::apply) clears the pending flag only after
+/// the apply succeeds. A failed apply therefore never looks applied; the
+/// caller must fail the stage and undo the delays.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Ledger {
+    pending: bool,
+}
+
+impl Ledger {
+    pub const fn new() -> Self {
+        Self { pending: false }
+    }
+
+    /// A TxDqDly write was made since the last successful apply.
+    pub fn wrote(&mut self) {
+        self.pending = true;
+    }
+
+    /// Whether writes are waiting for an apply.
+    pub const fn pending(&self) -> bool {
+        self.pending
+    }
+
+    /// Apply the pending writes, if any. The pending flag clears only on
+    /// success, so an error leaves it set.
+    pub fn apply<E>(&mut self, apply: &mut impl FnMut() -> Result<(), E>) -> Result<(), E> {
+        if !self.pending {
+            return Ok(());
+        }
+        apply()?;
+        self.pending = false;
+        Ok(())
+    }
+}
+
+/// Every TxDqDly of both timing groups, so a failed stage can put the write
+/// path back the way it found it.
+pub type Snapshot = [Delays; 2];
+
+/// Read every TxDqDly into a [`Snapshot`].
+pub fn snapshot<P: WritePort>(p: &mut P) -> Result<Snapshot, P::Error> {
+    let mut s = [[[0u16; LANES]; DBYTES]; 2];
+    for (tg, d) in s.iter_mut().enumerate() {
+        for (db, lanes) in d.iter_mut().enumerate() {
+            for (lane, v) in lanes.iter_mut().enumerate() {
+                *v = p.tx_dq(db, lane, tg)?;
+            }
+        }
+    }
+    Ok(s)
+}
+
+/// Put a [`Snapshot`] back on every lane, best effort: a failure to restore
+/// does not mask the failure being handled. The caller halts either way.
+pub fn restore<P: WritePort>(p: &mut P, before: &Snapshot) {
+    for (tg, d) in before.iter().enumerate() {
+        for (db, lanes) in d.iter().enumerate() {
+            for (lane, &v) in lanes.iter().enumerate() {
+                let _ = p.set_tx_dq(db, lane, tg, v);
+            }
+        }
+    }
+}
+
+/// Four compares of every probe block with fresh seeds. `Ok(mask)` has a set
+/// bit for every failing block (`Ok(0)`: clean). A compare error propagates:
+/// it must fail the stage, never be dropped as if the blocks were clean.
+pub fn final_check<P: WritePort>(p: &mut P, seed: &mut u32) -> Result<u32, P::Error> {
+    let mut bad = 0u32;
+    for _ in 0..4 {
+        *seed = seed.wrapping_add(0x9e37_79b9);
+        let f = p.check(*seed)?;
+        for (b, v) in f.iter().enumerate() {
+            if *v != 0 {
+                bad |= 1 << b;
+            }
+        }
+    }
+    Ok(bad)
+}
+
+/// A blind start ([`blind_baseline`], then optionally [`blind_center`]): the
+/// per-DBYTE delay it settled on and the data bits still failing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BlindStart {
+    pub delays: [u16; DBYTES],
+    pub error_bits: u32,
+}
+
+impl BlindStart {
+    /// True when the start writes and reads back cleanly (no error bits).
+    pub const fn clean(&self) -> bool {
+        self.error_bits == 0
+    }
+}
+
+/// The discovery after a blind start, classified fail-closed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Discovery<E> {
+    /// A usable map: the centring may follow.
+    Map(Map),
+    /// The blind start was clean but the discovery failed: keep the clean
+    /// blind start and run the final check, as before.
+    KeepBlind(WrError<E>),
+    /// The blind start left error bits and the discovery failed too: no
+    /// recovered state exists, so the stage must fail and undo the delays.
+    Failed(WrError<E>),
+}
+
+/// Measure and judge the map after a blind start.
+///
+/// An unclean blind start is not a base the discovery can recover from: its
+/// error bits mean the compare itself is not trustworthy, so a failed
+/// discovery is a hard stage failure. A clean blind start keeps the old
+/// behaviour (the map rules may refuse it, but the blind start is kept).
+pub fn discover_after_blind<P: WritePort>(
+    p: &mut P,
+    seed: &mut u32,
+    start: &BlindStart,
+) -> Discovery<P::Error> {
+    let m = match measure(p, seed) {
+        Ok(m) => m,
+        Err(e) => {
+            return if start.clean() {
+                Discovery::KeepBlind(e)
+            } else {
+                Discovery::Failed(e)
+            };
+        }
+    };
+    match m.check() {
+        Ok(()) => Discovery::Map(m),
+        Err(e) => {
+            if start.clean() {
+                Discovery::KeepBlind(e)
+            } else {
+                Discovery::Failed(e)
+            }
+        }
+    }
+}
+
+/// The blind-start sequence with its fail-closed recovery.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlindRun<E> {
+    /// A usable map: the centring may follow.
+    Map(Map),
+    /// Keep the clean blind start and run the final check.
+    KeepBlind(WrError<E>),
+    /// Hard failure; `before` has been put back on every lane.
+    Failed(WrError<E>),
+}
+
+/// [`discover_after_blind`] with the delays of a hard failure undone, so the
+/// stage never leaves a failed blind start applied.
+pub fn discover_or_restore<P: WritePort>(
+    p: &mut P,
+    seed: &mut u32,
+    start: &BlindStart,
+    before: &Snapshot,
+) -> BlindRun<P::Error> {
+    match discover_after_blind(p, seed, start) {
+        Discovery::Map(m) => BlindRun::Map(m),
+        Discovery::KeepBlind(e) => BlindRun::KeepBlind(e),
+        Discovery::Failed(e) => {
+            restore(p, before);
+            BlindRun::Failed(e)
+        }
+    }
+}
+
 /// A sweep: every lane at `base[db][lane] + lo + step * i`, i < `n`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Sweep {
@@ -1563,6 +1738,141 @@ mod tests {
             self.0.borrow_mut().mrr(ch, rank, ma)
         }
         fn settle(&mut self) {}
+    }
+
+    /// A port whose compare fails from `at` on; records the delays it holds.
+    struct FailCheck {
+        dq: [[[u16; 2]; LANES]; DBYTES],
+        at: u32,
+        checks: u32,
+    }
+
+    impl WritePort for FailCheck {
+        type Error = ();
+        fn set_tx_dq(&mut self, db: usize, lane: usize, tg: usize, v: u16) -> Result<(), ()> {
+            self.dq[db][lane][tg] = v;
+            Ok(())
+        }
+        fn tx_dq(&mut self, db: usize, lane: usize, tg: usize) -> Result<u16, ()> {
+            Ok(self.dq[db][lane][tg])
+        }
+        fn check(&mut self, _seed: u32) -> Result<Folds, ()> {
+            self.checks += 1;
+            if self.at != 0 && self.checks >= self.at {
+                Err(())
+            } else {
+                Ok([0; BLOCKS])
+            }
+        }
+    }
+
+    #[test]
+    fn ledger_clears_only_after_a_successful_apply() {
+        let mut l = Ledger::new();
+        assert!(!l.pending());
+        l.wrote();
+        assert!(l.pending());
+        let mut calls = 0;
+        {
+            let mut failing = || -> Result<(), ()> {
+                calls += 1;
+                Err(())
+            };
+            assert!(l.apply(&mut failing).is_err());
+        }
+        assert!(l.pending(), "a failed apply must stay pending");
+        assert_eq!(calls, 1);
+        {
+            let mut working = || -> Result<(), ()> {
+                calls += 1;
+                Ok(())
+            };
+            l.apply(&mut working).unwrap();
+        }
+        assert!(!l.pending(), "a successful apply clears");
+        assert_eq!(calls, 2);
+        // Nothing pending: the closure is not called again.
+        {
+            let mut working = || -> Result<(), ()> {
+                calls += 1;
+                Ok(())
+            };
+            l.apply(&mut working).unwrap();
+        }
+        assert_eq!(calls, 2);
+    }
+
+    #[test]
+    fn final_check_propagates_a_compare_error() {
+        let mut p = FailCheck {
+            dq: [[[0; 2]; LANES]; DBYTES],
+            at: 2,
+            checks: 0,
+        };
+        let mut seed = 1;
+        assert!(
+            final_check(&mut p, &mut seed).is_err(),
+            "a compare error must propagate, not be dropped as clean"
+        );
+        assert_eq!(p.checks, 2, "the failing compare is the second of four");
+        let mut clean = FailCheck {
+            dq: [[[0; 2]; LANES]; DBYTES],
+            at: 0,
+            checks: 0,
+        };
+        assert_eq!(final_check(&mut clean, &mut seed).unwrap(), 0);
+        assert_eq!(clean.checks, 4);
+    }
+
+    #[test]
+    fn unclean_blind_start_then_failed_discovery_fails_closed() {
+        // Exactly the board sequence: the blind baseline leaves error bits,
+        // then the discovery fails its Baseline compare.
+        let mut s = Sim::new();
+        s.half = 0;
+        let before = snapshot(&mut s).unwrap();
+        let mut seed = 5;
+        let (v, left) = blind_baseline(&mut s, &mut seed).unwrap();
+        assert!(
+            left != 0,
+            "the injected start must leave error bits ({left})"
+        );
+        let start = BlindStart {
+            delays: v,
+            error_bits: left,
+        };
+        match discover_or_restore(&mut s, &mut seed, &start, &before) {
+            BlindRun::Failed(WrError::Baseline(_)) => {}
+            other => panic!("expected a hard failure, got {other:?}"),
+        }
+        // The failed sequence itself undid the delays it applied.
+        for tg in 0..2 {
+            for db in 0..DBYTES {
+                for lane in 0..LANES {
+                    assert_eq!(s.tx_dq(db, lane, tg).unwrap(), before[tg][db][lane]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn clean_blind_start_keeps_a_failed_discovery() {
+        // A clean blind start with a discovery that still fails keeps the
+        // old behaviour: the caller runs the final check on the blind start.
+        let mut p = FailCheck {
+            dq: [[[0; 2]; LANES]; DBYTES],
+            at: 1,
+            checks: 0,
+        };
+        let start = BlindStart {
+            delays: [0x20; DBYTES],
+            error_bits: 0,
+        };
+        let mut seed = 9;
+        assert!(matches!(
+            discover_after_blind(&mut p, &mut seed, &start),
+            Discovery::KeepBlind(_)
+        ));
     }
 }
 
