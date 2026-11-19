@@ -534,25 +534,23 @@ pub fn discover_after_blind<P: WritePort>(
     seed: &mut u32,
     start: &BlindStart,
 ) -> Discovery<P::Error> {
+    let classify = |e: WrError<P::Error>| {
+        // A port error is a hardware failure, not a refused map: it fails
+        // the stage whatever state the blind start left behind. A refused
+        // map from a clean blind start keeps the old behaviour.
+        if matches!(&e, WrError::Port(_)) || !start.clean() {
+            Discovery::Failed(e)
+        } else {
+            Discovery::KeepBlind(e)
+        }
+    };
     let m = match measure(p, seed) {
         Ok(m) => m,
-        Err(e) => {
-            return if start.clean() {
-                Discovery::KeepBlind(e)
-            } else {
-                Discovery::Failed(e)
-            };
-        }
+        Err(e) => return classify(e),
     };
     match m.check() {
         Ok(()) => Discovery::Map(m),
-        Err(e) => {
-            if start.clean() {
-                Discovery::KeepBlind(e)
-            } else {
-                Discovery::Failed(e)
-            }
-        }
+        Err(e) => classify(e),
     }
 }
 
@@ -1740,6 +1738,24 @@ mod tests {
         fn settle(&mut self) {}
     }
 
+    /// A port whose every compare reports one failing block (no hardware error).
+    struct AlwaysDirty;
+
+    impl WritePort for AlwaysDirty {
+        type Error = ();
+        fn set_tx_dq(&mut self, _: usize, _: usize, _: usize, _: u16) -> Result<(), ()> {
+            Ok(())
+        }
+        fn tx_dq(&mut self, _: usize, _: usize, _: usize) -> Result<u16, ()> {
+            Ok(0)
+        }
+        fn check(&mut self, _seed: u32) -> Result<Folds, ()> {
+            let mut f = [0u32; BLOCKS];
+            f[0] = 1;
+            Ok(f)
+        }
+    }
+
     /// A port whose compare fails from `at` on; records the delays it holds.
     struct FailCheck {
         dq: [[[u16; 2]; LANES]; DBYTES],
@@ -1856,9 +1872,9 @@ mod tests {
     }
 
     #[test]
-    fn clean_blind_start_keeps_a_failed_discovery() {
-        // A clean blind start with a discovery that still fails keeps the
-        // old behaviour: the caller runs the final check on the blind start.
+    fn a_port_error_during_discovery_fails_even_from_a_clean_blind_start() {
+        // An apply/compare error is a hardware failure, not a refused map:
+        // it must fail the stage even when the blind start was clean.
         let mut p = FailCheck {
             dq: [[[0; 2]; LANES]; DBYTES],
             at: 1,
@@ -1868,10 +1884,27 @@ mod tests {
             delays: [0x20; DBYTES],
             error_bits: 0,
         };
+        let mut seed = 3;
+        assert!(matches!(
+            discover_after_blind(&mut p, &mut seed, &start),
+            Discovery::Failed(WrError::Port(_))
+        ));
+    }
+
+    #[test]
+    fn clean_blind_start_keeps_a_failed_discovery() {
+        // A clean blind start with a discovery whose Baseline compare is
+        // dirty keeps the old behaviour: the caller runs the final check on
+        // the blind start.
+        let mut p = AlwaysDirty;
+        let start = BlindStart {
+            delays: [0x20; DBYTES],
+            error_bits: 0,
+        };
         let mut seed = 9;
         assert!(matches!(
             discover_after_blind(&mut p, &mut seed, &start),
-            Discovery::KeepBlind(_)
+            Discovery::KeepBlind(WrError::Baseline(_))
         ));
     }
 }
