@@ -111,7 +111,7 @@ impl WritePort for Port {
             DIRTY.store(false, core::sync::atomic::Ordering::Relaxed);
             cubie_a7a_dram::blobless::apply_delays(&mut self.0, DBYTES / 2)?;
         }
-        for &b in PROBE.iter() {
+        for &b in self::probe!().iter() {
             for a in (b..b + BLOCK_BYTES).step_by(4) {
                 // SAFETY: DRAM in mission mode; bt0 runs from SRAM and
                 // nothing else uses these blocks.
@@ -119,7 +119,7 @@ impl WritePort for Port {
             }
         }
         let mut f = [0u32; BLOCKS];
-        for (k, &b) in PROBE.iter().enumerate() {
+        for (k, &b) in self::probe!().iter().enumerate() {
             for a in (b..b + BLOCK_BYTES).step_by(4) {
                 // SAFETY: as above.
                 let got = unsafe { core::ptr::read_volatile(a as *const u32) };
@@ -399,4 +399,96 @@ fn final_check(p: &mut Port, seed: &mut u32) -> bool {
         "[dram] WR: final probe check: failing blocks {bad:04x}; DMI lane {DMI_LANE} set from its DBYTE's median"
     );
     bad == 0
+}
+
+/// The probe blocks of a compare: [`PROBE`] itself (the same tokens as
+/// before the feature existed, so images without it do not change), or
+/// with feature `wr-r1` the list of [`r1::blocks`]. Used by path
+/// (`self::probe!()`): a `use`d macro is in scope before its definition.
+#[cfg(not(feature = "wr-r1"))]
+macro_rules! probe_blocks {
+    () => {
+        PROBE
+    };
+}
+#[cfg(feature = "wr-r1")]
+macro_rules! probe_blocks {
+    () => {
+        r1::blocks()
+    };
+}
+use probe_blocks as probe;
+
+/// Feature `wr-r1` (the 6 GB board's preparation): the upper eight
+/// probe blocks go to 1 MiB above the start of rank 1's lowest block
+/// instead of [`PROBE`]'s 0xbf000000, so that the stage's compares (blind
+/// start, discovery, centring, the final check) cover both ranks. Where
+/// rank 1 lies comes from the address map the controller holds (ADDRMAP1
+/// of channel A read back; `cubie_a7a_dram::ctrl::RankMap`):
+///
+/// | part | rank bit | rank 1 from | upper blocks |
+/// |---|---|---|---|
+/// | CXMT 4 GB | DRAM offset bit 31 | 0xc0000000 | 0xc0100000 |
+/// | CXMT 6 GB (non-binary) | DRAM offset bit 30 | 0x80000000 | 0x80100000 |
+///
+/// Without the feature 0xbf000000 is rank 0 on the 4 GB part (timing
+/// group 1 is never written or read by this stage) and rank 1 on the 6 GB
+/// part. One rank, or a rank 1 that starts above 4 GiB: [`PROBE`] is kept
+/// and a line says so.
+#[cfg(feature = "wr-r1")]
+mod r1 {
+    use super::{Bt0Hw, BLOCKS, BLOCK_BYTES, PROBE};
+    use cubie_a7a_dram::RegIo;
+
+    /// [`PROBE`] with the upper eight blocks moved, once set.
+    static mut R1_PROBE: [usize; BLOCKS] = PROBE;
+    static mut R1_READY: bool = false;
+
+    /// Start of the upper eight probe blocks for a rank bit at DRAM offset
+    /// bit `rank_bit`: 1 MiB into rank 1's lowest block, if the blocks end
+    /// below 4 GiB.
+    const fn r1_base(rank_bit: u32) -> Option<usize> {
+        if rank_bit >= 32 {
+            return None;
+        }
+        let a = crate::mem::DRAM_BASE as u64 + (1u64 << rank_bit) + 0x10_0000;
+        if a + (PROBE[BLOCKS - 1] - PROBE[8]) as u64 + BLOCK_BYTES as u64 <= 1 << 32 {
+            Some(a as usize)
+        } else {
+            None
+        }
+    }
+    const _: () = assert!(matches!(r1_base(31), Some(0xc010_0000)));
+    const _: () = assert!(matches!(r1_base(30), Some(0x8010_0000)));
+    const _: () = assert!(r1_base(32).is_none() && r1_base(40).is_none());
+
+    /// The probe blocks of this run: the upper eight in rank 1.
+    pub fn blocks() -> &'static [usize; BLOCKS] {
+        // SAFETY: bt0 is single-threaded; the statics are only used here.
+        unsafe {
+            let b = &mut *core::ptr::addr_of_mut!(R1_PROBE);
+            if !core::ptr::read_volatile(core::ptr::addr_of!(R1_READY)) {
+                core::ptr::write_volatile(core::ptr::addr_of_mut!(R1_READY), true);
+                let am1 = Bt0Hw.read32(cubie_a7a_dram::ctrl::addrmap(0, 1));
+                let bit = cubie_a7a_dram::ctrl::RankMap::bit_from_addrmap1(am1, 2);
+                match bit.and_then(r1_base) {
+                    Some(base) => {
+                        for i in 8..BLOCKS {
+                            b[i] = base + (PROBE[i] - PROBE[8]);
+                        }
+                        println!(
+                            "[dram] WR: wr-r1: ADDRMAP1 {am1:#x}, rank bit {bit:?}: probe blocks 8..15 at {base:08x} (rank 1), not {:08x}",
+                            PROBE[8]
+                        );
+                    }
+                    None => {
+                        println!(
+                            "[dram] WR: wr-r1: ADDRMAP1 {am1:#x}, rank bit {bit:?}: no rank 1 below 4 GiB; probe blocks unchanged"
+                        );
+                    }
+                }
+            }
+            b
+        }
+    }
 }
