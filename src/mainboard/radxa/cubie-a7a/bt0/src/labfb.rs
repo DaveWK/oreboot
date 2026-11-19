@@ -9,15 +9,30 @@
 //! path ends in bt0's halt (or returns); either way the stack is reset and
 //! fastboot goes on (the pending `dram-run` gets its OKAY then). A second
 //! run in the same session is refused: retraining in a running session
-//! leaves the PHY read path broken, so every run starts
-//! from `fastboot reboot` (WDT0 reset back into FEL). A run that hangs ends
-//! in that same watchdog reset.
+//! leaves the PHY read path broken, so every run starts from a SoC reset.
+//!
+//! # Leaving a session
+//!
+//! `fastboot reboot` (and `reboot-bootloader`, and four failed USB
+//! sessions) end the session ([`leave`]). bt0 does not reset the SoC for
+//! it: on the board, WDT0 written by bt0 after a lab DRAM run never reset
+//! it (the soft reset register, the shortest interval, and the same after
+//! the clean-up of a return to FEL: four runs out of four, each ended by a
+//! power cycle), while the same registers written through the mask ROM's
+//! FEL have reset it after every DRAM run of the FEL flow. So the session
+//! ends in the ROM's FEL, entered afresh at its entry address
+//! (`fel::lab_enter_rom_fel`) with USB0 back in reset, and the host resets
+//! the SoC from there before the next run, as it does between FEL flow
+//! runs. The previous way out, the WDT0 writes from bt0, is kept as
+//! `A7A_LAB_EXIT=wdt` (build, or in a run's knobs) for comparison on the
+//! board. A run that hangs still ends in the 16 s watchdog bt0 armed for
+//! it.
 //!
 //! DRAM is the device under test, so nothing of the lab mode lives there:
 //! the fastboot buffer, the run log (everything bt0 prints from entry 4 on)
 //! and the knob text are in the mask ROM's FEL SRAM at 0x47000..0x77200,
-//! which the session never gives back (no return to FEL: `reboot-bootloader`
-//! is a reset too); lab op lists and their output use `lab.rs`'s SRAM
+//! which the session never gives back (no return into the FEL session that
+//! started it); lab op lists and their output use `lab.rs`'s SRAM
 //! (0xe0000..0xee000). Results:
 //!
 //! - `getvar lab-state | lab-knobs | lab-dram | lab-ops`;
@@ -221,12 +236,7 @@ fn serve(after_run: bool) -> ! {
         resumed = false;
         match proto::serve(&mut usb, &mut dev, buf) {
             Ok(Exit::Boot(())) => unreachable!(),
-            Ok(_) => {
-                println!("[lab] reboot: watchdog reset (back into FEL)");
-                musb::release();
-                cubie_a7a_common::uart::Uart::attach(crate::UART0_BASE).drain();
-                fel_style_reset()
-            }
+            Ok(_) => leave(BACK_ASKED),
             Err(e) => {
                 println!(
                     "[lab] USB session ended: {}; enumerating again",
@@ -235,8 +245,48 @@ fn serve(after_run: bool) -> ! {
             }
         }
     }
-    fel_style_reset()
+    leave(BACK_USB)
 }
+
+/// Why the session ended, as fastboot.rs `Back` tells the host's mailbox.
+const BACK_ASKED: u32 = 1;
+const BACK_USB: u32 = 2;
+
+/// A run's `A7A_LAB_EXIT=value` (Some(None) for `-A7A_LAB_EXIT`), which
+/// `dram-run` takes out of the knob text: the knob is the lab mode's own,
+/// not one of the DRAM crate's. None: the build's value.
+static mut EXIT: Option<Option<&'static str>> = None;
+
+/// `A7A_LAB_EXIT=wdt`: leave through bt0's own WDT0 reset, as before
+/// ([`fel_style_reset`]). Anything else, or unset: the mask ROM's FEL
+/// entry.
+fn exit_by_wdt() -> bool {
+    let run = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(EXIT)) };
+    run.unwrap_or(option_env!("A7A_LAB_EXIT")) == Some("wdt")
+}
+
+/// End the session (module comment, "Leaving a session").
+fn leave(back: u32) -> ! {
+    let uart = cubie_a7a_common::uart::Uart::attach(crate::UART0_BASE);
+    if exit_by_wdt() {
+        println!("[lab] reboot: watchdog reset (back into FEL)");
+        musb::release();
+        uart.drain();
+        fel_style_reset()
+    }
+    musb::reset_for_rom();
+    println!(
+        "[lab] reboot: the mask ROM's FEL entry, no reset (ISR {:#x}); reset the SoC from FEL before the next run",
+        crate::isr()
+    );
+    crate::fel::lab_enter_rom_fel(back)
+}
+
+/// RTC GP_DATA_REG2 and the vendor's reboot-into-FEL value (felreboot.rs,
+/// which the FEL builds do not carry): a media bt0 that finds it enters
+/// FEL instead of booting.
+const FEL_FLAG_REG: usize = soc::RTC_BASE + 0x108;
+const FEL_FLAG: u32 = 0x5aa5_a55a;
 
 /// WDT0 whole-system reset with exactly the writes the host's felreset
 /// script (scripts/felreset.sh in radxa-a7a-workspace) makes from FEL
@@ -245,7 +295,13 @@ fn serve(after_run: bool) -> ! {
 /// blob-free run. `soc::watchdog_reset` also writes WDT0 +0x08 (key | 1)
 /// first; after a lab DRAM run that path left the board out of FEL twice,
 /// while without a run it came back in 2.3 s.
+///
+/// Kept as `A7A_LAB_EXIT=wdt`: with the clean-up below it left the board
+/// out of FEL as well. It sets the reboot-into-FEL flag first, so that a
+/// reset that does happen ends in FEL on a board whose eMMC or SD card
+/// boots, too.
 fn fel_style_reset() -> ! {
+    write32(FEL_FLAG_REG, FEL_FLAG);
     // Measured: felreset's writes alone did not help either; first leave
     // the state entry 1's return to FEL leaves (USB0 to the ROM, its bus
     // clock, watchdog stopped, caches off), then the reset.
@@ -487,7 +543,8 @@ impl Device for Lab {
     }
 
     fn reboot(&mut self, _bootloader: bool) -> Result<(), &'static str> {
-        // Both are the watchdog reset: the ROM's FEL SRAM is in use.
+        // Both end the session the same way ([`leave`]): the FEL session
+        // that started it cannot be resumed (its SRAM is in use).
         Ok(())
     }
 
@@ -603,9 +660,19 @@ fn dram_run(text: &str) -> Result<(), &'static str> {
     unsafe { core::ptr::write_volatile(core::ptr::addr_of_mut!(KNOBS_N), text.len()) };
     let text = knob_text();
     let mut k = cubie_a7a_dram::knobs::get();
+    let mut exit = None;
     for tok in text.split([' ', '\n']).filter(|t| !t.is_empty()) {
-        k.apply(tok)?;
+        // The lab's own knob (`A7A_LAB_EXIT=value`, `-A7A_LAB_EXIT`);
+        // everything else is the DRAM crate's.
+        if let Some(v) = tok.strip_prefix("A7A_LAB_EXIT=") {
+            exit = Some(Some(v));
+        } else if tok == "-A7A_LAB_EXIT" {
+            exit = Some(None);
+        } else {
+            k.apply(tok)?;
+        }
     }
+    unsafe { core::ptr::write_volatile(core::ptr::addr_of_mut!(EXIT), exit) };
     cubie_a7a_dram::knobs::set(k);
     // SAFETY: entry 4 stored it; taken once (state Idle).
     let Some(pre) = (unsafe { (*core::ptr::addr_of_mut!(PRE)).take() }) else {

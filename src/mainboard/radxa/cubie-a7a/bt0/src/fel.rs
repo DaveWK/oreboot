@@ -614,3 +614,61 @@ fn refuse(code: u32, what: &str, why: impl core::fmt::Debug) {
     Uart::attach(UART0_BASE).drain();
     write32(MB_STATE, code);
 }
+
+// fel_return with the mask ROM's FEL entry in place of the saved lr: 0x20,
+// the vendor boot0's `FEL_BASE` for this SoC (felreboot.rs enters it from
+// the media builds).
+#[cfg(feature = "dram-lab")]
+global_asm!(
+    r#"
+    .section .text.fel, "ax"
+    .arm
+    .global fel_rom_entry
+fel_rom_entry:
+    ldr     r12, =fel_save
+    mov     r0, #0x20
+    str     r0, [r12, #4]
+    b       fel_return
+    .ltorg
+    "#
+);
+
+#[cfg(feature = "dram-lab")]
+unsafe extern "C" {
+    fn fel_rom_entry() -> !;
+}
+
+/// The DRAM lab's way back into FEL without a reset (labfb.rs): the mask
+/// ROM's FEL entry instead of a return into the FEL session that called
+/// entry 4. That session cannot be resumed (the lab's buffers are the
+/// ROM's FEL SRAM), so the ROM starts FEL afresh, as it does when the
+/// vendor boot0 or a media bt0 (felreboot.rs) branches there: with the
+/// ROM's VBAR, SCTLR, CPSR and stack pointer as it called entry 4
+/// (`fel_rom_entry`: `fel_return` puts them back and branches to the saved
+/// lr, which becomes the entry), the watchdog stopped and the ROM's bus
+/// clock.
+///
+/// The ROM's CPSR has IRQs on and its vectors are live again before its
+/// FEL set-up has run, so the caller leaves no interrupt source of the old
+/// session active (USB0 in reset, `musb::reset_for_rom`). If the core
+/// still sees one pending, the GIC is turned off first, as for the
+/// hand-over: the ROM's handler would run on the overwritten session.
+///
+/// `back` goes to the mailbox as fastboot's reason (1 asked, 2 USB).
+#[cfg(feature = "dram-lab")]
+pub(crate) fn lab_enter_rom_fel(back: u32) -> ! {
+    const ISR_I: u32 = 1 << 7;
+    if crate::isr() & ISR_I != 0 {
+        quiesce_rom_interrupts();
+    }
+    Uart::attach(UART0_BASE).drain();
+    recovery::stop_watchdog();
+    let rom_ahb = unsafe { *core::ptr::addr_of!(ROM_AHB) };
+    if rom_ahb != 0 {
+        write32(AHB, rom_ahb);
+    }
+    write32(MB_FASTBOOT_BACK, back);
+    // SAFETY: fel_save holds the ROM's state from entry 4; nothing returns
+    // through its lr any more.
+    unsafe { fel_rom_entry() }
+}

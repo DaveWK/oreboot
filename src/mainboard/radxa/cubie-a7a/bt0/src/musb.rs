@@ -823,3 +823,21 @@ impl xfer::InEp for Bulk<'_, '_> {
         now()
     }
 }
+
+/// USB0 as a SoC reset leaves it, for the mask ROM's FEL entry (the DRAM
+/// lab's way out, labfb.rs): off the bus, then the controller's and PHY0's
+/// reset lines asserted again. The ROM's own USB set-up releases them and
+/// programs the controller from its reset values, so nothing of the
+/// fastboot session (address, speed, FIFO layout) is left for it to find.
+/// The registers saved at take-over are dropped: they belong to a FEL
+/// session that is gone. Bus clocks and gates stay on (the ROM only ever
+/// sets them).
+#[cfg(feature = "dram-lab")]
+pub fn reset_for_rom() {
+    release();
+    // SAFETY: as in take_over.
+    unsafe { *addr_of_mut!(ROM) = None };
+    soc::clr_set_bits(CCU_USB0_BGR, USB0_DEVICE_RST, 0);
+    soc::clr_set_bits(CCU_USB0_CLK, USB0_PHY_RSTN, 0);
+    soc::udelay(100);
+}
