@@ -28,10 +28,28 @@
 //! flagged like the other stages' rows): the DCM program's rows and its wait rows per
 //! pstate ([`dcm_program`]), the per-block CSR set-up (`0x200a3` pulse,
 //! `0x2002a` = 1, `0x20041` = 1, `0x20007` = 0x100, DxRxStandbyEn around
-//! the MRR), the MRR read-out bracket (RxFifoVisibility 0x300, then 0xfffc
-//! per lane) and the stage's read latency per pstate ([`TRACE_MRL`], used
-//! only with the `mrl` knob). Not used: any value the firmware chose (the
-//! reference has no DQ path).
+//! the MRR), the MRR read-out bracket (RxFifoVisibility 0x300, then a
+//! value per lane) and the stage's read latency per pstate ([`TRACE_MRL`],
+//! used only with the `mrl` knob). Not used: any value the firmware chose
+//! (the reference has no DQ path).
+//!
+//! The MRR read-out ([`Readout`]). The value the reference writes per lane
+//! before it reads the lane's contents (0xfffc) is not a constant: the
+//! reference reads every lane's FIFO pointers first, all of which read 0
+//! there (it has no DQ path), and 0xfffc is the read-enable and select
+//! bits (0x3c0) with a pointer of 0 - 4 in 16 bits. With real pointers the
+//! value differs, so the first form of this read-out ([`Readout::Fixed`],
+//! pointer 0x3c of a 48-entry FIFO) read nothing: every lane 0, on the
+//! PHY-firmware-trained state as well. The pointer the contents sit at is
+//! therefore found, not assumed ([`Readout::Located`], feature
+//! `full-speed`; without the feature the stage is built with the first
+//! form, as before): after the RxFifoInit
+//! pulse and the MRR of MR5, every pointer of the debug port is read in
+//! both address forms ([`Port`]), the run of pointers that decode to the
+//! wanted MR5 gives the place ([`locate`]), and MR16 must then read as it
+//! was written (stale contents would repeat MR5). RxFifoVisibility by the
+//! public PHY register description (EIC7700X TRM Part 2): [9] ObsSelOvrd,
+//! [8] ObsSel, [7] RdEnDfe1, [6] RdEnDfe0, [5:0] RdPtr.
 
 use crate::hw::Hw;
 use crate::phy::coldinit::{mrw_ddr, Row};
@@ -486,6 +504,82 @@ pub const TRACE_MRL: [u16; 4] = [0x82, 3, 5, 8];
 /// `rdtrain::VIS_MRR` uses 0x3fc (its blobless MRRs read 0 on the board).
 pub const VIS_INFO: u16 = 0x300;
 pub const VIS_TRACE: u16 = 0xfffc;
+#[cfg(any(test, feature = "full-speed"))]
+/// RxFifoVisibility with the DFE0 FIFO's pointers selected (ObsSelOvrd,
+/// ObsSel 0), as the read training reads them.
+pub const VIS_INFO_DFE0: u16 = 0x200;
+#[cfg(any(test, feature = "full-speed"))]
+/// Entries of the RX FIFO per lane (RdLoc 0..47).
+pub const FIFO_UI: usize = 48;
+
+#[cfg(any(test, feature = "full-speed"))]
+/// An address form of the RX FIFO's debug read port.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Port {
+    /// The DFE0 FIFO: ObsSelOvrd with ObsSel 0, RdEnDfe0 pulsed (0, 1, 0)
+    /// with the pointer in place, the public description's procedure.
+    Dfe0,
+    /// The reference's form with a real pointer: ObsSelOvrd, ObsSel and
+    /// both read enables set in the one write that carries the pointer.
+    Both,
+}
+
+#[cfg(any(test, feature = "full-speed"))]
+/// Where an MRR's eight UI sit in the FIFO: the port form and its pointer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Loc {
+    pub port: Port,
+    pub ptr: u8,
+}
+
+#[cfg(any(test, feature = "full-speed"))]
+/// The decoded value at every pointer, per [`Port`] (0 [`Port::Dfe0`], 1
+/// [`Port::Both`]); None: a lane read neither clearly 0 nor clearly 1.
+pub type Scan = [[Option<u8>; FIFO_UI]; 2];
+
+#[cfg(any(test, feature = "full-speed"))]
+/// The place of the value `want` in a scan: the port form with the
+/// longest circular run of pointers that decode to it (ties: DFE0), and
+/// the middle of that run. None: no pointer of either form reads it.
+pub fn locate(scan: &Scan, want: u8) -> Option<Loc> {
+    let mut best: Option<(usize, Loc)> = None;
+    for (k, port) in [Port::Dfe0, Port::Both].into_iter().enumerate() {
+        let hit = |p: usize| scan[k][p % FIFO_UI] == Some(want);
+        if (0..FIFO_UI).all(hit) {
+            // Every pointer reads it: the port does not address the FIFO.
+            continue;
+        }
+        let mut p = 0;
+        while p < FIFO_UI {
+            if !hit(p) || hit(p + FIFO_UI - 1) {
+                p += 1;
+                continue;
+            }
+            let mut len = 1;
+            while hit(p + len) {
+                len += 1;
+            }
+            if best.map_or(true, |(l, _)| len > l) {
+                let ptr = ((p + (len - 1) / 2) % FIFO_UI) as u8;
+                best = Some((len, Loc { port, ptr }));
+            }
+            p += len;
+        }
+    }
+    best.map(|(_, l)| l)
+}
+
+#[cfg(any(test, feature = "full-speed"))]
+/// How the MRR read-out addresses the FIFO contents.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Readout {
+    /// One RxFifoVisibility value for every lane, written once per lane
+    /// (the first form: 0xfffc, or 0x3fc; FEL lab `A7A_DCA_VIS`). Kept for
+    /// comparison: it reads zeros on the board.
+    Fixed(u16),
+    /// The place found on the block's MR5 (module documentation).
+    Located,
+}
 
 // ---------------------------------------------------------------------------
 // The stage on hardware.
@@ -528,8 +622,13 @@ pub struct Config {
     /// initialization 0x45, or 0x04/0x44 with `A7A_EI_FSPWR0`). MRR of
     /// MR16 is printed but never trusted for this.
     pub mr16_found: u8,
-    /// RxFifoVisibility for the per-lane contents ([`VIS_TRACE`]).
+    /// RxFifoVisibility for the per-lane contents ([`VIS_TRACE`]): the
+    /// first read-out form's value (the only form without feature
+    /// `full-speed`; with it, see `readout`).
     pub vis: u16,
+    /// How the FIFO contents are addressed.
+    #[cfg(any(test, feature = "full-speed"))]
+    pub readout: Readout,
     /// Write [`TRACE_MRL`] for the pstate during the stage.
     pub trace_mrl: bool,
     /// Sweeps per block (results add up per step).
@@ -548,6 +647,8 @@ impl Config {
         pstate: 1,
         mr16_found: 0x04,
         vis: VIS_TRACE,
+        #[cfg(any(test, feature = "full-speed"))]
+        readout: Readout::Located,
         trace_mrl: false,
         iterations: 1,
         policy: DcaPolicy::DEFAULT,
@@ -574,7 +675,12 @@ impl Config {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Mrr {
     pub ma: u8,
+    /// The pointers with ObsSel 1 (as the reference reads them) and with
+    /// ObsSel 0 (the DFE0 FIFO's: [15:10] RdLoc, [9:5] WrLocOdd, [4:0]
+    /// WrLocEvn).
     pub info: [[u16; 8]; 2],
+    #[cfg(any(test, feature = "full-speed"))]
+    pub info_dfe0: [[u16; 8]; 2],
     pub raw: [[u16; 8]; 2],
     pub value: [Option<u8>; 2],
 }
@@ -583,6 +689,8 @@ impl Mrr {
     pub const EMPTY: Mrr = Mrr {
         ma: 0,
         info: [[0; 8]; 2],
+        #[cfg(any(test, feature = "full-speed"))]
+        info_dfe0: [[0; 8]; 2],
         raw: [[0; 8]; 2],
         value: [None; 2],
     };
@@ -628,6 +736,11 @@ pub enum DcaStop {
     /// MR30 of the operating set did not read back: not restorable, so
     /// no sweep.
     Mr30Unread,
+    /// MR5 was found in the FIFO, but MR16 then did not read as written
+    /// (`got`) at the same place: the contents are not this MRR's, so
+    /// nothing was written.
+    #[cfg(any(test, feature = "full-speed"))]
+    Mr16Read { got: Option<u8> },
 }
 
 /// MRRs of [`Mode::Mrr`] at the found FSP-WR, and with FSP-WR at the
@@ -643,6 +756,12 @@ pub struct DcaBlock {
     /// The DBYTE of the block (0/1) whose MRR read MR5 right (the reference
     /// reads the second: DBYTE 1 / 3).
     pub mrr_db: Option<usize>,
+    /// [`Readout::Located`]: per DBYTE of the block, what every pointer
+    /// read after the MRR of MR5, and the place taken from it.
+    #[cfg(any(test, feature = "full-speed"))]
+    pub scan: [Scan; 2],
+    #[cfg(any(test, feature = "full-speed"))]
+    pub loc: [Option<Loc>; 2],
     pub found: [Mrr; MRR_FOUND.len()],
     pub operating: [Mrr; MRR_OPERATING.len()],
     /// MR30 of the operating set before the sweep.
@@ -669,6 +788,10 @@ impl DcaBlock {
             channel,
             rank,
             mrr_db: None,
+            #[cfg(any(test, feature = "full-speed"))]
+            scan: [[[None; FIFO_UI]; 2]; 2],
+            #[cfg(any(test, feature = "full-speed"))]
+            loc: [None; 2],
             found: [Mrr::EMPTY; MRR_FOUND.len()],
             operating: [Mrr::EMPTY; MRR_OPERATING.len()],
             mr30_found: None,
@@ -752,6 +875,96 @@ pub(crate) fn mrr_rows<H: Hw>(
     m
 }
 
+#[cfg(any(test, feature = "full-speed"))]
+/// One lane's FIFO contents at `loc`.
+fn contents<H: Hw>(ex: &mut WlExec<'_, H>, db: u32, lane: u32, loc: Loc) -> u16 {
+    let p = loc.ptr as u16 & 0x3f;
+    match loc.port {
+        Port::Dfe0 => {
+            for v in [
+                VIS_INFO_DFE0 | p,
+                VIS_INFO_DFE0 | 0x40 | p,
+                VIS_INFO_DFE0 | p,
+            ] {
+                ex.write(fifo_vis(db), v);
+            }
+            ex.hw.udelay(1);
+        }
+        Port::Both => ex.write(fifo_vis(db), VIS_INFO | 0xc0 | p),
+    }
+    ex.read(0x10073 + 0x1000 * db + 0x100 * lane)
+}
+
+#[cfg(any(test, feature = "full-speed"))]
+/// The launch `rows` (an MRR) between the reference's bracket (receivers
+/// on, RxFifoInit), then per DBYTE the FIFO pointers and the contents:
+/// with [`Readout::Fixed`] at its value, with [`Readout::Located`] at
+/// `loc[i]` (a DBYTE without a place is not read). `scan`: every pointer
+/// of both port forms decoded as well (the block's MR5).
+fn mrr_at<H: Hw>(
+    ex: &mut WlExec<'_, H>,
+    dbs: [u32; 2],
+    rows: &[Row],
+    ma: u8,
+    ro: &Readout,
+    loc: [Option<Loc>; 2],
+    mut scan: Option<&mut [Scan; 2]>,
+) -> Mrr {
+    let mut m = Mrr { ma, ..Mrr::EMPTY };
+    let standby = ex.read(0x1000a + 0x1000 * dbs[0]);
+    ex.write(RX_STANDBY, 0);
+    fire(ex, dbs, EV_FIFO);
+    launch(ex, rows);
+    ex.write(RX_STANDBY, standby);
+    for (i, &db) in dbs.iter().enumerate() {
+        let vis_found = ex.read(fifo_vis(db));
+        let mut sel = [0u16; 8];
+        for (dq, s) in sel.iter_mut().enumerate() {
+            *s = ex.read(0x10080 + 0x1000 * db + dq as u32) & 0xf;
+        }
+        ex.write(fifo_vis(db), VIS_INFO_DFE0);
+        for lane in 0..8u32 {
+            m.info_dfe0[i][lane as usize] = ex.read(fifo_info(db, lane));
+        }
+        ex.write(fifo_vis(db), VIS_INFO);
+        for lane in 0..8u32 {
+            m.info[i][lane as usize] = ex.read(fifo_info(db, lane));
+        }
+        if let Some(sc) = scan.as_deref_mut() {
+            for (k, port) in [Port::Dfe0, Port::Both].into_iter().enumerate() {
+                for ptr in 0..FIFO_UI {
+                    let at = Loc {
+                        port,
+                        ptr: ptr as u8,
+                    };
+                    let raw: [u16; 8] =
+                        core::array::from_fn(|lane| contents(ex, db, lane as u32, at));
+                    sc[i][k][ptr] = decode(&raw, &sel);
+                }
+                ex.hw.kick_watchdog();
+            }
+        }
+        match (*ro, loc[i]) {
+            (Readout::Fixed(vis), _) => {
+                for lane in 0..8u32 {
+                    ex.write(fifo_vis(db), vis);
+                    m.raw[i][lane as usize] = ex.read(0x10073 + 0x1000 * db + 0x100 * lane);
+                }
+                m.value[i] = decode(&m.raw[i], &sel);
+            }
+            (Readout::Located, Some(at)) => {
+                for lane in 0..8u32 {
+                    m.raw[i][lane as usize] = contents(ex, db, lane, at);
+                }
+                m.value[i] = decode(&m.raw[i], &sel);
+            }
+            (Readout::Located, None) => {}
+        }
+        ex.write(fifo_vis(db), vis_found);
+    }
+    m
+}
+
 pub(crate) fn select<H: Hw>(ex: &mut WlExec<'_, H>, ch: Channel, cfg: &Config) {
     let (a, b) = ch.enables();
     let mask = match ch {
@@ -805,6 +1018,8 @@ pub fn run_block<H: Hw>(hw: &mut H, out: &mut DcaBlock, cfg: &Config) {
     out.elapsed_us = hw.now_us().wrapping_sub(t0) as u32;
 }
 
+// The stage's body without feature `full-speed`: the first read-out form.
+#[cfg(not(any(test, feature = "full-speed")))]
 fn body<H: Hw>(ex: &mut WlExec<'_, H>, out: &mut DcaBlock, dbs: [u32; 2], cfg: &Config) {
     let rank = out.rank;
     for (k, &ma) in MRR_FOUND.iter().enumerate() {
@@ -860,6 +1075,7 @@ fn body<H: Hw>(ex: &mut WlExec<'_, H>, out: &mut DcaBlock, dbs: [u32; 2], cfg: &
     launch(ex, &mrw_launch(rank, 16, cfg.mr16_found));
 }
 
+#[cfg(not(any(test, feature = "full-speed")))]
 fn sweep<H: Hw>(
     ex: &mut WlExec<'_, H>,
     out: &mut DcaBlock,
@@ -887,6 +1103,201 @@ fn sweep<H: Hw>(
                 out.sweep[1].record(flip, i, v.map(|x| dcm_bit(x, false, flip)));
             }
         }
+    }
+}
+
+// The stage's body with feature `full-speed`: the read-out of the
+// configuration ([`Readout`]).
+#[cfg(any(test, feature = "full-speed"))]
+fn body<H: Hw>(ex: &mut WlExec<'_, H>, out: &mut DcaBlock, dbs: [u32; 2], cfg: &Config) {
+    let rank = out.rank;
+    let ro = cfg.readout;
+    // MR5 first: with the located read-out every pointer is read after
+    // this one MRR, and the place of the wanted value is the block's.
+    if ro == Readout::Located {
+        let rows = rxen::mrr_program(rank, MRR_FOUND[0]);
+        mrr_at(
+            ex,
+            dbs,
+            &rows,
+            MRR_FOUND[0],
+            &ro,
+            [None; 2],
+            Some(&mut out.scan),
+        );
+        out.loc = [
+            locate(&out.scan[0], cfg.mr5_want),
+            locate(&out.scan[1], cfg.mr5_want),
+        ];
+    }
+    let loc = out.loc;
+    let read = |ex: &mut WlExec<'_, H>, ma: u8| {
+        mrr_at(ex, dbs, &rxen::mrr_program(rank, ma), ma, &ro, loc, None)
+    };
+    for (k, &ma) in MRR_FOUND.iter().enumerate() {
+        out.found[k] = read(ex, ma);
+    }
+    let mr5 = out.found[0].value;
+    // The reference reads the second DBYTE; take the first one that reads MR5.
+    out.mrr_db = [1usize, 0]
+        .into_iter()
+        .find(|&i| mr5[i] == Some(cfg.mr5_want));
+    let Some(mdb) = out.mrr_db else {
+        out.stop = Some(DcaStop::MrrPath { got: mr5 });
+        return;
+    };
+    let Some(mr16_op) = mr16_write_operating(cfg.mr16_found) else {
+        out.stop = Some(DcaStop::Mr16 {
+            found: cfg.mr16_found,
+        });
+        return;
+    };
+    if ro == Readout::Located {
+        // A second known answer at the same place, before any write.
+        let got = out.found[2].get(mdb);
+        if got != Some(cfg.mr16_found) {
+            out.stop = Some(DcaStop::Mr16Read { got });
+            return;
+        }
+    }
+    launch(ex, &mrw_launch(rank, 16, mr16_op));
+    for (k, &ma) in MRR_OPERATING.iter().enumerate() {
+        out.operating[k] = read(ex, ma);
+    }
+    out.mr30_found = out.operating[0].get(mdb);
+    match cfg.mode {
+        Mode::Mrr => {}
+        Mode::Dcm => {
+            let (rows, n) = cfg.dcm(rank);
+            launch(ex, &rows[..n]);
+            out.dcm_once = read(ex, 26).get(mdb);
+        }
+        Mode::Measure | Mode::Apply => match out.mr30_found {
+            None => out.stop = Some(DcaStop::Mr30Unread),
+            Some(found) => {
+                sweep(ex, out, dbs, cfg, mdb, found);
+                let d = [
+                    decide(&out.sweep[0], &cfg.policy),
+                    decide(&out.sweep[1], &cfg.policy),
+                ];
+                out.decision = [Some(d[0]), Some(d[1])];
+                let last = if cfg.mode == Mode::Apply {
+                    final_mr30(found, d[0].step, d[1].step)
+                } else {
+                    found
+                };
+                launch(ex, &mrw_launch(rank, 30, last));
+                out.mr30_final = Some(last);
+            }
+        },
+    }
+    // MR16 back: FSP-WR to the non-operating set as found.
+    launch(ex, &mrw_launch(rank, 16, cfg.mr16_found));
+}
+
+#[cfg(any(test, feature = "full-speed"))]
+fn sweep<H: Hw>(
+    ex: &mut WlExec<'_, H>,
+    out: &mut DcaBlock,
+    dbs: [u32; 2],
+    cfg: &Config,
+    mdb: usize,
+    found: u8,
+) {
+    let rank = out.rank;
+    let (rows, n) = cfg.dcm(rank);
+    for _ in 0..cfg.iterations.max(1) {
+        for i in 0..STEPS {
+            if ex.failure.is_some() {
+                return;
+            }
+            launch(ex, &mrw_launch(rank, 30, mr30_both(step_of(i))));
+            launch(ex, &rows[..n]);
+            // The reference puts MR30 back before the read-out (its found value
+            // there is 0): the MRR then runs at the trained duty.
+            launch(ex, &mrw_launch(rank, 30, found));
+            let rows = rxen::mrr_program(rank, 26);
+            let v = mrr_at(ex, dbs, &rows, 26, &cfg.readout, out.loc, None).get(mdb);
+            out.mr26[i] = v;
+            for flip in 0..2 {
+                out.sweep[0].record(flip, i, v.map(|x| dcm_bit(x, true, flip)));
+                out.sweep[1].record(flip, i, v.map(|x| dcm_bit(x, false, flip)));
+            }
+        }
+    }
+}
+
+#[cfg(any(test, feature = "full-speed"))]
+/// One pointer scan as text: the decoded byte per pointer, `--` unclear.
+fn scan_text(s: &[Option<u8>; FIFO_UI], buf: &mut [u8; 2 * FIFO_UI]) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for (k, v) in s.iter().enumerate() {
+        (buf[2 * k], buf[2 * k + 1]) = match v {
+            Some(x) => (HEX[(x >> 4) as usize], HEX[(x & 0xf) as usize]),
+            None => (b'-', b'-'),
+        };
+    }
+}
+
+#[cfg(any(test, feature = "full-speed"))]
+/// The lines of one block (`DCA <block> ...`): the result, the pointer
+/// scan and the place taken, every MRR with its pointers and raw lanes,
+/// and the sweep with its decision per DRAM byte.
+pub fn log_block<H: Hw>(hw: &mut H, b: &DcaBlock) {
+    let nm = crate::rdtrain::block_name(b.channel, b.rank);
+    hw.kick_watchdog();
+    hw.log(format_args!(
+        "[dram] DCA {nm}: stop {:?} failure {:?} restored {} MRR DBYTE {:?} at {:?}; MR30 found {:02x?} final {:02x?}; DCM once {:02x?}; {} launches, {} writes, {} us\n",
+        b.stop, b.failure, b.restored, b.mrr_db, b.loc, b.mr30_found, b.mr30_final, b.dcm_once, b.launches, b.writes, b.elapsed_us
+    ));
+    if b.scan.iter().flatten().flatten().any(|v| v.is_some()) {
+        for (i, sc) in b.scan.iter().enumerate() {
+            for (k, port) in ["DFE0", "both"].iter().enumerate() {
+                let mut buf = [0u8; 2 * FIFO_UI];
+                scan_text(&sc[k], &mut buf);
+                hw.kick_watchdog();
+                hw.log(format_args!(
+                    "[dram] DCA {nm} scan b{i} {port} pointer 0..47: {}\n",
+                    core::str::from_utf8(&buf).unwrap_or("?")
+                ));
+            }
+        }
+    }
+    for (what, list) in [
+        ("FSP-WR found", &b.found[..]),
+        ("FSP-WR operating", &b.operating[..]),
+    ] {
+        for m in list.iter().filter(|m| m.ma != 0) {
+            hw.kick_watchdog();
+            hw.log(format_args!(
+                "[dram] DCA {nm} MRR {what} MR{}: {:02x?} raw {:04x?} | {:04x?} info {:04x?} | {:04x?} DFE0 {:04x?} | {:04x?}\n",
+                m.ma, m.value, m.raw[0], m.raw[1], m.info[0], m.info[1], m.info_dfe0[0], m.info_dfe0[1]
+            ));
+        }
+    }
+    if b.mr26.iter().any(|x| x.is_some()) {
+        hw.log(format_args!(
+            "[dram] DCA {nm} MR26 per step -7..+7: {:02x?}\n",
+            b.mr26
+        ));
+        for (k, byte) in ["upper", "lower"].iter().enumerate() {
+            let s = &b.sweep[k];
+            hw.kick_watchdog();
+            hw.log(format_args!(
+                "[dram] DCA {nm} {byte}: flip0 ones {:?} flip1 ones {:?} reads {:?}; decision {:?}\n",
+                s.ones[0], s.ones[1], s.reads[0], b.decision[k]
+            ));
+        }
+    }
+}
+
+#[cfg(any(test, feature = "full-speed"))]
+/// Whether the block left another MR30 than it found (an applied change:
+/// WCK2CK leveling and the read training are due again).
+pub const fn changed(b: &DcaBlock) -> bool {
+    match (b.mr30_found, b.mr30_final) {
+        (Some(a), Some(z)) => a != z,
+        _ => false,
     }
 }
 
@@ -1256,6 +1667,17 @@ mod sim {
         off: f32,
         mr5: u8,
         mrws: Vec<(usize, usize, u8, u8)>,
+        /// The RX FIFO's debug port: the port form that addresses the
+        /// contents, and the pointers at which the last MRR's eight UI
+        /// read whole (`at`, `at + span - 1`, modulo the FIFO).
+        port: Port,
+        at: usize,
+        span: usize,
+        /// The last MRR's bit per (DBYTE, lane).
+        burst: HashMap<(u32, u32), bool>,
+        /// What the debug port holds per DBYTE after its last address
+        /// write: the pointer, if the form was right.
+        latched: [Option<usize>; 4],
     }
 
     const LANE_SEL: [[u16; 8]; 4] = [
@@ -1292,6 +1714,11 @@ mod sim {
                 off: 1.3,
                 mr5: 0x13,
                 mrws: Vec::new(),
+                port: Port::Dfe0,
+                at: 8,
+                span: 5,
+                burst: HashMap::new(),
+                latched: [None; 4],
             }
         }
         fn get(&self, a: u32) -> u16 {
@@ -1367,11 +1794,43 @@ mod sim {
                 for dq in 0..8 {
                     let lane = LANE_SEL[db as usize][dq] as u32;
                     let bit = i == 1 && v >> dq & 1 != 0;
-                    self.regs.insert(
-                        0x10073 + 0x1000 * db + 0x100 * lane,
-                        if bit { 0xff } else { 0 },
-                    );
+                    self.burst.insert((db, lane), bit);
                 }
+            }
+        }
+        /// A write to RxFifoVisibility of `db`: the debug port latches the
+        /// pointer on RdEnDfe0 rising with ObsSel 0 ([`Port::Dfe0`]), or
+        /// with ObsSel and both enables set ([`Port::Both`]).
+        fn vis(&mut self, db: usize, old: u16, v: u16) {
+            let ptr = (v & 0x3f) as usize;
+            let hit = match self.port {
+                Port::Dfe0 => v & 0x340 == 0x240 && old & 0x40 == 0,
+                Port::Both => v & 0x3c0 == 0x3c0,
+            };
+            if hit {
+                self.latched[db] = (ptr < FIFO_UI).then_some(ptr);
+            } else if v & 0xc0 != 0 {
+                self.latched[db] = None;
+            }
+        }
+        /// RxDfe0FifoContents of (`db`, `lane`): the burst's bit in all
+        /// eight UI inside the span, a mix one pointer outside, else 0.
+        fn contents(&self, db: u32, lane: u32) -> u16 {
+            let Some(ptr) = self.latched[db as usize] else {
+                return 0;
+            };
+            let bit = *self.burst.get(&(db, lane)).unwrap_or(&false);
+            let d = (ptr + FIFO_UI - self.at) % FIFO_UI;
+            if d < self.span {
+                if bit {
+                    0xff
+                } else {
+                    0
+                }
+            } else if (d == self.span || d == FIFO_UI - 1) && bit {
+                0x0f
+            } else {
+                0
             }
         }
     }
@@ -1390,10 +1849,17 @@ mod sim {
             if a == 0x20021 {
                 return 1;
             }
+            if a & 0xf00ff == 0x10073 && (a >> 8) & 0xf < 8 {
+                return self.contents((a >> 12) & 0xf, (a >> 8) & 0xf);
+            }
             self.get(a)
         }
         fn write16(&mut self, addr: usize, v: u16) {
             let a = ((addr - PHY_BASE) / 2) as u32;
+            if a & 0xf0fff == 0x10072 {
+                let old = self.get(a);
+                self.vis(((a >> 12) & 0xf) as usize, old, v);
+            }
             if a == 0x20020 && v & 1 != 0 && self.get(0x20020) & 1 == 0 {
                 self.regs.insert(a, v);
                 self.run();
@@ -1550,6 +2016,195 @@ mod sim {
         assert_eq!(a0.decision[0].unwrap().step, Err(NoDecision::Flat));
         assert_eq!(a0.decision[1].unwrap().step, Ok(0));
         assert_eq!(a0.mr30_final, Some(0x00));
+    }
+
+    #[test]
+    fn the_fixed_pointer_reads_zeros_on_a_fifo_with_pointers() {
+        // What the board showed: with the reference's value written as a
+        // constant (pointer 0x3c of 48 entries) every lane reads 0 and the
+        // stage stops before it writes anything, in either port form.
+        for port in [Port::Dfe0, Port::Both] {
+            for vis in [VIS_TRACE, 0x3fc] {
+                let mut sim = Sim::new(ERR, 0);
+                sim.port = port;
+                let cfg = Config {
+                    mode: Mode::Apply,
+                    readout: Readout::Fixed(vis),
+                    ..Config::DEFAULT
+                };
+                let out = run_all(&mut sim, &cfg);
+                for o in &out {
+                    assert_eq!(
+                        o.stop,
+                        Some(DcaStop::MrrPath {
+                            got: [Some(0), Some(0)]
+                        })
+                    );
+                }
+                assert!(sim.mrws.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn the_located_read_out_finds_the_burst_wherever_it_sits() {
+        for port in [Port::Dfe0, Port::Both] {
+            for at in [0, 3, 8, 9, 20, 44, 47] {
+                for span in [1, 2, 5] {
+                    let mut sim = Sim::new(ERR, 0x9a);
+                    (sim.port, sim.at, sim.span) = (port, at, span);
+                    let out = run_all(&mut sim, &Config::DEFAULT);
+                    for o in &out {
+                        assert_eq!(o.stop, None, "{port:?} at {at} span {span}");
+                        let l = o.loc[1].unwrap();
+                        assert_eq!(l.port, port);
+                        let d = (l.ptr as usize + FIFO_UI - at) % FIFO_UI;
+                        assert!(d < span, "{port:?} at {at} span {span}: {l:?}");
+                        // The first DBYTE carries no MR bits: every lane 0
+                        // at every pointer is not a place.
+                        assert_eq!(o.loc[0], None);
+                        assert_eq!(o.operating[0].get(1), Some(0x9a));
+                        assert_eq!(o.found[2].get(1), Some(0x04));
+                    }
+                    assert!(sim.mrws.iter().all(|m| m.2 == 16));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn stale_contents_stop_before_any_write() {
+        // A FIFO that keeps showing MR5 whatever is read: MR16 does not
+        // read as written, so the place is not trusted.
+        struct Stale(Sim);
+        impl crate::hw::RegIo for Stale {
+            fn read32(&mut self, a: usize) -> u32 {
+                self.0.read32(a)
+            }
+            fn write32(&mut self, a: usize, v: u32) {
+                self.0.write32(a, v)
+            }
+            fn read16(&mut self, a: usize) -> u16 {
+                self.0.read16(a)
+            }
+            fn write16(&mut self, a: usize, v: u16) {
+                let before = self.0.burst.clone();
+                self.0.write16(a, v);
+                if !before.is_empty() {
+                    self.0.burst = before;
+                }
+            }
+            fn udelay(&mut self, us: u32) {
+                self.0.udelay(us)
+            }
+            fn now_us(&mut self) -> u64 {
+                self.0.now_us()
+            }
+            fn log(&mut self, _: core::fmt::Arguments) {}
+        }
+        impl Hw for Stale {
+            fn set_voltage(&mut self, _: crate::hw::Rail, _: u32) -> bool {
+                true
+            }
+        }
+        let mut sim = Stale(Sim::new(ERR, 0));
+        let cfg = Config {
+            mode: Mode::Apply,
+            ..Config::DEFAULT
+        };
+        let mut o = DcaBlock::empty(Channel::A, Rank::R0);
+        run_block(&mut sim, &mut o, &cfg);
+        assert_eq!(o.stop, Some(DcaStop::Mr16Read { got: Some(0x13) }));
+        assert!(sim.0.mrws.is_empty());
+        assert!(o.restored);
+    }
+
+    #[test]
+    fn locate_takes_the_middle_of_the_longest_run() {
+        let mut s: Scan = [[Some(0); FIFO_UI]; 2];
+        for p in [46, 47, 0, 1, 2] {
+            s[0][p] = Some(0x13);
+        }
+        s[1][10] = Some(0x13);
+        s[0][20] = None;
+        assert_eq!(
+            locate(&s, 0x13),
+            Some(Loc {
+                port: Port::Dfe0,
+                ptr: 0
+            })
+        );
+        s[0] = [Some(0); FIFO_UI];
+        assert_eq!(
+            locate(&s, 0x13),
+            Some(Loc {
+                port: Port::Both,
+                ptr: 10
+            })
+        );
+        // A port that shows the value at every pointer addresses nothing.
+        s[1] = [Some(0x13); FIFO_UI];
+        assert_eq!(locate(&s, 0x13), None);
+        assert_eq!(locate(&[[None; FIFO_UI]; 2], 0x13), None);
+    }
+
+    #[test]
+    fn the_log_names_the_place_and_the_decision() {
+        struct Log(Sim, std::string::String);
+        impl crate::hw::RegIo for Log {
+            fn read32(&mut self, a: usize) -> u32 {
+                self.0.read32(a)
+            }
+            fn write32(&mut self, a: usize, v: u32) {
+                self.0.write32(a, v)
+            }
+            fn read16(&mut self, a: usize) -> u16 {
+                self.0.read16(a)
+            }
+            fn write16(&mut self, a: usize, v: u16) {
+                self.0.write16(a, v)
+            }
+            fn udelay(&mut self, us: u32) {
+                self.0.udelay(us)
+            }
+            fn now_us(&mut self) -> u64 {
+                self.0.now_us()
+            }
+            fn log(&mut self, a: core::fmt::Arguments) {
+                use core::fmt::Write;
+                self.1.write_fmt(a).unwrap();
+            }
+        }
+        impl Hw for Log {
+            fn set_voltage(&mut self, _: crate::hw::Rail, _: u32) -> bool {
+                true
+            }
+        }
+        let mut hw = Log(Sim::new(ERR, 0), std::string::String::new());
+        let cfg = Config {
+            mode: Mode::Apply,
+            ..Config::DEFAULT
+        };
+        let mut o = DcaBlock::empty(Channel::A, Rank::R0);
+        run_block(&mut hw, &mut o, &cfg);
+        assert!(changed(&o));
+        log_block(&mut hw, &o);
+        let t = &hw.1;
+        assert!(t.contains("DCA A0: stop None"), "{t}");
+        assert!(t.contains("scan b1 DFE0 pointer 0..47: 00000000000000--1313131313--00"));
+        assert!(t.contains("MRR FSP-WR found MR5: [None, Some(13)]"));
+        assert!(t.contains("DCA A0 upper: flip0 ones"));
+        // Measure leaves MR30 as found: no change to act on.
+        let mut hw = Log(Sim::new(ERR, 0), std::string::String::new());
+        run_block(
+            &mut hw,
+            &mut o,
+            &Config {
+                mode: Mode::Measure,
+                ..Config::DEFAULT
+            },
+        );
+        assert!(!changed(&o) && o.decision[0].is_some());
     }
 }
 

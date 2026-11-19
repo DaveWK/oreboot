@@ -35,3 +35,12 @@ rank-map = []
 # feature drift-log; always built for the unit tests). Off: the crate
 # compiles exactly as before, so the other images stay byte-identical.
 drift-log = []
+# The full-speed lab stages of the blob-free flow, each still selected by
+# its own build knob: the WCK duty-cycle stage after the read training
+# (dca, A7A_DCA) and through the controller (dcactl, A7A_DCA_CTL), the
+# two-dimensional read eye (rdeye, A7A_RD_VREF=eye) and the command-bus
+# reference step of command bus training (blobless::cavref, A7A_CA_VREF)
+# (bt0 feature full-speed; always built for the unit tests). Off: the
+# crate compiles exactly as before, so the other images stay
+# byte-identical.
+full-speed = []
