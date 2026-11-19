@@ -117,7 +117,7 @@ emmc = ["cubie-a7a-dram/vendor-vdd2l"]
 # SPI NOR (READ/RDID/RDSR only), the USB disk on the blue port (EHCI1,
 # Bulk-Only, SCSI reads only), the SD card (identification and reads
 # only). No NOR erase/program code is built in.
-fastboot = ["fel"]
+fastboot = ["fel", "cubie-a7a-fastboot/emmc-session"]
 # fastboot flash/erase of the SPI NOR partitions (bt0, layout, main, edk2)
 # behind cubie_a7a_fastboot::nor's guards (oem nor-arm with the image's
 # length and CRC-32, JEDEC ID, no protection bits, erase/program/read-back

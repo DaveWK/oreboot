@@ -421,16 +421,14 @@ pub fn emmc_flash(
     scratch: &mut [u32],
     info: &mut dyn Info,
 ) -> Result<(), &'static str> {
-    let r = d.card.refresh(&mut d.host, &mut d.ext).and_then(|()| {
-        d.card.program(
-            &mut d.host,
-            t,
-            image,
-            &mut |i| emmc_layout_check(i, dram_end),
-            scratch,
-            info,
-        )
-    });
+    let r = d.card.program(
+        &mut d.host,
+        t,
+        image,
+        &mut |i| emmc_layout_check(i, dram_end),
+        scratch,
+        info,
+    );
     r.map_err(|e| {
         println!("[fastboot] emmc flash at block {}: {e:?}", t.first);
         e.message()
@@ -446,10 +444,7 @@ pub fn emmc_erase(
     scratch: &mut [u32],
     info: &mut dyn Info,
 ) -> Result<(), &'static str> {
-    let r = d
-        .card
-        .refresh(&mut d.host, &mut d.ext)
-        .and_then(|()| d.card.erase(&mut d.host, t, scratch, info));
+    let r = d.card.erase(&mut d.host, t, scratch, info);
     r.map_err(|e| {
         println!("[fastboot] emmc erase at block {}: {e:?}", t.first);
         e.message()

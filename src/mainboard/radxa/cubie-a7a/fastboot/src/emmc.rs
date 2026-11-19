@@ -32,7 +32,11 @@
 //! done by writing zeros: no CMD35/36/38 (erase groups, TRIM, discard,
 //! secure erase) in any build.
 use crate::egon;
-use crate::emmcarm::{Content, Part, Target, BLOCK as BLOCK64, EGON_MAX, FW_END, FW_START};
+use crate::emmcarm::Part;
+#[cfg(any(test, feature = "emmc-session"))]
+use crate::emmcarm::{Content, Target, BLOCK as BLOCK64};
+use crate::emmcarm::{EGON_MAX, FW_END, FW_START};
+#[cfg(any(test, feature = "emmc-session"))]
 use crate::proto::Info;
 use crate::sd::{bits, BusError, Resp};
 
@@ -320,8 +324,11 @@ pub struct Card {
     /// Blocks in each boot partition (0: none).
     pub boot_blocks: u64,
     pub fields: Fields,
-    /// The selected partition (PARTITION_ACCESS).
-    pub part: Part,
+    #[cfg(not(any(test, feature = "emmc-session")))]
+    part: Part,
+    /// The selected partition (PARTITION_ACCESS), unknown after an ambiguous CMD6.
+    #[cfg(any(test, feature = "emmc-session"))]
+    part: Option<Part>,
     /// Write commands allowed (the `fastboot-emmc-write` build).
     pub write: bool,
 }
@@ -380,7 +387,10 @@ impl Card {
             user_blocks,
             boot_blocks: fields.boot_size_mult as u64 * 256,
             fields,
+            #[cfg(not(any(test, feature = "emmc-session")))]
             part: Part::User,
+            #[cfg(any(test, feature = "emmc-session"))]
+            part: Some(Part::User),
             write,
         };
         if fields.part_config & 7 != 0 {
@@ -435,7 +445,12 @@ impl Card {
         // The card may or may not have switched: put it back to 1 bit.
         let _ = self.switch(b, Switch::BusWidth(0));
         read_ext_csd(b, self.write, ext)?;
-        self.fields = Fields::parse(ext);
+        #[cfg(not(any(test, feature = "emmc-session")))]
+        {
+            self.fields = Fields::parse(ext);
+        }
+        #[cfg(any(test, feature = "emmc-session"))]
+        self.update_ext(ext);
         Ok(false)
     }
 
@@ -451,15 +466,30 @@ impl Card {
     }
 
     fn send_switch<B: MmcBus>(&mut self, b: &mut B, s: Switch) -> Result<(), Error> {
-        cmd(b, self.write, 6, s.arg(), Resp::R1b)?;
+        #[cfg(any(test, feature = "emmc-session"))]
+        let part = self.part.take();
+        let response = cmd(b, self.write, 6, s.arg(), Resp::R1b)?[0];
+        if cfg!(any(test, feature = "emmc-session")) && response & R1_ERRORS != 0 {
+            return Err(Error::Status(6, response));
+        }
         let st = self.status(b)?;
         if st & R1_SWITCH_ERROR != 0 {
             return Err(Error::Status(6, st));
         }
         match s {
-            Switch::PartitionConfig(v) => self.fields.part_config = v,
+            Switch::PartitionConfig(v) => {
+                self.fields.part_config = v;
+                #[cfg(any(test, feature = "emmc-session"))]
+                {
+                    self.part = access(v);
+                }
+            }
             Switch::BusWidth(v) => self.fields.bus_width = v,
             Switch::BootBus(v) => self.fields.boot_bus = v,
+        }
+        #[cfg(any(test, feature = "emmc-session"))]
+        if !matches!(s, Switch::PartitionConfig(_)) {
+            self.part = part;
         }
         Ok(())
     }
@@ -489,7 +519,15 @@ impl Card {
 
     /// Select `part` (PARTITION_ACCESS), keeping every other bit.
     pub fn select<B: MmcBus>(&mut self, b: &mut B, part: Part) -> Result<(), Error> {
-        if part == self.part {
+        #[cfg(any(test, feature = "emmc-session"))]
+        if self.part.is_none() {
+            self.refresh(b, &mut [0; WORDS])?;
+        }
+        #[cfg(any(test, feature = "emmc-session"))]
+        let selected = self.part == Some(part);
+        #[cfg(not(any(test, feature = "emmc-session")))]
+        let selected = self.part == part;
+        if selected {
             return Ok(());
         }
         if self.blocks(part) == 0 {
@@ -497,7 +535,10 @@ impl Card {
         }
         let v = (self.fields.part_config & !7) | part as u8;
         self.switch(b, Switch::PartitionConfig(v))?;
-        self.part = part;
+        #[cfg(not(any(test, feature = "emmc-session")))]
+        {
+            self.part = part;
+        }
         Ok(())
     }
 
@@ -541,11 +582,52 @@ impl Card {
         Ok(())
     }
 
-    /// Re-read EXT_CSD into `ext` (and the fields).
+    /// Re-read EXT_CSD and reconcile the cached fields and access bits, without
+    /// changing the selected partition.
+    #[cfg(any(test, feature = "emmc-session"))]
     pub fn refresh<B: MmcBus>(&mut self, b: &mut B, ext: &mut [u32; WORDS]) -> Result<(), Error> {
-        self.select(b, Part::User)?;
+        self.part = None;
         read_ext_csd(b, self.write, ext)?;
+        self.update_ext(ext);
+        Ok(())
+    }
+
+    #[cfg(any(test, feature = "emmc-session"))]
+    fn update_ext(&mut self, ext: &[u32; WORDS]) {
         self.fields = Fields::parse(ext);
+        self.part = access(self.fields.part_config);
+    }
+
+    /// Refresh before trusting the cached selection, then confirm a deliberate
+    /// switch with another EXT_CSD read. After ambiguity or unexpected drift,
+    /// do not switch and write as part of the same destructive command.
+    #[cfg(any(test, feature = "emmc-session"))]
+    fn select_for_write<B: MmcBus>(
+        &mut self,
+        b: &mut B,
+        part: Part,
+        ext: &mut [u32; WORDS],
+    ) -> Result<(), Error> {
+        if !self.write {
+            return Err(Error::Guard("eMMC writes are not built in"));
+        }
+        let cached = self.part;
+        self.refresh(b, ext)?;
+        if let Some(why) = self.protected(part) {
+            return Err(Error::Guard(why));
+        }
+        if self.part != Some(part) && self.part.is_some() && self.part == cached {
+            self.select(b, part)?;
+            self.refresh(b, ext)?;
+            if let Some(why) = self.protected(part) {
+                return Err(Error::Guard(why));
+            }
+        }
+        if self.part != Some(part) {
+            return Err(Error::Guard(
+                "eMMC partition access not confirmed; not touched",
+            ));
+        }
         Ok(())
     }
 
@@ -573,6 +655,7 @@ impl Card {
 
     /// Write `blocks` blocks from `words` at `lba` of the selected
     /// partition; every call is checked against `t` once more.
+    #[cfg(any(test, feature = "emmc-session"))]
     fn write_blocks<B: MmcBus>(
         &mut self,
         b: &mut B,
@@ -585,7 +668,7 @@ impl Card {
         if !self.write
             || n == 0
             || n > MAX_BLOCKS as u64
-            || self.part != t.part
+            || self.part != Some(t.part)
             || lba < t.first
             || lba + n > t.first + t_blocks
             || lba + n > self.blocks(t.part)
@@ -604,6 +687,7 @@ impl Card {
     }
 
     /// The target's length in blocks on this card.
+    #[cfg(any(test, feature = "emmc-session"))]
     pub fn target_blocks(&self, t: &Target) -> Result<u64, Error> {
         let n = if t.blocks == 0 {
             self.blocks(t.part)
@@ -625,6 +709,7 @@ impl Card {
     /// write protection, then write with the first block last (a partial
     /// boot0 write never carries an eGON header), and read back.
     /// `scratch`: at least [`MAX_BLOCKS`] blocks.
+    #[cfg(any(test, feature = "emmc-session"))]
     pub fn program<B: MmcBus>(
         &mut self,
         b: &mut B,
@@ -648,10 +733,7 @@ impl Card {
         if scratch.len() < WORDS * MAX_BLOCKS {
             return Err(Error::Guard("scratch buffer too small"));
         }
-        if let Some(why) = self.protected(t.part) {
-            return Err(Error::Guard(why));
-        }
-        self.select(b, t.part)?;
+        self.select_for_write(b, t.part, &mut [0; WORDS])?;
         let blocks = image.len().div_ceil(BLOCK) as u64;
         info.info(format_args!(
             "writing {blocks} blocks to {:?} at block {}",
@@ -692,6 +774,7 @@ impl Card {
 
     /// `erase` of `t`: zeros, the first block first (the target stops
     /// being bootable before anything else changes), then read back.
+    #[cfg(any(test, feature = "emmc-session"))]
     pub fn erase<B: MmcBus>(
         &mut self,
         b: &mut B,
@@ -703,10 +786,7 @@ impl Card {
         if scratch.len() < WORDS * MAX_BLOCKS {
             return Err(Error::Guard("scratch buffer too small"));
         }
-        if let Some(why) = self.protected(t.part) {
-            return Err(Error::Guard(why));
-        }
-        self.select(b, t.part)?;
+        self.select_for_write(b, t.part, &mut [0; WORDS])?;
         info.info(format_args!(
             "zeroing {tb} blocks of {:?} at block {}",
             t.part, t.first
@@ -728,6 +808,7 @@ impl Card {
         Ok(())
     }
 
+    #[cfg(any(test, feature = "emmc-session"))]
     fn compare<B: MmcBus>(
         &mut self,
         b: &mut B,
@@ -762,6 +843,7 @@ impl Card {
     /// bits 6:3 (`part_config`, access bits ignored) and
     /// BOOT_BUS_CONDITIONS, then read EXT_CSD back. Refused while
     /// BOOT_CONFIG_PROT is set (never cleared here).
+    #[cfg(any(test, feature = "emmc-session"))]
     pub fn boot_config<B: MmcBus>(
         &mut self,
         b: &mut B,
@@ -774,6 +856,11 @@ impl Card {
         }
         crate::emmcarm::boot_config_ok(part_config, boot_bus).map_err(Error::Guard)?;
         self.refresh(b, ext)?;
+        if self.part.is_none() {
+            return Err(Error::Guard(
+                "eMMC partition access not confirmed; not touched",
+            ));
+        }
         if self.fields.boot_config_prot != 0 {
             return Err(Error::Guard(
                 "BOOT_CONFIG_PROT set; boot configuration not touched",
@@ -783,11 +870,20 @@ impl Card {
         self.send_switch(b, Switch::PartitionConfig(pc))?;
         self.send_switch(b, Switch::BootBus(boot_bus))?;
         self.refresh(b, ext)?;
-        if self.fields.part_config & 0x78 != part_config & 0x78 || self.fields.boot_bus != boot_bus
-        {
+        if self.fields.part_config != pc || self.fields.boot_bus != boot_bus {
             return Err(Error::Verify(0));
         }
         Ok(())
+    }
+}
+
+#[cfg(any(test, feature = "emmc-session"))]
+fn access(config: u8) -> Option<Part> {
+    match config & 7 {
+        0 => Some(Part::User),
+        1 => Some(Part::Boot1),
+        2 => Some(Part::Boot2),
+        _ => None,
     }
 }
 
@@ -806,6 +902,7 @@ fn read_ext_csd<B: MmcBus>(b: &mut B, write: bool, ext: &mut [u32; WORDS]) -> Re
 
 /// Copy `words.len() * 4` bytes of `image` from `at` into `words`,
 /// zero-padded past its end.
+#[cfg(any(test, feature = "emmc-session"))]
 fn fill(words: &mut [u32], image: &[u8], at: usize) {
     for (i, w) in words.iter_mut().enumerate() {
         let o = at + 4 * i;
@@ -877,6 +974,8 @@ pub(crate) mod model {
         pub bus_width_readable: bool,
         pub width: u32,
         pub fail_write_at: Option<u64>,
+        pub fail_status_once: bool,
+        pub ignore_access_switch: bool,
         pub corrupt_at: Option<u64>,
         state: State,
         busy: u32,
@@ -912,6 +1011,8 @@ pub(crate) mod model {
                 bus_width_readable: false,
                 width: 1,
                 fail_write_at: None,
+                fail_status_once: false,
+                ignore_access_switch: false,
                 corrupt_at: None,
                 state: State::Idle,
                 busy: 2,
@@ -958,6 +1059,9 @@ pub(crate) mod model {
                     }
                     if value & 7 != 0 && self.ext[ext_csd::BOOT_SIZE_MULT] == 0 {
                         return Ok([self.r1() | R1_SWITCH_ERROR, 0, 0, 0]);
+                    }
+                    if self.ignore_access_switch {
+                        return Ok([self.r1(), 0, 0, 0]);
                     }
                 }
                 Switch::BootBus(_) => {
@@ -1029,7 +1133,12 @@ pub(crate) mod model {
                     self.state = State::Tran;
                     [0x700, 0, 0, 0]
                 }
-                (13, State::Tran) if arg == RCA << 16 => [self.r1(), 0, 0, 0],
+                (13, State::Tran) if arg == RCA << 16 => {
+                    if core::mem::take(&mut self.fail_status_once) {
+                        return Err(BusError::Timeout);
+                    }
+                    [self.r1(), 0, 0, 0]
+                }
                 (6, State::Tran) => return self.switch(arg),
                 _ => return Err(BusError::Error),
             };
@@ -1469,6 +1578,84 @@ mod tests {
             assert_eq!(firmware_check(&v), Ok(()));
             assert!(FW_START + v.len() as u64 <= FW_END);
         }
+    }
+
+    #[test]
+    fn ambiguous_switch_refuses_later_armed_write() {
+        use crate::emmcarm::Guard;
+
+        let mut m = EmmcModel::new(256, 1, true);
+        let mut card = open(&mut m);
+        m.fail_status_once = true;
+        assert_eq!(
+            card.select(&mut m, Part::Boot1),
+            Err(Error::Bus(13, BusError::Timeout))
+        );
+        assert_eq!(m.ext[ext_csd::PARTITION_CONFIG] & 7, 1);
+
+        let mut guard = Guard::new(true);
+        let data = image(BLOCK, 12);
+        let name = "emmc@0+200";
+        guard
+            .arm(
+                &std::format!("{name} flash 200 {:08x}", crate::crc32(&data)),
+                0,
+            )
+            .unwrap();
+        let target = guard.take(name, Some(&data), 1).unwrap();
+        let mut scratch = vec![0; WORDS * MAX_BLOCKS];
+        let mut log = Log(Vec::new());
+        assert_eq!(
+            card.program(
+                &mut m,
+                &target,
+                &data,
+                &mut ok_board,
+                &mut scratch,
+                &mut log
+            ),
+            Err(Error::Guard(
+                "eMMC partition access not confirmed; not touched"
+            ))
+        );
+        assert!(!m.cmds().iter().any(|&i| matches!(i, 24 | 25)));
+        // Explicit recovery, then a newly armed, confirmed write.
+        card.select(&mut m, Part::User).unwrap();
+        guard
+            .arm(
+                &std::format!("{name} flash 200 {:08x}", crate::crc32(&data)),
+                2,
+            )
+            .unwrap();
+        let target = guard.take(name, Some(&data), 3).unwrap();
+        card.program(
+            &mut m,
+            &target,
+            &data,
+            &mut ok_board,
+            &mut scratch,
+            &mut log,
+        )
+        .unwrap();
+        assert_eq!(&m.user[..BLOCK], &data);
+    }
+
+    #[test]
+    fn erase_requires_matching_access_after_successful_status() {
+        let mut m = EmmcModel::new(256, 1, true);
+        let mut card = open(&mut m);
+        m.ignore_access_switch = true;
+        let mut scratch = vec![0; WORDS * MAX_BLOCKS];
+        let mut log = Log(Vec::new());
+        let target = target("emmc-boot0").unwrap();
+        assert_eq!(
+            card.erase(&mut m, &target, &mut scratch, &mut log),
+            Err(Error::Guard(
+                "eMMC partition access not confirmed; not touched"
+            ))
+        );
+        assert_eq!(&m.cmds()[12..], [8, 6, 13, 8]);
+        assert_eq!(m.ext[ext_csd::PARTITION_CONFIG] & 7, 0);
     }
 
     #[test]

@@ -5,6 +5,11 @@ authors = ["oreboot authors"]
 edition = "2021"
 description = "fastboot for the Cubie A7A bt0: protocol loop, boot bundles and the guarded SPI NOR writer (no_std, host-tested)"
 
+[features]
+# Track CMD6 outcomes for fastboot's reusable card sessions. The media boot
+# path only identifies the card and reads the user area; it never writes.
+emmc-session = []
+
 [dependencies]
 # The A7A boot layout table (decode, contract, load order) and CRC-32.
 cubie-a7a-common = { path = "../common" }
