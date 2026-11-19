@@ -15,6 +15,7 @@
 //! - X cases: the RX FIFO DFE0 pointers of DBYTE 0/1 (RxFifoVisibility
 //!   0x200, receivers out of standby, FIFO reset) before and after a pair
 //!   with one hw1 strobe bit: which bits make the PHY capture.
+//!
 //! Every CSR a case changes is put back after it.
 //!
 //! [`field_probe`] (bt0 `A7A_ACSM_FIELD=<variant>`, feature `hybrid`, after

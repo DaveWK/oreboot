@@ -748,7 +748,7 @@ fn read_enable(bases: [Option<cubie_a7a_dram::phy::wcklevel::Mr18Base>; 4]) {
 const RD_VREF: Option<cubie_a7a_dram::rdvref::VrefPlan> =
     match RdVrefKnob::parse(crate::knob!("A7A_RD_VREF")) {
         Ok(p) => p,
-        Err(()) => panic!("A7A_RD_VREF: measure|apply[,start,step,n[,dacs]] (hex)"),
+        Err(_) => panic!("A7A_RD_VREF: measure|apply[,start,step,n[,dacs]] (hex)"),
     };
 
 #[cfg(all(not(feature = "wck-alias-probe"), not(feature = "rd-measure")))]

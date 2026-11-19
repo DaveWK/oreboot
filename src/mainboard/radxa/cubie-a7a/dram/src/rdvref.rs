@@ -36,6 +36,10 @@ pub const POINTS_MAX: usize = 48;
 /// The VrefDAC field.
 pub const DAC_MAX: u16 = 0x7f;
 
+/// Why [`VrefPlan`] text does not parse: malformed, or a value out of range.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ParseError;
+
 /// One sweep's plan (env `A7A_RD_VREF`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VrefPlan {
@@ -78,7 +82,7 @@ impl VrefPlan {
 
     /// `measure` or `apply`, optionally followed by `,<start>,<step>,<n>`
     /// and `,<dacs>` (hex). None: unset; Err: malformed.
-    pub const fn parse(s: Option<&str>) -> Result<Option<VrefPlan>, ()> {
+    pub const fn parse(s: Option<&str>) -> Result<Option<VrefPlan>, ParseError> {
         let Some(s) = s else {
             return Ok(None);
         };
@@ -91,12 +95,12 @@ impl VrefPlan {
             p.apply = true;
             i = 5;
         } else {
-            return Err(());
+            return Err(ParseError);
         }
         let mut field = 0;
         while i < b.len() {
             if b[i] != b',' {
-                return Err(());
+                return Err(ParseError);
             }
             i += 1;
             let mut v: u32 = 0;
@@ -106,32 +110,32 @@ impl VrefPlan {
                     b'0'..=b'9' => b[i] - b'0',
                     b'a'..=b'f' => b[i] - b'a' + 10,
                     b'A'..=b'F' => b[i] - b'A' + 10,
-                    _ => return Err(()),
+                    _ => return Err(ParseError),
                 };
                 v = v * 16 + d as u32;
                 digits += 1;
                 if v > 0xffff {
-                    return Err(());
+                    return Err(ParseError);
                 }
                 i += 1;
             }
             if digits == 0 {
-                return Err(());
+                return Err(ParseError);
             }
             match field {
                 0 => p.start = v as u16,
                 1 => p.step = v as u16,
                 2 => p.n = v as u16,
                 3 => p.dacs = v as u8,
-                _ => return Err(()),
+                _ => return Err(ParseError),
             }
             field += 1;
         }
         if field != 0 && field < 3 {
-            return Err(());
+            return Err(ParseError);
         }
         if !p.valid() {
-            return Err(());
+            return Err(ParseError);
         }
         Ok(Some(p))
     }
@@ -278,7 +282,7 @@ impl VrefPlan {
     /// `,<start>,<step>,<n>` and `,<dacs>` (hex) as for the sweep, or one
     /// of the sweep's forms ([`VrefPlan::parse`]). None: unset; Err:
     /// malformed, or coarse rows over the search's budget.
-    pub const fn parse_knob(s: Option<&str>) -> Result<Option<VrefPlan>, ()> {
+    pub const fn parse_knob(s: Option<&str>) -> Result<Option<VrefPlan>, ParseError> {
         let Some(text) = s else {
             return Ok(None);
         };
@@ -302,24 +306,24 @@ impl VrefPlan {
                     b'0'..=b'9' => b[i] - b'0',
                     b'a'..=b'f' => b[i] - b'a' + 10,
                     b'A'..=b'F' => b[i] - b'A' + 10,
-                    _ => return Err(()),
+                    _ => return Err(ParseError),
                 };
                 v = v * 16 + d as u32;
                 digits += 1;
                 if v > 0xff {
-                    return Err(());
+                    return Err(ParseError);
                 }
                 i += 1;
             }
             if digits == 0 {
-                return Err(());
+                return Err(ParseError);
             }
             match field {
                 0 => p.start = v as u16,
                 1 => p.step = v as u16,
                 2 => p.n = v as u16,
                 3 if v >= 1 && v <= 3 => p.dacs = v as u8 | Self::EYE_FLAG,
-                _ => return Err(()),
+                _ => return Err(ParseError),
             }
             field += 1;
         }
@@ -328,7 +332,7 @@ impl VrefPlan {
             ..p
         };
         if (field != 0 && field < 3) || !rows.valid() || !crate::rdeye::rows_valid(&p) {
-            return Err(());
+            return Err(ParseError);
         }
         Ok(Some(p))
     }
@@ -343,7 +347,7 @@ pub struct EyeKnob;
 #[cfg(any(test, feature = "full-speed"))]
 impl EyeKnob {
     /// [`VrefPlan::parse_knob`].
-    pub const fn parse(s: Option<&str>) -> Result<Option<VrefPlan>, ()> {
+    pub const fn parse(s: Option<&str>) -> Result<Option<VrefPlan>, ParseError> {
         VrefPlan::parse_knob(s)
     }
 }
@@ -461,7 +465,7 @@ mod tests {
             "measure,2g,2,10",
             "applyx",
         ] {
-            assert_eq!(VrefPlan::parse(Some(bad)), Err(()), "{bad}");
+            assert_eq!(VrefPlan::parse(Some(bad)), Err(ParseError), "{bad}");
         }
     }
 }

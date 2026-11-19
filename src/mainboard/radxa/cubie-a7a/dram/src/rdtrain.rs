@@ -1095,9 +1095,9 @@ fn vref_sweep<H: Hw>(
         }
         fire(ex, dbs, EV_UPDATE);
         let m = sweep_lanes(ex, dbs, prog, &regs, base, cfg.lane_step, n);
-        for i in 0..2 {
-            for lane in 0..LANES {
-                vr.profile[i][lane][k] = Some(crate::rdvref::width(m[i][lane], n));
+        for (i, row) in m.iter().enumerate() {
+            for (lane, &value) in row.iter().enumerate() {
+                vr.profile[i][lane][k] = Some(crate::rdvref::width(value, n));
             }
         }
     }

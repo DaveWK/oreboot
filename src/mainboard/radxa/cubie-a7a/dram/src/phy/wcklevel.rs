@@ -762,7 +762,12 @@ pub(super) const fn held_edge(
             edge.0[0],
             0,
             0,
-            edge.0[3] | if (start + i) % 2 == 0 { 0x0400 } else { 0 },
+            edge.0[3]
+                | if (start + i).is_multiple_of(2) {
+                    0x0400
+                } else {
+                    0
+                },
         );
         i += 1;
     }

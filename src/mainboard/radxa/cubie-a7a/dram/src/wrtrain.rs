@@ -316,12 +316,12 @@ pub fn blind_baseline<P: WritePort>(
     seed: &mut u32,
 ) -> Result<([u16; DBYTES], u32), WrError<P::Error>> {
     let mut v = [0x20u16; DBYTES];
-    for db in 0..DBYTES {
-        set_dbyte(p, db, v[db]).map_err(WrError::Port)?;
+    for (db, &value) in v.iter().enumerate() {
+        set_dbyte(p, db, value).map_err(WrError::Port)?;
     }
     for _round in 0..2 {
-        for db in 0..DBYTES {
-            let mut best = (u32::MAX, v[db]);
+        for (db, slot) in v.iter_mut().enumerate() {
+            let mut best = (u32::MAX, *slot);
             let mut x = 0u16;
             while x <= TX_DQ_MAX {
                 set_dbyte(p, db, x).map_err(WrError::Port)?;
@@ -353,8 +353,8 @@ pub fn blind_baseline<P: WritePort>(
                     run = (0, 0);
                 }
             }
-            v[db] = lo + (best_run.0 + (best_run.1.max(1) - 1) / 2) as u16;
-            set_dbyte(p, db, v[db]).map_err(WrError::Port)?;
+            *slot = lo + (best_run.0 + (best_run.1.max(1) - 1) / 2) as u16;
+            set_dbyte(p, db, *slot).map_err(WrError::Port)?;
         }
     }
     let left = error_bits(p, seed).map_err(WrError::Port)?;
@@ -378,8 +378,8 @@ pub fn blind_center<P: WritePort>(
 ) -> Result<([u16; DBYTES], [(u16, u16); DBYTES], u32), WrError<P::Error>> {
     let mut v = start;
     let mut run = [(0u16, 0u16); DBYTES];
-    for db in 0..DBYTES {
-        set_dbyte(p, db, start[db]).map_err(WrError::Port)?;
+    for (db, &value) in start.iter().enumerate() {
+        set_dbyte(p, db, value).map_err(WrError::Port)?;
     }
     for db in 0..DBYTES {
         run[db] = (start[db], start[db]);
@@ -641,16 +641,16 @@ pub fn centre<P: WritePort>(
     seed: &mut u32,
 ) -> Result<Centring, WrError<P::Error>> {
     let mut before = [[0u16; LANES]; DBYTES];
-    for db in 0..DBYTES {
-        for lane in 0..LANES {
-            before[db][lane] = p.tx_dq(db, lane, tg).map_err(WrError::Port)?;
+    for (db, row) in before.iter_mut().enumerate() {
+        for (lane, slot) in row.iter_mut().enumerate() {
+            *slot = p.tx_dq(db, lane, tg).map_err(WrError::Port)?;
         }
     }
     let r = centre_from(p, m, tg, apply, &before, seed);
     if r.is_err() {
-        for db in 0..DBYTES {
-            for lane in 0..LANES {
-                let _ = p.set_tx_dq(db, lane, tg, before[db][lane]);
+        for (db, row) in before.iter().enumerate() {
+            for (lane, &value) in row.iter().enumerate() {
+                let _ = p.set_tx_dq(db, lane, tg, value);
             }
         }
     }
@@ -708,10 +708,9 @@ fn centre_from<P: WritePort>(
             }
         }
     }
-    for db in 0..DBYTES {
-        for lane in 0..LANES {
-            p.set_tx_dq(db, lane, tg, applied[db][lane])
-                .map_err(WrError::Port)?;
+    for (db, row) in applied.iter().enumerate() {
+        for (lane, &value) in row.iter().enumerate() {
+            p.set_tx_dq(db, lane, tg, value).map_err(WrError::Port)?;
         }
     }
     let bad = clean(p, seed).map_err(WrError::Port)?;
@@ -932,12 +931,12 @@ where
         mrw_all(mp, &|_, _| code, true).map_err(|e| WrError::Port(e.into()))?;
         let maps = sweep(p, m, tg, centres, &FINE, DQ_LANES, seed)?;
         let f = fits(m, tg, &maps, centres, &FINE);
-        for db in 0..DBYTES {
+        for (db, row) in f.iter().enumerate() {
             if !m.reachable(db, tg) {
                 continue;
             }
             let mut worst: Option<u8> = Some(u8::MAX);
-            for lane in f[db].iter().take(DMI_LANE) {
+            for lane in row.iter().take(DMI_LANE) {
                 worst = match (worst, lane) {
                     (Some(w), LaneFit::Centre { width, .. }) => {
                         Some(w.min((*width).min(255) as u8))
@@ -960,10 +959,9 @@ where
         out.chosen[bytes[ch][k]].unwrap_or(restore[ch][k])
     };
     mrw_all(mp, &pick, false).map_err(|e| WrError::Port(e.into()))?;
-    for db in 0..DBYTES {
-        for lane in 0..LANES {
-            p.set_tx_dq(db, lane, tg, centres[db][lane])
-                .map_err(WrError::Port)?;
+    for (db, row) in centres.iter().enumerate() {
+        for (lane, &value) in row.iter().enumerate() {
+            p.set_tx_dq(db, lane, tg, value).map_err(WrError::Port)?;
         }
     }
     Ok(out)
