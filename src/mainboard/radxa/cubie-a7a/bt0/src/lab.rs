@@ -25,11 +25,18 @@
 //! | 12 PTEST | base, bytes, mode | errors, first address, wanted, got, OR of all xors, bit-28 0->1 count, bit-28 1->0 count, first bit-28 address, ms |
 //!
 //! | 13 WARM | entry | - (does not return: the ROM's interrupts quiesced, then the RMR warm reset into AArch64 at `entry`, as entry 2 does for main; the watchdog the lab armed keeps running) |
+//! | 14 DRIFT | channel, run-time code, flags | the 22 words of `cubie_a7a_dram::drift::Sample::words` (feature `drift-log`; without it the op is unknown) |
 //!
 //! PTEST modes (fill the whole range, then check it): 0 address in
 //! address, 1 its inverse, 2 checkerboard 0x5555_5555/0xaaaa_aaaa by word,
 //! 3 its inverse, 4 walking one (bit = word index mod 32), 5 walking zero,
 //! 6 bit 28 alone toggling by word (rest 0), 7 its inverse (rest 1).
+//!
+//! DRIFT (run-time code 0x40 for 2048 clocks, or 0 to leave the
+//! oscillators alone; flags bit 0 strobes the RX replica's snapshot) takes
+//! one drift sample of the channel: both ranks' WCK2DQI and WCK2DQO
+//! interval oscillator counts, MR4, and the PHY's drift indicators of the
+//! channel's DBYTEs. It handles the CSR mux itself and puts it back.
 //!
 //! PHY CSRs are given as their APB address (0x20000 = MASTER); the CPU
 //! address is `0x0A900000 + 2 * csr`. The CSR mux (MicroContMuxSel) is not
@@ -59,6 +66,8 @@ pub mod op {
     pub const MRW: u32 = 11;
     pub const PTEST: u32 = 12;
     pub const WARM: u32 = 13;
+    #[cfg(feature = "drift-log")]
+    pub const DRIFT: u32 = 14;
 }
 
 const PHY_BASE: usize = 0x0a90_0000;
@@ -261,6 +270,8 @@ pub fn run() -> (u32, u32, u32) {
             op::W16 | op::W32 | op::R16N => 2,
             op::R16 | op::R32 | op::DELAY | op::WARM => 1,
             op::MEMTEST | op::MRR | op::FILL | op::CHECK | op::PTEST => 3,
+            #[cfg(feature = "drift-log")]
+            op::DRIFT => 3,
             op::MRW => 4,
             _ => return (ops, out.n as u32, 0x100 | opc),
         };
@@ -329,6 +340,13 @@ pub fn run() -> (u32, u32, u32) {
                     Err(cubie_a7a_dram::Error::Config(_)) => 0xdead_0002,
                     Err(_) => 0xdead_0003,
                 });
+            }
+            #[cfg(feature = "drift-log")]
+            op::DRIFT => {
+                let s = cubie_a7a_dram::drift::sample(&mut hw, a(0) as usize, a(1), a(2));
+                for v in s.words() {
+                    out.push(v);
+                }
             }
             op::R16N => {
                 let (c, n) = (a(0) as usize, a(1) as usize);

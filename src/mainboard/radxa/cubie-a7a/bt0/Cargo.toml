@@ -142,6 +142,12 @@ fastboot-emmc-write = ["fastboot"]
 # stage's compares cover both ranks. Lab feature until a board run confirms
 # the rank layout; without it every image is built as before.
 wr-r1 = ["cubie-a7a-dram/rank-map"]
+# Lab op DRIFT of the FEL lab entry (src/lab.rs; cubie_a7a_dram::drift): one
+# drift sample of a channel in mission mode. It runs the DRAM's WCK2DQI and
+# WCK2DQO interval oscillators through the controller's sequencer and
+# returns their counts, MR4 and the PHY's drift indicators; it compensates
+# nothing. Lab builds only; without it every image is built as before.
+drift-log = ["fel", "cubie-a7a-dram/drift-log"]
 # The blobless probe at pstate 3 (the lowest) instead of 1, the
 # timing-independence test of the data-mode compare.
 probe-ps3 = ["blobless"]
