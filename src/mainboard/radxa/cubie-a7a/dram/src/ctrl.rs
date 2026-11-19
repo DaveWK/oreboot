@@ -208,7 +208,6 @@ pub fn set_address_map<H: Hw>(hw: &mut H, p: &Para, ch: usize) -> Result<(), Err
 
 /// HIF bit of ADDRMAP1's chip-select bit 0 field at value 0 (DesignWare
 /// DDRCTL: each ADDRMAP field holds its HIF bit minus the field's base).
-#[cfg(any(test, feature = "rank-map"))]
 const CS_BIT0_BASE: u32 = 6;
 
 /// Where the address map puts the ranks in the system address space: the
@@ -232,9 +231,7 @@ const CS_BIT0_BASE: u32 = 6;
 /// bases give a dense layout for every parameter set); not yet measured on
 /// a board.
 ///
-/// Feature `rank-map` (and the unit tests): images without it are built
-/// from exactly the code they had before.
-#[cfg(any(test, feature = "rank-map"))]
+/// The default write stage decodes the live map with this type.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RankMap {
     /// Bit of the DRAM offset that selects the rank; `None` with one rank.
@@ -243,7 +240,6 @@ pub struct RankMap {
     pub size: u64,
 }
 
-#[cfg(any(test, feature = "rank-map"))]
 impl RankMap {
     /// From the ADDRMAP1 write of the shared writer for `p`'s geometry;
     /// `size` is the usable size in bytes (the caller's

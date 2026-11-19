@@ -26,9 +26,7 @@ vendor-vdd2l = []
 # values, so the knob functions fold to constants and images stay the size
 # the build-time consts gave.
 lab-knobs = []
-# ctrl::RankMap: where the address map puts each rank in the system address
-# space (bt0 feature wr-r1; always built for the unit tests). Off: the crate
-# compiles exactly as before, so the other images stay byte-identical.
+# Compatibility alias: the live rank decoder is always available.
 rank-map = []
 # drift: one sample of the DRAM's WCK2DQ interval oscillators, MR4 and the
 # PHY's drift indicators in mission mode, for logging; no compensation (bt0

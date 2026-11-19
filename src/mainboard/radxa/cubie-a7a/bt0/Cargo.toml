@@ -138,14 +138,8 @@ dram-lab = ["fastboot", "fel-lab", "cubie-a7a-dram/lab-knobs", "cubie-a7a-common
 # eMMC flash/erase and the boot configuration (PARTITION_CONFIG bits 6:3,
 # BOOT_BUS_CONDITIONS) behind arming and content checks.
 fastboot-emmc-write = ["fastboot"]
-# The write stage's upper eight probe blocks in rank 1 instead of at
-# 0xbf000000 (src/dram/wrstage.rs `blocks`; with the blob-free boot, or
-# with `bl-mission` or `hybrid` and `A7A_WR_STAGE`): rank 1 is found from
-# the address map the controller
-# holds (CXMT 4 GB: 0xc0100000; CXMT 6 GB, non-binary: 0x80100000), so the
-# stage's compares cover both ranks. Lab feature until a board run confirms
-# the rank layout; without it every image is built as before.
-wr-r1 = ["cubie-a7a-dram/rank-map"]
+# Compatibility alias for old lab configurations; all write stages use live probes.
+wr-r1 = []
 # Lab op DRIFT of the FEL lab entry (src/lab.rs; cubie_a7a_dram::drift): one
 # drift sample of a channel in mission mode. It runs the DRAM's WCK2DQI and
 # WCK2DQO interval oscillators through the controller's sequencer and

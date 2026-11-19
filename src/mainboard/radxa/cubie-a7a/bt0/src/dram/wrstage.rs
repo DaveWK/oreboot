@@ -25,7 +25,7 @@
 //! nothing. Unset: the writes are made as before (defaults unchanged).
 //!
 //! The compare is through the controller: the CPU writes and reads back
-//! [`PROBE`] blocks. The verdict is the host's check afterwards (MRR,
+//! the live probe blocks. The verdict is the host's check afterwards (MRR,
 //! then 3 x 16 MiB memtest), plus the printed delays against the ones found
 //! before (the PMU's in the hybrid).
 
@@ -49,22 +49,7 @@ fn BITS() -> u32 {
     }
 }
 
-/// Probe blocks: 128 bytes each, at power-of-two offsets (so that any
-/// channel interleave from 128 B to 8 KiB puts blocks on both channels),
-/// at the bottom and the top of the 32-bit DRAM window (rank 1, if it is
-/// mapped inside the window at all).
-const PROBE: [usize; BLOCKS] = {
-    let off = [0usize, 0x80, 0x100, 0x200, 0x400, 0x800, 0x1000, 0x2000];
-    let mut p = [0usize; BLOCKS];
-    let mut i = 0;
-    while i < 8 {
-        p[i] = 0x4010_0000 + off[i];
-        p[i + 8] = 0xbf00_0000 + off[i];
-        i += 1;
-    }
-    p
-};
-const BLOCK_BYTES: usize = 128;
+use wrtrain::probe::{Plan, BLOCK_BYTES};
 /// Vref codes of the sweep (10 % + 0.5 % of VDDQ per code: 26 %..41 %;
 /// at VDDQ 560 mV 146..230 mV, inside the 75..350 mV DQ Vref range at a
 /// WCK up to 1600 MHz) and the code that identifies each MR's byte (15 %,
@@ -83,7 +68,7 @@ const VREF_N_CAPPED: usize = wrtrain::vref_n_capped(VREF_FIRST, 1, VREF_N, VREF_
 
 /// The write port and its staged-write ledger; the MR port never writes a
 /// delay, so its ledger stays clean.
-struct Port(Bt0Hw, Ledger);
+struct Port<'a>(Bt0Hw, Ledger, &'a Plan);
 
 /// `A7A_WR_APPLY` (module docs).
 #[allow(non_snake_case)]
@@ -93,18 +78,20 @@ fn APPLY() -> bool {
 
 /// Undo the delays a failed stage left behind. The caller halts whether or
 /// not this succeeds, so a restore error is only logged.
-fn undo(p: &mut Port, before: &Snapshot) -> bool {
+fn undo(p: &mut Port<'_>, before: &Snapshot) -> bool {
     wrtrain::restore(p, before);
-    println!("[dram] WR: stage failed; the delays found before are back");
+    p.apply_restore();
     false
 }
 
 /// The final probe compare, propagated: a compare error fails the stage.
-fn finish(p: &mut Port, before: &Snapshot, seed: &mut u32) -> bool {
-    match wrtrain::final_check(p, seed) {
-        Ok(bad) => {
+fn finish(p: &mut Port<'_>, before: &Snapshot, seed: &mut u32, m: &wrtrain::Map) -> bool {
+    match wrtrain::final_check(m, seed, |seed| p.compare(seed)) {
+        Ok(report) => {
+            let bad = report.bad;
+            log_coverage("final", p.2.required, report.covered);
             println!("[dram] WR: final probe check: failing blocks {bad:04x}");
-            bad == 0
+            report.passes(p.2.required) || undo(p, before)
         }
         Err(e) => {
             println!("[dram] WR: final probe check failed: {e:?}; stopping");
@@ -113,7 +100,7 @@ fn finish(p: &mut Port, before: &Snapshot, seed: &mut u32) -> bool {
     }
 }
 
-impl WritePort for Port {
+impl WritePort for Port<'_> {
     type Error = Error;
     fn set_tx_dq(&mut self, db: usize, lane: usize, tg: usize, v: u16) -> Result<(), Error> {
         csr_access(&mut self.0, true);
@@ -129,6 +116,25 @@ impl WritePort for Port {
         Ok(v)
     }
     fn check(&mut self, seed: u32) -> Result<Folds, Error> {
+        self.compare(seed).map(|(f, _)| f)
+    }
+}
+
+impl Port<'_> {
+    fn apply_restore(&mut self) {
+        if APPLY() {
+            let hw = &mut self.0;
+            if let Err(e) = self
+                .1
+                .apply(&mut || cubie_a7a_dram::blobless::apply_delays(hw, DBYTES / 2))
+            {
+                println!("[dram] WR: restoring delays failed: {e:?}");
+                return;
+            }
+        }
+        println!("[dram] WR: stage failed; restored initial delay settings");
+    }
+    fn compare(&mut self, seed: u32) -> Result<(Folds, u32), Error> {
         // Plain load and store: bt0 runs with the MMU off, where the
         // exclusive accesses of an atomic read-modify-write (swap) abort.
         // Fail closed: the pending flag clears only after a successful apply,
@@ -138,7 +144,7 @@ impl WritePort for Port {
             self.1
                 .apply(&mut || cubie_a7a_dram::blobless::apply_delays(hw, DBYTES / 2))?;
         }
-        for &b in self::probe!().iter() {
+        for &b in self.2.blocks.iter() {
             for a in (b..b + BLOCK_BYTES).step_by(4) {
                 // SAFETY: DRAM in mission mode; bt0 runs from SRAM and
                 // nothing else uses these blocks.
@@ -146,19 +152,21 @@ impl WritePort for Port {
             }
         }
         let mut f = [0u32; BLOCKS];
-        for (k, &b) in self::probe!().iter().enumerate() {
+        let mut compared = 0;
+        for (k, &b) in self.2.blocks.iter().enumerate() {
             for a in (b..b + BLOCK_BYTES).step_by(4) {
                 // SAFETY: as above.
                 let got = unsafe { core::ptr::read_volatile(a as *const u32) };
                 f[k] |= got ^ pattern(a, seed);
             }
+            compared |= 1 << k;
         }
         crate::recovery::kick();
-        Ok(f)
+        Ok((f, compared))
     }
 }
 
-impl MrPort for Port {
+impl MrPort for Port<'_> {
     type Error = Error;
     fn mrw(&mut self, ch: usize, rank: usize, ma: u8, op: u8) -> Result<(), Error> {
         cubie_a7a_dram::mr::write_rank(&mut self.0, ch, rank as u32, ma as u32, op as u32)
@@ -173,9 +181,17 @@ impl MrPort for Port {
     }
 }
 
-/// Two ports on one `Bt0Hw` (a unit struct): the write side and the MR side.
-fn ports() -> (Port, Port) {
-    (Port(Bt0Hw, Ledger::new()), Port(Bt0Hw, Ledger::new()))
+/// One nibble per timing group; one bit per physical DBYTE.
+fn log_coverage(stage: &str, required: u8, observed: u8) {
+    for db in 0..DBYTES {
+        let groups = |mask: u8| ((mask >> db) & 1) | (((mask >> (DBYTES + db)) & 1) << 1);
+        println!(
+            "[dram] WR: {stage} ch{} DB{db} TG mask {:x}, required {:x}",
+            db / 2,
+            groups(observed),
+            groups(required)
+        );
+    }
 }
 
 fn print_delays(tag: &str, tg: usize, d: &Delays) {
@@ -191,11 +207,20 @@ pub fn run() -> bool {
     if BITS() == 0 {
         return true;
     }
-    let (mut p, mut mp) = ports();
+    use cubie_a7a_dram::ctrl::{addrmap, ddrc, MSTR0};
+    let mstr = [0, 1].map(|ch| Bt0Hw.read32(ddrc(ch, MSTR0)));
+    let am1 = [0, 1].map(|ch| Bt0Hw.read32(addrmap(ch, 1)));
+    let Some(plan) = Plan::from_live(crate::mem::DRAM_BASE as u32, mstr, am1) else {
+        println!("[dram] WR: unsupported geometry MSTR0 {mstr:08x?} ADDRMAP1 {am1:08x?}; stopping");
+        return false;
+    };
+    let mut p = Port(Bt0Hw, Ledger::new(), &plan);
+    let mut mp = Port(Bt0Hw, Ledger::new(), &plan);
     let mut seed = 0x5eed_0001u32;
     println!(
-        "[dram] WR: stage bits {:x}, probe blocks {PROBE:08x?} x {BLOCK_BYTES} B",
-        BITS()
+        "[dram] WR: stage bits {:x}, probe blocks {:08x?} x {BLOCK_BYTES} B",
+        BITS(),
+        plan.blocks
     );
     let before = match wrtrain::snapshot(&mut p) {
         Ok(b) => b,
@@ -250,19 +275,26 @@ pub fn run() -> bool {
     }
     let blind_clean = blind_start.as_ref().is_some_and(BlindStart::clean);
     let m = match blind_start.as_ref() {
-        Some(start) => match wrtrain::discover_or_restore(&mut p, &mut seed, start, &before) {
-            BlindRun::Map(m) => m,
-            BlindRun::KeepBlind(e) => {
-                println!(
-                    "[dram] WR: discovery failed: {e:?}; the blind start is clean, keeping it"
-                );
-                return finish(&mut p, &before, &mut seed);
+        Some(start) => {
+            match wrtrain::discover_or_restore(&mut p, &mut seed, start, plan.required, &before) {
+                BlindRun::Map(m) => m,
+                BlindRun::KeepBlind(m, e) => {
+                    println!(
+                        "[dram] WR: discovery failed: {e:?}; the blind start is clean, keeping it"
+                    );
+                    log_coverage("discovery", plan.required, m.coverage(u32::MAX));
+                    return finish(&mut p, &before, &mut seed, &m);
+                }
+                BlindRun::Failed(e) => {
+                    if let wrtrain::WrError::Coverage(missing) = &e {
+                        log_coverage("discovery", plan.required, plan.required & !missing);
+                    }
+                    p.apply_restore();
+                    println!("[dram] WR: discovery failed: {e:?}; stopping");
+                    return false;
+                }
             }
-            BlindRun::Failed(e) => {
-                println!("[dram] WR: discovery failed: {e:?}; the delays are back; stopping");
-                return false;
-            }
-        },
+        }
         None => match wrtrain::discover(&mut p, &mut seed) {
             Ok(m) => m,
             Err(e) => {
@@ -271,6 +303,11 @@ pub fn run() -> bool {
             }
         },
     };
+    let observed = m.coverage(u32::MAX);
+    log_coverage("discovery", plan.required, observed);
+    if observed & plan.required != plan.required {
+        return undo(&mut p, &before);
+    }
     println!(
         "[dram] WR: blocks tg {:?}, DBYTEs {:x?}, on both tg {:04x}",
         m.block_tg, m.block_dbs, m.block_both
@@ -287,7 +324,7 @@ pub fn run() -> bool {
         println!(
             "[dram] WR: discovery holds; no centring asked for (stage bit 20): the blind start is clean, keeping it"
         );
-        return finish(&mut p, &before, &mut seed);
+        return finish(&mut p, &before, &mut seed, &m);
     }
     let mut pmu = [[[0u16; LANES]; DBYTES]; 2];
     for (tg, d) in pmu.iter_mut().enumerate() {
@@ -349,31 +386,6 @@ pub fn run() -> bool {
                     "[dram] WR: centring tg {tg} failed: {e:?}; the delays found before are back"
                 );
                 degraded = true;
-            }
-        }
-    }
-    if BITS() & 0x10 != 0 && !measure_only {
-        // Blind (blobless) mode: a timing group the probe blocks cannot
-        // reach (rank 1 above the 32-bit window) would keep the untrained
-        // 0x20 and corrupt every later write to that rank. Take the other
-        // group's result for it (the PMU's two groups agree within +/-3
-        // units in a board dump); flagged, unmeasured.
-        for tg in 0..2 {
-            // Only a group out of reach: one whose centring failed has its
-            // own delays back and keeps them.
-            if reached[tg] {
-                continue;
-            }
-            if let Some(other) = centred[1 - tg] {
-                for (db, lanes) in other.iter().enumerate() {
-                    for (lane, &v) in lanes.iter().enumerate() {
-                        let _ = p.set_tx_dq(db, lane, tg, v);
-                    }
-                }
-                println!(
-                    "[dram] WR: tg {tg} unmeasured: set from tg {} (unverified)",
-                    1 - tg
-                );
             }
         }
     }
@@ -463,102 +475,9 @@ pub fn run() -> bool {
         }
         println!("[dram] WR: measurement only; the delays found before are back");
     }
-    let clean = finish(&mut p, &before, &mut seed);
     if degraded {
         println!("[dram] WR: a step failed; the stage does not pass");
         return undo(&mut p, &before);
     }
-    clean
-}
-
-/// The probe blocks of a compare: [`PROBE`] itself (the same tokens as
-/// before the feature existed, so images without it do not change), or
-/// with feature `wr-r1` the list of [`r1::blocks`]. Used by path
-/// (`self::probe!()`): a `use`d macro is in scope before its definition.
-#[cfg(not(feature = "wr-r1"))]
-macro_rules! probe_blocks {
-    () => {
-        PROBE
-    };
-}
-#[cfg(feature = "wr-r1")]
-macro_rules! probe_blocks {
-    () => {
-        r1::blocks()
-    };
-}
-use probe_blocks as probe;
-
-/// Feature `wr-r1` (the 6 GB board's preparation): the upper eight
-/// probe blocks go to 1 MiB above the start of rank 1's lowest block
-/// instead of [`PROBE`]'s 0xbf000000, so that the stage's compares (blind
-/// start, discovery, centring, the final check) cover both ranks. Where
-/// rank 1 lies comes from the address map the controller holds (ADDRMAP1
-/// of channel A read back; `cubie_a7a_dram::ctrl::RankMap`):
-///
-/// | part | rank bit | rank 1 from | upper blocks |
-/// |---|---|---|---|
-/// | CXMT 4 GB | DRAM offset bit 31 | 0xc0000000 | 0xc0100000 |
-/// | CXMT 6 GB (non-binary) | DRAM offset bit 30 | 0x80000000 | 0x80100000 |
-///
-/// Without the feature 0xbf000000 is rank 0 on the 4 GB part (timing
-/// group 1 is never written or read by this stage) and rank 1 on the 6 GB
-/// part. One rank, or a rank 1 that starts above 4 GiB: [`PROBE`] is kept
-/// and a line says so.
-#[cfg(feature = "wr-r1")]
-mod r1 {
-    use super::{Bt0Hw, BLOCKS, BLOCK_BYTES, PROBE};
-    use cubie_a7a_dram::RegIo;
-
-    /// [`PROBE`] with the upper eight blocks moved, once set.
-    static mut R1_PROBE: [usize; BLOCKS] = PROBE;
-    static mut R1_READY: bool = false;
-
-    /// Start of the upper eight probe blocks for a rank bit at DRAM offset
-    /// bit `rank_bit`: 1 MiB into rank 1's lowest block, if the blocks end
-    /// below 4 GiB.
-    const fn r1_base(rank_bit: u32) -> Option<usize> {
-        if rank_bit >= 32 {
-            return None;
-        }
-        let a = crate::mem::DRAM_BASE as u64 + (1u64 << rank_bit) + 0x10_0000;
-        if a + (PROBE[BLOCKS - 1] - PROBE[8]) as u64 + BLOCK_BYTES as u64 <= 1 << 32 {
-            Some(a as usize)
-        } else {
-            None
-        }
-    }
-    const _: () = assert!(matches!(r1_base(31), Some(0xc010_0000)));
-    const _: () = assert!(matches!(r1_base(30), Some(0x8010_0000)));
-    const _: () = assert!(r1_base(32).is_none() && r1_base(40).is_none());
-
-    /// The probe blocks of this run: the upper eight in rank 1.
-    pub fn blocks() -> &'static [usize; BLOCKS] {
-        // SAFETY: bt0 is single-threaded; the statics are only used here.
-        unsafe {
-            let b = &mut *core::ptr::addr_of_mut!(R1_PROBE);
-            if !core::ptr::read_volatile(core::ptr::addr_of!(R1_READY)) {
-                core::ptr::write_volatile(core::ptr::addr_of_mut!(R1_READY), true);
-                let am1 = Bt0Hw.read32(cubie_a7a_dram::ctrl::addrmap(0, 1));
-                let bit = cubie_a7a_dram::ctrl::RankMap::bit_from_addrmap1(am1, 2);
-                match bit.and_then(r1_base) {
-                    Some(base) => {
-                        for i in 8..BLOCKS {
-                            b[i] = base + (PROBE[i] - PROBE[8]);
-                        }
-                        println!(
-                            "[dram] WR: wr-r1: ADDRMAP1 {am1:#x}, rank bit {bit:?}: probe blocks 8..15 at {base:08x} (rank 1), not {:08x}",
-                            PROBE[8]
-                        );
-                    }
-                    None => {
-                        println!(
-                            "[dram] WR: wr-r1: ADDRMAP1 {am1:#x}, rank bit {bit:?}: no rank 1 below 4 GiB; probe blocks unchanged"
-                        );
-                    }
-                }
-            }
-            b
-        }
-    }
+    finish(&mut p, &before, &mut seed, &m)
 }

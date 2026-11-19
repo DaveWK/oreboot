@@ -61,6 +61,8 @@
 //!   lanes move, then gets its own window; one that is not seen gets the
 //!   median of its DBYTE's DQ lanes.
 
+pub mod probe;
+
 use dram_train::window::{longest_run_linear, Window};
 
 pub const DBYTES: usize = 4;
@@ -129,6 +131,8 @@ pub enum WrError<E> {
     /// Two DQ lanes that share a block share data bits (db, lane, other
     /// db, other lane).
     LaneOverlap(usize, usize, usize, usize),
+    /// Required DBYTE/TG pairs without unambiguous measured blocks.
+    Coverage(u8),
     /// The applied result does not read back cleanly (blocks).
     Verify(u32),
     /// A sweep with more than [`MAX_POINTS`] points or a zero step.
@@ -161,6 +165,18 @@ impl Map {
             }
         }
         m
+    }
+    /// Pairs demonstrated by unambiguous, actually compared blocks.
+    pub fn coverage(&self, compared: u32) -> u8 {
+        let mut pairs = 0;
+        for b in 0..BLOCKS {
+            if (compared & !self.block_both) & (1 << b) != 0 {
+                if let Some(tg @ 0..=1) = self.block_tg[b] {
+                    pairs |= self.block_dbs[b] << (tg as usize * DBYTES);
+                }
+            }
+        }
+        pairs
     }
     /// Whether (`db`, `tg`) can be measured at all.
     pub fn reachable(&self, db: usize, tg: usize) -> bool {
@@ -478,21 +494,38 @@ pub fn restore<P: WritePort>(p: &mut P, before: &Snapshot) {
     }
 }
 
-/// Four compares of every probe block with fresh seeds. `Ok(mask)` has a set
-/// bit for every failing block (`Ok(0)`: clean). A compare error propagates:
-/// it must fail the stage, never be dropped as if the blocks were clean.
-pub fn final_check<P: WritePort>(p: &mut P, seed: &mut u32) -> Result<u32, P::Error> {
+#[derive(Debug, PartialEq, Eq)]
+pub struct FinalCheck {
+    pub bad: u32,
+    pub covered: u8,
+}
+
+impl FinalCheck {
+    pub fn passes(&self, required: u8) -> bool {
+        self.bad == 0 && self.covered & required == required
+    }
+}
+
+/// Four fresh seeds (the P3-A final check). Intersect coverage across the
+/// four passes: a skipped block does not inherit a clean zero-initialized fold.
+pub fn final_check<E>(
+    map: &Map,
+    seed: &mut u32,
+    mut compare: impl FnMut(u32) -> Result<(Folds, u32), E>,
+) -> Result<FinalCheck, E> {
     let mut bad = 0u32;
+    let mut covered = u8::MAX;
     for _ in 0..4 {
         *seed = seed.wrapping_add(0x9e37_79b9);
-        let f = p.check(*seed)?;
+        let (f, compared) = compare(*seed)?;
+        covered &= map.coverage(compared);
         for (b, v) in f.iter().enumerate() {
             if *v != 0 {
                 bad |= 1 << b;
             }
         }
     }
-    Ok(bad)
+    Ok(FinalCheck { bad, covered })
 }
 
 /// A blind start ([`blind_baseline`], then optionally [`blind_center`]): the
@@ -515,9 +548,8 @@ impl BlindStart {
 pub enum Discovery<E> {
     /// A usable map: the centring may follow.
     Map(Map),
-    /// The blind start was clean but the discovery failed: keep the clean
-    /// blind start and run the final check, as before.
-    KeepBlind(WrError<E>),
+    /// Fully covered map unsuitable for centring; verify the clean blind start.
+    KeepBlind(Map, WrError<E>),
     /// The blind start left error bits and the discovery failed too: no
     /// recovered state exists, so the stage must fail and undo the delays.
     Failed(WrError<E>),
@@ -528,29 +560,25 @@ pub enum Discovery<E> {
 /// An unclean blind start is not a base the discovery can recover from: its
 /// error bits mean the compare itself is not trustworthy, so a failed
 /// discovery is a hard stage failure. A clean blind start keeps the old
-/// behaviour (the map rules may refuse it, but the blind start is kept).
+/// behaviour only for a fully covered map that the centring rules refuse.
 pub fn discover_after_blind<P: WritePort>(
     p: &mut P,
     seed: &mut u32,
     start: &BlindStart,
+    required: u8,
 ) -> Discovery<P::Error> {
-    let classify = |e: WrError<P::Error>| {
-        // A port error is a hardware failure, not a refused map: it fails
-        // the stage whatever state the blind start left behind. A refused
-        // map from a clean blind start keeps the old behaviour.
-        if matches!(&e, WrError::Port(_)) || !start.clean() {
-            Discovery::Failed(e)
-        } else {
-            Discovery::KeepBlind(e)
-        }
-    };
     let m = match measure(p, seed) {
         Ok(m) => m,
-        Err(e) => return classify(e),
+        Err(e) => return Discovery::Failed(e), // no measured coverage
     };
+    let missing = required & !m.coverage(u32::MAX);
+    if missing != 0 {
+        return Discovery::Failed(WrError::Coverage(missing));
+    }
     match m.check() {
         Ok(()) => Discovery::Map(m),
-        Err(e) => classify(e),
+        Err(e) if start.clean() => Discovery::KeepBlind(m, e),
+        Err(e) => Discovery::Failed(e),
     }
 }
 
@@ -560,7 +588,7 @@ pub enum BlindRun<E> {
     /// A usable map: the centring may follow.
     Map(Map),
     /// Keep the clean blind start and run the final check.
-    KeepBlind(WrError<E>),
+    KeepBlind(Map, WrError<E>),
     /// Hard failure; `before` has been put back on every lane.
     Failed(WrError<E>),
 }
@@ -571,11 +599,12 @@ pub fn discover_or_restore<P: WritePort>(
     p: &mut P,
     seed: &mut u32,
     start: &BlindStart,
+    required: u8,
     before: &Snapshot,
 ) -> BlindRun<P::Error> {
-    match discover_after_blind(p, seed, start) {
+    match discover_after_blind(p, seed, start, required) {
         Discovery::Map(m) => BlindRun::Map(m),
-        Discovery::KeepBlind(e) => BlindRun::KeepBlind(e),
+        Discovery::KeepBlind(m, e) => BlindRun::KeepBlind(m, e),
         Discovery::Failed(e) => {
             restore(p, before);
             BlindRun::Failed(e)
@@ -1819,6 +1848,7 @@ mod tests {
 
     #[test]
     fn final_check_propagates_a_compare_error() {
+        let map = discover(&mut Sim::new().trained(), &mut 1).unwrap();
         let mut p = FailCheck {
             dq: [[[0; 2]; LANES]; DBYTES],
             at: 2,
@@ -1826,7 +1856,7 @@ mod tests {
         };
         let mut seed = 1;
         assert!(
-            final_check(&mut p, &mut seed).is_err(),
+            final_check(&map, &mut seed, |seed| p.check(seed).map(|f| (f, u32::MAX))).is_err(),
             "a compare error must propagate, not be dropped as clean"
         );
         assert_eq!(p.checks, 2, "the failing compare is the second of four");
@@ -1835,7 +1865,16 @@ mod tests {
             at: 0,
             checks: 0,
         };
-        assert_eq!(final_check(&mut clean, &mut seed).unwrap(), 0);
+        assert_eq!(
+            final_check(&map, &mut seed, |seed| clean
+                .check(seed)
+                .map(|f| (f, u32::MAX)))
+            .unwrap(),
+            FinalCheck {
+                bad: 0,
+                covered: 0xff
+            }
+        );
         assert_eq!(clean.checks, 4);
     }
 
@@ -1856,7 +1895,7 @@ mod tests {
             delays: v,
             error_bits: left,
         };
-        match discover_or_restore(&mut s, &mut seed, &start, &before) {
+        match discover_or_restore(&mut s, &mut seed, &start, 0xff, &before) {
             BlindRun::Failed(WrError::Baseline(_)) => {}
             other => panic!("expected a hard failure, got {other:?}"),
         }
@@ -1885,16 +1924,75 @@ mod tests {
         };
         let mut seed = 3;
         assert!(matches!(
-            discover_after_blind(&mut p, &mut seed, &start),
+            discover_after_blind(&mut p, &mut seed, &start, 0xff),
             Discovery::Failed(WrError::Port(_))
         ));
     }
 
+    fn plan(active: u32, am1: u32) -> Option<probe::Plan> {
+        probe::Plan::from_live(0x4000_0000, [active << 24; 2], [am1; 2])
+    }
+    fn probe_discover(s: &mut Sim, start: &BlindStart, before: &Snapshot) -> BlindRun<()> {
+        discover_or_restore(s, &mut 1, start, 0xff, before)
+    }
+    fn verify_probe(m: &Map, mut compare: impl FnMut() -> Result<(Folds, u32), ()>) -> bool {
+        final_check(m, &mut 1, |_| compare()).is_ok_and(|r| r.passes(0xff))
+    }
     #[test]
-    fn clean_blind_start_keeps_a_failed_discovery() {
-        // A clean blind start with a discovery whose Baseline compare is
-        // dirty keeps the old behaviour: the caller runs the final check on
-        // the blind start.
+    fn probe119_four_gb() {
+        let p = plan(3, 0x3f17).unwrap();
+        assert_eq!(p.blocks[8], 0xc010_0000);
+        assert_eq!(p.blocks[15], 0xc010_2000);
+    }
+    #[test]
+    fn probe119_six_gb() {
+        let p = plan(3, 0x3f16).unwrap();
+        assert_eq!(p.blocks[8], 0x8010_0000);
+        assert_eq!(p.blocks[15], 0x8010_2000);
+    }
+    #[test]
+    fn probe119_single_rank_from_geometry_only() {
+        let p = plan(1, 0x3f3f).unwrap();
+        assert_eq!(p.required, 0x0f);
+        // Same absent CS field, but both ranks enabled: no usable plan.
+        assert!(plan(3, 0x3f3f).is_none());
+    }
+    #[test]
+    fn probe119_no_tg1_refuses_clean_blind_start() {
+        let mut s = Sim::new().trained();
+        for (tg, _) in &mut s.blocks {
+            *tg = 0;
+        }
+        let before = snapshot(&mut s).unwrap();
+        let start = BlindStart {
+            delays: [0; DBYTES],
+            error_bits: 0,
+        };
+        let result = probe_discover(&mut s, &start, &before);
+        assert!(matches!(result, BlindRun::Failed(_)));
+        assert_eq!(before, snapshot(&mut s).unwrap());
+        assert!(matches!(
+            discover_or_restore(&mut s, &mut 1, &start, 0x0f, &before),
+            BlindRun::Map(_)
+        ));
+    }
+    #[test]
+    fn probe119_final_missing_required_pair() {
+        let mut s = Sim::new().trained();
+        let map = discover(&mut s, &mut 1).unwrap();
+        // Only the second final readback skips the channel-1/TG1 blocks.
+        let missing = map.blocks(3, 1);
+        let mut calls = 0;
+        let report = verify_probe(&map, || {
+            calls += 1;
+            let f = s.check(calls)?;
+            Ok::<_, ()>((f, if calls == 2 { !missing } else { u32::MAX }))
+        });
+        assert!(!report);
+    }
+    #[test]
+    fn clean_blind_start_without_a_measured_map_fails() {
+        // A blind baseline cannot replace measured discovery coverage.
         let mut p = AlwaysDirty;
         let start = BlindStart {
             delays: [0x20; DBYTES],
@@ -1902,8 +2000,8 @@ mod tests {
         };
         let mut seed = 9;
         assert!(matches!(
-            discover_after_blind(&mut p, &mut seed, &start),
-            Discovery::KeepBlind(WrError::Baseline(_))
+            discover_after_blind(&mut p, &mut seed, &start, 0xff),
+            Discovery::Failed(WrError::Baseline(_))
         ));
     }
 }
