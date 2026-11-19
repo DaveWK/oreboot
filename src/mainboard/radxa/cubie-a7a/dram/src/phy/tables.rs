@@ -5,11 +5,11 @@
 //! `freq.rs`; `xr`/`xs` are the changes for one rank and the slow speed bin.
 //! Generated data; do not edit by hand, with one exception: the receiver
 //! reference code of [`C_PSTATE`], generated as the literal 0x0035 at 156
-//! CSRs, is the parameter of [`c_pstate`] (`vrefinit.rs` names that
-//! value).
+//! CSRs, is the parameter of [`c_pstate`] (`vrefinit.rs` names that value
+//! and reads the lab knob that replaces it).
 
 use super::prog::*;
-use super::vrefinit::VENDOR_VREF_DAC;
+use super::vrefinit::VREF_DAC_INIT;
 
 /// ddrphy_phyinit_C_initPhyConfig: 45 ops.
 pub static C_ONCE: &[Op] = &[
@@ -63,9 +63,9 @@ pub static C_ONCE: &[Op] = &[
 /// Ops of [`C_PSTATE`].
 pub const C_PSTATE_OPS: usize = 705;
 
-/// ddrphy_phyinit_C_initPhyConfigPsLoop: 705 ops, with the vendor
-/// library's receiver reference code.
-pub static C_PSTATE: &[Op] = &c_pstate(VENDOR_VREF_DAC);
+/// ddrphy_phyinit_C_initPhyConfigPsLoop: 705 ops, with this build's
+/// receiver reference code ([`VREF_DAC_INIT`]).
+pub static C_PSTATE: &[Op] = &c_pstate(VREF_DAC_INIT);
 
 /// [`C_PSTATE`] with `vref_dac` as the code of its 156 receiver reference
 /// writes ([`super::vrefinit::is_vref_dac_csr`]); the PState SRAM records

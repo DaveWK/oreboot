@@ -9,7 +9,10 @@
 //! the receiver reference every default boot reads with, at every DRAM
 //! clock.
 //!
-//! The code in the table is [`VENDOR_VREF_DAC`]: not ours.
+//! The code in the table is [`VENDOR_VREF_DAC`]: not ours. Build
+//! variable `A7A_VREF_INIT=<hex>` (FEL lab) replaces it at all 156 CSRs,
+//! to measure whether a code of our own does as well; unset, the table and
+//! the image are what they were.
 //!
 //! Register names and the 7-bit field are those of the EIC7700X TRM Part 2
 //! register list (public; another SoC with the same DWC LPDDR5/4 PHY
@@ -31,7 +34,7 @@
 /// The VrefDAC code the vendor library programs in step C, at all 156
 /// CSRs. REFERENCE-DERIVED like the rest of `tables::C_PSTATE` (its bus
 /// events): taken over, not derived and not measured by us. It is the
-/// receiver reference of every build.
+/// receiver reference of every build that does not set `A7A_VREF_INIT`.
 pub const VENDOR_VREF_DAC: u16 = 0x0035;
 
 /// The largest VrefDAC code: the field is 7 bits.
@@ -59,10 +62,75 @@ pub const fn is_vref_dac_csr(csr: u32) -> bool {
     }
 }
 
+/// Why the text of `A7A_VREF_INIT` is refused.
+#[cfg_attr(test, derive(Clone, Copy, Debug, PartialEq, Eq))]
+pub enum VrefInitError {
+    /// Not one or two hex digits.
+    NotHex,
+    /// Above [`VREF_DAC_MAX`].
+    OutOfRange,
+}
+
+impl VrefInitError {
+    /// The build's diagnostic.
+    #[inline]
+    pub const fn message(self) -> &'static str {
+        match self {
+            VrefInitError::NotHex => {
+                "A7A_VREF_INIT is not one or two hex digits (a VrefDAC code without 0x, 00..7f)"
+            }
+            VrefInitError::OutOfRange => {
+                "A7A_VREF_INIT is above 7f: the VrefDAC field is 7 bits (00..7f)"
+            }
+        }
+    }
+}
+
+/// The VrefDAC code step C writes in a build whose `A7A_VREF_INIT` is
+/// `text`: unset, [`VENDOR_VREF_DAC`]; else the code `text` names,
+/// one or two hex digits, at most [`VREF_DAC_MAX`]. Anything else is
+/// refused (the build fails), never ignored or clamped.
+#[inline]
+pub const fn parse(text: Option<&str>) -> Result<u16, VrefInitError> {
+    let Some(text) = text else {
+        return Ok(VENDOR_VREF_DAC);
+    };
+    let b = text.as_bytes();
+    if b.is_empty() || b.len() > 2 {
+        return Err(VrefInitError::NotHex);
+    }
+    let mut v: u16 = 0;
+    let mut i = 0;
+    while i < b.len() {
+        let d = match b[i] {
+            c @ b'0'..=b'9' => c - b'0',
+            c @ b'a'..=b'f' => c - b'a' + 10,
+            c @ b'A'..=b'F' => c - b'A' + 10,
+            _ => return Err(VrefInitError::NotHex),
+        };
+        v = v * 16 + d as u16;
+        i += 1;
+    }
+    if v > VREF_DAC_MAX {
+        return Err(VrefInitError::OutOfRange);
+    }
+    Ok(v)
+}
+
+/// The VrefDAC code of this build's `tables::C_PSTATE` ([`parse`] of
+/// `A7A_VREF_INIT`). The table is a constant of the image, so the knob is
+/// a build variable only: the lab mode's run-time knobs
+/// (`crate::knobs::EXTRA`) do not have it.
+pub const VREF_DAC_INIT: u16 = match parse(crate::knob!("A7A_VREF_INIT")) {
+    Ok(v) => v,
+    Err(why) => panic!("{}", why.message()),
+};
+
 #[cfg(test)]
 mod tests {
     extern crate std;
     use super::*;
+    use crate::knobs::profile::{BOOT_1200, BOOT_2400, BOOT_400, BOOT_800};
     use crate::para::Para;
     use crate::phy::prog::{self, Kind, Op};
     use crate::phy::{csr, freq, init, tables};
@@ -135,6 +203,67 @@ mod tests {
         let mut hw = Recorder::default();
         prog::run(&mut hw, table, c, freq::config);
         hw
+    }
+
+    #[test]
+    fn knob_text() {
+        assert_eq!(parse(None), Ok(VENDOR_VREF_DAC));
+        assert_eq!(VENDOR_VREF_DAC, 0x35);
+        for (text, want) in [
+            ("0", 0x00),
+            ("00", 0x00),
+            ("7", 0x07),
+            ("33", 0x33),
+            ("34", 0x34),
+            ("35", 0x35),
+            ("40", 0x40),
+            ("7f", 0x7f),
+            ("7F", 0x7f),
+        ] {
+            assert_eq!(parse(Some(text)), Ok(want), "{text}");
+        }
+        // Every code of the field, and nothing above it.
+        for v in 0..=0xffu16 {
+            let text = std::format!("{v:02x}");
+            let want = if v <= VREF_DAC_MAX {
+                Ok(v)
+            } else {
+                Err(VrefInitError::OutOfRange)
+            };
+            assert_eq!(parse(Some(&text)), want, "{text}");
+        }
+        assert_eq!(VREF_DAC_MAX, 0x7f);
+        for text in ["80", "ff", "FF", "a0"] {
+            assert_eq!(parse(Some(text)), Err(VrefInitError::OutOfRange), "{text}");
+        }
+        for text in [
+            "", " ", "-", "0x40", "040", "100", "4g", "g", "4 ", " 4", "+4", "-1", "64d", "0x",
+        ] {
+            assert_eq!(parse(Some(text)), Err(VrefInitError::NotHex), "{text:?}");
+        }
+        for e in [VrefInitError::NotHex, VrefInitError::OutOfRange] {
+            assert!(e.message().starts_with("A7A_VREF_INIT "));
+        }
+    }
+
+    /// This build's table is [`tables::c_pstate`] of this build's knob, and
+    /// without the knob that is the vendor library's code. No boot profile
+    /// sets the knob, so a default image has it only from the environment.
+    #[test]
+    fn build_value() {
+        assert_eq!(parse(option_env!("A7A_VREF_INIT")), Ok(VREF_DAC_INIT));
+        if option_env!("A7A_VREF_INIT").is_none() {
+            assert_eq!(VREF_DAC_INIT, VENDOR_VREF_DAC);
+        }
+        for p in [&BOOT_1200, &BOOT_2400, &BOOT_800, &BOOT_400] {
+            assert_eq!(p.get("A7A_VREF_INIT"), None, "profile {}", p.mhz);
+        }
+        assert!(!crate::knobs::EXTRA.contains(&"A7A_VREF_INIT"));
+        let want = tables::c_pstate(VREF_DAC_INIT);
+        assert_eq!(tables::C_PSTATE.len(), tables::C_PSTATE_OPS);
+        for (i, (got, want)) in tables::C_PSTATE.iter().zip(&want).enumerate() {
+            assert_eq!((shape(got), got.val), (shape(want), want.val), "op {i}");
+        }
     }
 
     /// The table has one plain write per receiver reference CSR, 156 of
