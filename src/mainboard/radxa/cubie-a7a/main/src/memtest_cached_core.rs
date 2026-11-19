@@ -436,15 +436,29 @@ pub fn decode_error(addr: u64, wanted: u64, got: u64) -> ErrorDecode {
     }
 }
 
-/// Per-pass mismatch summary: total errors, first decoded error and error
-/// count per GiB of DRAM. Implements `memtest::stress::Record` so
-/// `stress::Runner` populates it directly.
+/// A copy-pass block digest mismatch whose word-by-word rescan found no
+/// persistent word error: counted as an error without decoding a physical bit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UnlocalizedMismatch {
+    pub leg: &'static str,
+    pub block_base: u64,
+    pub block_len: u64,
+    pub src_digest: [u8; 32],
+    pub dst_digest: [u8; 32],
+}
+
+/// Per-pass mismatch summary: total errors, first decoded error, first
+/// unlocalized block-hash mismatch, and error count per GiB of DRAM.
+/// Implements `memtest::stress::Record` so `stress::Runner` populates it
+/// directly.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PassReport {
     pub dram_base: u64,
     pub gib_count: usize,
     pub errors: u64,
     pub first: Option<ErrorDecode>,
+    pub unlocalized_count: u64,
+    pub first_unlocalized: Option<UnlocalizedMismatch>,
     pub per_gib: [u64; MAX_GIB],
     pub out_of_range: u64,
 }
@@ -457,6 +471,8 @@ impl PassReport {
             gib_count,
             errors: 0,
             first: None,
+            unlocalized_count: 0,
+            first_unlocalized: None,
             per_gib: [0; MAX_GIB],
             out_of_range: 0,
         }
@@ -466,10 +482,23 @@ impl PassReport {
         &self.per_gib[..self.gib_count]
     }
 
-    /// Record one mismatch without requiring a `wanted != got` XOR (used if a
-    /// copy-pass hash mismatch did not recur on rescan).
-    pub fn record_hash_mismatch(&mut self, addr: u64, wanted: u64, got: u64) {
-        self.record(addr, wanted, got);
+    /// Record an unlocalized block-hash mismatch (a copy-pass digest mismatch
+    /// that disappeared on word-by-word rescan): counts as an error and in the
+    /// block's GiB bucket without populating `self.first` or decoding any bit.
+    pub fn record_unlocalized(&mut self, mismatch: UnlocalizedMismatch) {
+        self.errors = self.errors.saturating_add(1);
+        self.unlocalized_count = self.unlocalized_count.saturating_add(1);
+        if self.first_unlocalized.is_none() {
+            self.first_unlocalized = Some(mismatch);
+        }
+        if let Some(off) = mismatch.block_base.checked_sub(self.dram_base) {
+            let gib = (off >> 30) as usize;
+            if gib < self.gib_count {
+                self.per_gib[gib] = self.per_gib[gib].saturating_add(1);
+                return;
+            }
+        }
+        self.out_of_range = self.out_of_range.saturating_add(1);
     }
 
     /// Fold another pass's totals into an aggregate report.
@@ -477,6 +506,12 @@ impl PassReport {
         self.errors = self.errors.saturating_add(other.errors);
         if self.first.is_none() {
             self.first = other.first;
+        }
+        self.unlocalized_count = self
+            .unlocalized_count
+            .saturating_add(other.unlocalized_count);
+        if self.first_unlocalized.is_none() {
+            self.first_unlocalized = other.first_unlocalized;
         }
         for i in 0..MAX_GIB {
             self.per_gib[i] = self.per_gib[i].saturating_add(other.per_gib[i]);
@@ -1052,11 +1087,16 @@ pub fn run_copy_leg<M: Memory>(
             }
             if report.errors == before {
                 // Hash differed during streaming read, then rescan passed
-                // (transient read error): still record a failure so 0 errors
-                // is never reported after a digest mismatch.
-                let w0 = u64::from_le_bytes(src_hash[..8].try_into().unwrap());
-                let g0 = u64::from_le_bytes(dst_hash[..8].try_into().unwrap());
-                report.record_hash_mismatch(pair.dst, w0, g0);
+                // (transient read error): record an unlocalized block-hash
+                // mismatch with both digests without feeding digest bytes into
+                // the physical bit/address decoder.
+                report.record_unlocalized(UnlocalizedMismatch {
+                    leg: leg.name,
+                    block_base: pair.dst,
+                    block_len: pair.len,
+                    src_digest: src_hash,
+                    dst_digest: dst_hash,
+                });
             }
         }
     }
@@ -1486,7 +1526,8 @@ mod tests {
         assert_eq!(cf.failing_bits(), &[37]);
         assert_eq!(cf.first_bit.unwrap().burst_beat, 6);
 
-        // Transient single-read flip during dst hash still records an error.
+        // Transient single-read flip during dst hash yields an unlocalized
+        // block-hash mismatch, counts as an error, and decodes no physical bit.
         mem.fault_read = Some((0x1_0000_0200, 1u64 << 37));
         mem.fault_once = true;
         let mut copy_transient = PassReport::new(0x4000_0000, 4 * GIB);
@@ -1502,6 +1543,15 @@ mod tests {
         assert_eq!(stats_tr.hash_mismatches, 1);
         assert_eq!(copy_transient.errors, 1);
         assert_eq!(copy_transient.gib_counts(), &[0, 0, 0, 1]);
+        assert!(copy_transient.first.is_none());
+        assert_eq!(copy_transient.unlocalized_count, 1);
+        let u = copy_transient.first_unlocalized.unwrap();
+        assert_eq!(u.leg, "test-copy");
+        assert_eq!(u.block_base, 0x1_0000_0000);
+        assert_eq!(u.block_len, 4096);
+        assert_eq!(u.src_digest, stats_tr.last_src_hash);
+        assert_eq!(u.dst_digest, stats_tr.last_dst_hash);
+        assert_ne!(u.src_digest, u.dst_digest);
     }
 
     #[test]

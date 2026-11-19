@@ -18,8 +18,9 @@ use crate::memtest_cached_core::{
     build_copy_plan, cached_plan_from_handoff, evaluate_verdict,
     plan_covers_both_ranks_and_above_4g, rank_of_addr, run_bit37_pass, run_copy_leg,
     validate_live_rank_map, wb_mapped_range, Bit37Shape, CopyLegStats, ErrorDecode, LiveRankMap,
-    PassReport, RunCoverage, Verdict, ABOVE_4G, ADDRMAP1_CH0, BIT37_SEED_1000, BIT37_SEED_1010,
-    COPY_BLOCK_BYTES, COPY_SEED_BASE, MAIR_WB, SCTLR_C, SCTLR_I, SCTLR_M, STRESS_BLOCK_BYTES,
+    PassReport, RunCoverage, UnlocalizedMismatch, Verdict, ABOVE_4G, ADDRMAP1_CH0, BIT37_SEED_1000,
+    BIT37_SEED_1010, COPY_BLOCK_BYTES, COPY_SEED_BASE, MAIR_WB, SCTLR_C, SCTLR_I, SCTLR_M,
+    STRESS_BLOCK_BYTES,
 };
 
 /// Level-1 table of the cached EL3 flat map (4 KiB aligned).
@@ -297,6 +298,23 @@ fn print_first_error(name: &str, err: &ErrorDecode) {
     }
 }
 
+fn print_hex32(bytes: &[u8; 32]) {
+    for &b in bytes {
+        print!("{b:02x}");
+    }
+}
+
+fn print_unlocalized_mismatch(name: &str, count: u64, u: &UnlocalizedMismatch) {
+    print!(
+        "[main] memtest-cached: pass {name} unlocalized block-hash mismatch (count={count}): leg={} block={:#x} len={:#x} src_sha256=",
+        u.leg, u.block_base, u.block_len
+    );
+    print_hex32(&u.src_digest);
+    print!(" dst_sha256=");
+    print_hex32(&u.dst_digest);
+    println!();
+}
+
 fn print_pass_summary(name: &str, ms: u64, report: &PassReport, copy: Option<CopyLegStats>) {
     print!("[main] memtest-cached: pass {name} ms={ms}");
     if let Some(st) = copy {
@@ -312,6 +330,9 @@ fn print_pass_summary(name: &str, ms: u64, report: &PassReport, copy: Option<Cop
     println!();
     if let Some(err) = report.first.as_ref() {
         print_first_error(name, err);
+    }
+    if let Some(u) = report.first_unlocalized.as_ref() {
+        print_unlocalized_mismatch(name, report.unlocalized_count, u);
     }
 }
 
@@ -468,6 +489,9 @@ pub fn run(h: &Handoff) -> Result<(), &'static str> {
     println!(" ({reason})");
     if let Some(err) = total.first.as_ref() {
         print_first_error("total", err);
+    }
+    if let Some(u) = total.first_unlocalized.as_ref() {
+        print_unlocalized_mismatch("total", total.unlocalized_count, u);
     }
     Uart::attach(crate::soc::UART0_BASE).drain();
 
