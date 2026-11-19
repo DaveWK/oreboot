@@ -1249,6 +1249,12 @@ pub fn mission_handover_relock<H: Hw>(
         hw.write16(csr(0x200a3), 0);
         hw.udelay(5);
     }
+    if crate::obs::OBS_ARM & crate::obs::ARM_CHECK != 0 {
+        // FEL lab A7A_OBS_ARM bit 0: the PHY's RX FIFO pointer check,
+        // armed (masked off the interrupt pin) before the DFI init, so the
+        // dfi_init_start check and every later read are covered.
+        crate::obs::arm(hw);
+    }
     for (c, v) in [(0x2006e, 0u16), (0x20060, 1), (0x20054, 1), (0x2002a, 0)] {
         hw.write16(csr(c), v);
     }
@@ -1271,6 +1277,12 @@ pub fn mission_handover_relock<H: Hw>(
                 hw.modify32(freq(ch, set, crate::handover::DFITMG0), |v| {
                     (v & !crate::handover::RDDATA_EN_MASK)
                         | (en << crate::handover::RDDATA_EN_SHIFT)
+                });
+            }
+            if let Some(cs) = crate::obs::HO_RDCSLAT {
+                // FEL lab: dfi_tphy_rdcslat (+0x588 [14:8]) of the set.
+                hw.modify32(freq(ch, set, 0x588), |v| {
+                    (v & !crate::obs::RDCSLAT_MASK) | (cs << crate::obs::RDCSLAT_SHIFT)
                 });
             }
         }
@@ -1307,8 +1319,16 @@ pub fn mission_handover_relock<H: Hw>(
         csr_access(hw, false);
         crate::phy::devinit::mission_bringup(hw, 3);
     }
+    if crate::obs::OBS_ARM & crate::obs::ARM_SNAP != 0 {
+        let s = crate::obs::snap(hw);
+        crate::obs::print(hw, "before the DFI init", &s);
+    }
     crate::post::dfi_init_cpu(hw, channels)?;
     crate::post::controller_after_phy(hw, p)?;
+    if crate::obs::OBS_ARM & crate::obs::ARM_SNAP != 0 {
+        let s = crate::obs::snap(hw);
+        crate::obs::print(hw, "after the DFI init", &s);
+    }
     if let Some(spec) = option_env!("A7A_HO_MRS") {
         // FEL lab A7A_HO_MRS="ma=hex,...": operating-set MRWs through the
         // controller after the hand-over, before any read (FSP window

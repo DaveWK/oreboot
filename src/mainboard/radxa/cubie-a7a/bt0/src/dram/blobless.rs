@@ -1052,6 +1052,13 @@ fn print_ho_knobs() {
             blobless::HO_RXEN_ADD
         );
     }
+    if cubie_a7a_dram::obs::OBS_ARM != 0 || cubie_a7a_dram::obs::HO_RDCSLAT.is_some() {
+        println!(
+            "[dram] OBS knobs: A7A_OBS_ARM {:x} (1 RX FIFO pointer check armed before the DFI init, 2 snapshots), dfi_tphy_rdcslat {:x?}",
+            cubie_a7a_dram::obs::OBS_ARM,
+            cubie_a7a_dram::obs::HO_RDCSLAT
+        );
+    }
     if let Some(s) = option_env!("A7A_HO_CSRS") {
         println!(
             "[dram] HO knobs: {} PHY CSR writes before the hand-over",

@@ -14,6 +14,7 @@ pub mod dump;
 pub mod handover;
 pub mod hw;
 pub mod mr;
+pub mod obs;
 pub mod para;
 pub mod phy;
 pub mod post;
