@@ -674,7 +674,9 @@ impl cubie_a7a_fastboot::sd::SdBus for Smhc {
         arg: u32,
         resp: cubie_a7a_fastboot::sd::Resp,
     ) -> Result<[u32; 4], cubie_a7a_fastboot::sd::BusError> {
-        let r = self.cmd_data(idx, arg, map_resp(resp), None).map_err(bus_error);
+        let r = self
+            .cmd_data(idx, arg, map_resp(resp), None)
+            .map_err(bus_error);
         if idx == 3 {
             if let Ok(v) = r {
                 self.rca = v[0] >> 16;
@@ -683,8 +685,15 @@ impl cubie_a7a_fastboot::sd::SdBus for Smhc {
         r
     }
 
-    fn read(&mut self, idx: u32, arg: u32, buf: &mut [u32]) -> Result<(), cubie_a7a_fastboot::sd::BusError> {
-        self.cmd_data(idx, arg, Resp::R1, Some(buf)).map(|_| ()).map_err(bus_error)
+    fn read(
+        &mut self,
+        idx: u32,
+        arg: u32,
+        buf: &mut [u32],
+    ) -> Result<(), cubie_a7a_fastboot::sd::BusError> {
+        self.cmd_data(idx, arg, Resp::R1, Some(buf))
+            .map(|_| ())
+            .map_err(bus_error)
     }
 
     fn delay_ms(&mut self, ms: u32) {

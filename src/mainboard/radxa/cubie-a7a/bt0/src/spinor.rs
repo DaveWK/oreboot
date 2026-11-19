@@ -76,8 +76,14 @@ const CMD_TIMEOUT_US: u64 = 1_000_000;
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 pub enum Error {
-    Timeout { what: &'static str, fsr: u32 },
-    Range { offset: u32, len: usize },
+    Timeout {
+        what: &'static str,
+        fsr: u32,
+    },
+    Range {
+        offset: u32,
+        len: usize,
+    },
     Fifo(u32),
     /// A guard in this driver refused (never sent).
     Refused(&'static str),
@@ -103,7 +109,14 @@ fn wait_clear(reg: usize, bits: u32, what: &'static str) -> Result<(), Error> {
 
 fn cs(high: bool) {
     let t = read32(TCR) & !TCR_XCH;
-    write32(TCR, if high { t | TCR_SS_LEVEL } else { t & !TCR_SS_LEVEL });
+    write32(
+        TCR,
+        if high {
+            t | TCR_SS_LEVEL
+        } else {
+            t & !TCR_SS_LEVEL
+        },
+    );
 }
 
 impl SpiNor {
@@ -134,7 +147,8 @@ impl SpiNor {
     fn command(&self, cmd: &[u8], out: &mut [u8]) -> Result<(), Error> {
         // READ, RDID and RDSR1 only (cubie_a7a_fastboot::nor::READ_OPCODES),
         // checked at run time: no other byte goes out as an opcode here.
-        if cmd.is_empty() || cmd.len() > 4 || !cubie_a7a_fastboot::nor::read_opcode_allowed(cmd[0]) {
+        if cmd.is_empty() || cmd.len() > 4 || !cubie_a7a_fastboot::nor::read_opcode_allowed(cmd[0])
+        {
             return Err(Error::Refused("opcode not allowed on the read path"));
         }
         write32(FCR, FCR_RF_RST | FCR_TF_RST);
@@ -243,7 +257,10 @@ mod write {
     const PROGRAM_TIMEOUT_US: u64 = 50_000;
 
     fn allowed(op: u8) -> bool {
-        matches!(op, OP_READ | OP_RDID | OP_WREN | OP_RDSR1 | OP_SE | OP_BE | OP_PP)
+        matches!(
+            op,
+            OP_READ | OP_RDID | OP_WREN | OP_RDSR1 | OP_SE | OP_BE | OP_PP
+        )
     }
 
     impl SpiNor {
@@ -263,7 +280,13 @@ mod write {
             }
             let ntx = hdr.len() + tx.len();
             let total = ntx + rx.len();
-            let byte = |i: usize| if i < hdr.len() { hdr[i] } else { tx[i - hdr.len()] };
+            let byte = |i: usize| {
+                if i < hdr.len() {
+                    hdr[i]
+                } else {
+                    tx[i - hdr.len()]
+                }
+            };
             let mut sent = 0;
             while sent < ntx && sent < FIFO_DEPTH as usize {
                 write8(TXD, byte(sent));
@@ -378,7 +401,9 @@ mod write {
                 || offset / nor::PAGE != (offset + n - 1) / nor::PAGE
                 || !nor::in_window(offset, n)
             {
-                return Err(Error::Refused("program outside one page of the write window"));
+                return Err(Error::Refused(
+                    "program outside one page of the write window",
+                ));
             }
             self.write_enable()?;
             self.xfer(&addr(OP_PP, offset), data, &mut [])?;

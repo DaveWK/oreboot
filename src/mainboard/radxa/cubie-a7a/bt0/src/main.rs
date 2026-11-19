@@ -54,6 +54,12 @@ mod ccu;
 mod dram;
 mod dvfs;
 #[cfg(feature = "fastboot")]
+mod ehci;
+#[cfg(feature = "fastboot")]
+mod ext;
+#[cfg(feature = "fastboot")]
+mod extcheck;
+#[cfg(feature = "fastboot")]
 mod fastboot;
 #[cfg(feature = "fel")]
 mod fel;
@@ -61,12 +67,6 @@ mod gpadc;
 mod gpio;
 #[cfg(feature = "fel")]
 mod lab;
-#[cfg(feature = "fastboot")]
-mod ehci;
-#[cfg(feature = "fastboot")]
-mod ext;
-#[cfg(feature = "fastboot")]
-mod extcheck;
 #[cfg(feature = "fastboot")]
 mod musb;
 mod probe;
@@ -662,7 +662,10 @@ extern "C" fn main() -> ! {
     };
     match nor.id() {
         Ok(id) => {
-            println!("[bt0] SPI NOR: JEDEC ID {:02x} {:02x} {:02x}", id[0], id[1], id[2]);
+            println!(
+                "[bt0] SPI NOR: JEDEC ID {:02x} {:02x} {:02x}",
+                id[0], id[1], id[2]
+            );
         }
         Err(e) => {
             println!("[bt0] SPI NOR: RDID failed: {e:?}");
