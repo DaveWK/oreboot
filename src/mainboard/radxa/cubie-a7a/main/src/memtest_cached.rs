@@ -106,17 +106,20 @@ impl CachedEl3FlatMap {
     }
 
     /// Tear down the cached EL3 flat map in one register-only `asm!` block:
-    /// 1. Clear `SCTLR_EL3.C` (keeping `M=1` so the flat VA=PA map stays active
-    ///    and `I=1` so the 4-instruction loop finishes well within WDT0) to
-    ///    prevent any further data-cache allocation.
+    /// 1. Clear both `SCTLR_EL3.C` and `SCTLR_EL3.I` (keeping `M=1` so the
+    ///    flat VA=PA map stays active). Per Arm ARM `SCTLR_EL3.I` ("Stage 1
+    ///    instruction access cacheability"), EL3 instruction fetches to Normal
+    ///    memory are treated as Non-cacheable when `I=0`, stopping both data-
+    ///    and instruction-side refills into L1/L2/L3.
     /// 2. `DC CIVAC` every cache line across `[wb_start, wb_end)` — all Normal
     ///    WB DRAM blocks mapped by `L1_CACHED` — reaching PoC across L1/L2/L3.
-    /// 3. `dsb sy`, restore original `SCTLR_EL3` (`M=0, C=0`), `isb`,
-    ///    `tlbi alle3`, `ic iallu`, `dsb sy`, `isb`, restore `TTBR0/TCR/MAIR`,
-    ///    `isb`.
+    /// 3. Hold `C=0, I=0` through the final maintenance barrier (`dsb sy; isb`),
+    ///    then `ic iallu; dsb sy; isb` to invalidate all instruction caches,
+    ///    then restore original `SCTLR_EL3` (`M=0, C=0`, saved `I`), `isb`,
+    ///    `tlbi alle3; dsb sy; isb`, and restore `TTBR0/TCR/MAIR; isb`.
     #[inline(never)]
     fn teardown(&self) {
-        let sctlr_no_c = (self.sctlr | SCTLR_M | SCTLR_I) & !SCTLR_C;
+        let sctlr_no_ci = (self.sctlr | SCTLR_M) & !(SCTLR_C | SCTLR_I);
         let wb_start = self.wb_start;
         let wb_end = self.wb_end;
         let step = self.line_size;
@@ -131,7 +134,7 @@ impl CachedEl3FlatMap {
         unsafe {
             asm!(
                 "dsb sy",
-                "msr sctlr_el3, {no_c}",
+                "msr sctlr_el3, {no_ci}",
                 "isb",
                 "1:",
                 "dc civac, {p}",
@@ -139,17 +142,20 @@ impl CachedEl3FlatMap {
                 "cmp {p}, {end}",
                 "b.lo 1b",
                 "dsb sy",
+                "isb",
+                "ic iallu",
+                "dsb sy",
+                "isb",
                 "msr sctlr_el3, {s}",
                 "isb",
                 "tlbi alle3",
-                "ic iallu",
                 "dsb sy",
                 "isb",
                 "msr ttbr0_el3, {b}",
                 "msr tcr_el3, {t}",
                 "msr mair_el3, {m}",
                 "isb",
-                no_c = in(reg) sctlr_no_c,
+                no_ci = in(reg) sctlr_no_ci,
                 p = inout(reg) wb_start => _,
                 end = in(reg) wb_end,
                 step = in(reg) step,
