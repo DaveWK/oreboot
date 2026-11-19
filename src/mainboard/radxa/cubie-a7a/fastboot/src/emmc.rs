@@ -400,6 +400,13 @@ impl Card {
 
     /// Switch to `width` and compare a second EXT_CSD read with `ext`;
     /// back to 1 bit on any mismatch. Ok(true) if the wide bus works.
+    /// BUS_WIDTH [183] itself is W/E_P in the eMMC standard (written, not
+    /// readable):
+    /// a device may return 0 or the written code there, and both are
+    /// accepted; every other byte must read back identical. Comparing
+    /// [183] with the written code kept every JEDEC-conforming module on
+    /// 1 bit (seen with a SanDisk iNAND). Linux (mmc_compare_ext_csds)
+    /// and U-Boot compare a few read-only fields only; this stays stricter.
     fn try_width<B: MmcBus>(
         &mut self,
         b: &mut B,
@@ -412,10 +419,11 @@ impl Card {
             && b.set_width(width).is_ok()
             && read_ext_csd(b, self.write, &mut again).is_ok()
             && {
-                // BUS_WIDTH itself changed; everything else must match.
+                // BUS_WIDTH reads 0 or the code; everything else must match.
+                let got = byte(&again, ext_csd::BUS_WIDTH);
                 let mut want = *ext;
-                set_byte(&mut want, ext_csd::BUS_WIDTH, code);
-                want == again
+                set_byte(&mut want, ext_csd::BUS_WIDTH, got);
+                (got == 0 || got == code) && want == again
             };
         if ok {
             self.width = width;
@@ -862,6 +870,11 @@ pub(crate) mod model {
         pub boot: [Vec<u8>; 2],
         pub log: Vec<(u32, u32)>,
         pub broken_wide: bool,
+        /// EXT_CSD[183] BUS_WIDTH as CMD8 returns it: false (default) as
+        /// the eMMC standard types it, W/E_P, written but not readable, so
+        /// it reads 0 (seen on a SanDisk iNAND module: always 1-bit);
+        /// true for a device that echoes the written width.
+        pub bus_width_readable: bool,
         pub width: u32,
         pub fail_write_at: Option<u64>,
         pub corrupt_at: Option<u64>,
@@ -896,6 +909,7 @@ pub(crate) mod model {
                 boot: [pattern(bb, 0x55), pattern(bb, 0xaa)],
                 log: Vec::new(),
                 broken_wide: false,
+                bus_width_readable: false,
                 width: 1,
                 fail_write_at: None,
                 corrupt_at: None,
@@ -1028,7 +1042,11 @@ pub(crate) mod model {
                 return Err(BusError::Error);
             }
             let bytes: Vec<u8> = if idx == 8 {
-                self.ext.to_vec()
+                let mut e = self.ext.to_vec();
+                if !self.bus_width_readable {
+                    e[ext_csd::BUS_WIDTH] = 0;
+                }
+                e
             } else {
                 let n = buf.len() * 4;
                 let a = arg as usize * 512;
@@ -1266,6 +1284,73 @@ mod tests {
         let n = m.log.len();
         assert!(card.read(&mut m, Part::Boot1, 0, &mut buf).is_err());
         assert_eq!(m.log.len(), n);
+    }
+
+    #[test]
+    fn bus_width_byte_reads_zero_or_the_code() {
+        // W/E_P as the eMMC standard types it (reads 0, the model's default
+        // and the SanDisk module) and a device that echoes the code: 8-bit,
+        // with the same commands either way.
+        for readable in [false, true] {
+            let mut m = EmmcModel::new(USER, 16, false);
+            m.bus_width_readable = readable;
+            let card = open(&mut m);
+            assert_eq!(card.width, 8, "readable {readable}");
+            assert_eq!(card.fields.bus_width, if readable { 2 } else { 0 });
+            assert_eq!(m.cmds(), [0, 1, 1, 1, 2, 3, 9, 7, 8, 6, 13, 8]);
+            assert_eq!(m.width, 8);
+        }
+        // 4-bit only: same, through the 4-bit switch.
+        for readable in [false, true] {
+            let mut m = EmmcModel::new(USER, 16, false);
+            m.bus_width_readable = readable;
+            let mut ext = [0u32; WORDS];
+            let c = Card::identify(&mut m, &mut ext, 4, false).unwrap();
+            assert_eq!(c.width, 4);
+            assert_eq!(m.log[9], (6, Switch::BusWidth(1).arg()));
+        }
+    }
+
+    #[test]
+    fn bus_width_byte_with_another_value_falls_back() {
+        // [183] reading back neither 0 nor the code (a garbled bus that
+        // only hits that byte) still fails the wide bus.
+        let mut m = EmmcModel::new(USER, 16, false);
+        m.bus_width_readable = true;
+        let mut ext = [0u32; WORDS];
+        // Identify on 1 bit, then pretend the 8-bit read returned 1 at 183.
+        let mut c = Card::identify(&mut m, &mut ext, 1, false).unwrap();
+        m.ext[ext_csd::BUS_WIDTH] = 0;
+        set_byte(&mut ext, ext_csd::BUS_WIDTH, 0);
+        struct Odd<'a>(&'a mut EmmcModel);
+        impl MmcBus for Odd<'_> {
+            fn present(&mut self) -> Option<bool> {
+                self.0.present()
+            }
+            fn clock(&mut self, i: bool) -> Result<(), BusError> {
+                self.0.clock(i)
+            }
+            fn set_width(&mut self, w: u32) -> Result<(), BusError> {
+                self.0.set_width(w)
+            }
+            fn cmd(&mut self, i: u32, a: u32, r: Resp) -> Result<[u32; 4], BusError> {
+                self.0.cmd(i, a, r)
+            }
+            fn read(&mut self, i: u32, a: u32, buf: &mut [u32]) -> Result<(), BusError> {
+                self.0.read(i, a, buf)?;
+                if i == 8 && self.0.width == 8 {
+                    set_byte(
+                        (&mut buf[..WORDS]).try_into().unwrap(),
+                        ext_csd::BUS_WIDTH,
+                        1,
+                    );
+                }
+                Ok(())
+            }
+        }
+        assert!(!c.try_width(&mut Odd(&mut m), &mut ext, 8).unwrap());
+        assert_eq!(c.width, 1);
+        assert_eq!(m.ext[ext_csd::BUS_WIDTH], 0);
     }
 
     #[test]
