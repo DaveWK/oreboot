@@ -266,13 +266,32 @@ pub const MRL_SEARCH: Option<u16> = match crate::knob!("A7A_RD_MRL_SEARCH") {
     None => None,
 };
 
+/// Measurement hypothesis for the fixed-time PHY receive-path term (in ps)
+/// in [`derive_mrl`].
+///
+/// The A733 PHY pipeline is not publicly documented, so this value is a
+/// working measurement hypothesis rather than an established A733 timing
+/// budget:
+/// - The public BSD-3 STM32MP2 skip-training `dfimrl_program` sums three
+///   200 ps fixed-time terms (`phy_tx_insertion_dly`, `phy_rx_insertion_dly`,
+///   and `phy_rx_fifo_dly`), but that PHY differs: 4 UI per DFI clock, a
+///   separate `ARdPtrInitVal`, and a different receive-gate encoding. Shared
+///   register names do not establish an identical A733 pipeline or that A733's
+///   trained `RxEnDly` absorbs the same terms.
+/// - With `dficlk_ui = 8`, `fifo_ui = 4`, and `mrl_margin = 1` fixed, host
+///   test `pstate_config_tests::rx_pipe_ps_hypothesis_fit_range` computes that
+///   every integer value in `342..=1777` ps reproduces all four test-only
+///   vendor `(RxEnDly, DFIMRL)` pairs; those pairs are regression checks, not
+///   validation of 600 ps.
+/// - The board verification run (with burst traffic) decides it.
+pub const RX_PIPE_PS_HYPOTHESIS: u16 = 600;
+
 impl TrainConfig {
     /// pstate 1 (WCK 1200 MHz, 2400 MT/s, DfiClk 300 MHz, UI 417 ps):
-    /// LPDDR5 4:1 WCK:CK at DFI 1:4 ratio (`DfiFreqRatio = 2'b10`), so
-    /// 1 DfiClk = 4 WCK = 8 UI. Fixed PHY receive-path terms (`fifo_ui = 4`,
-    /// `fifo_ps = 600` ps = 200 ps TX insertion + 200 ps RX insertion +
-    /// 200 ps RX FIFO, `mrl_margin = 1`) follow the public BSD-3 STM32MP2
-    /// skip-training `dfimrl_program`.
+    /// LPDDR5 4:1 WCK:CK at DFI 1:4 ratio (`DfiFreqRatio = 2'b10`, public
+    /// EIC7700X TRM), so `1 DfiClk = 4 WCK = 8 UI` (`dficlk_ui = 8`).
+    /// `fifo_ui = 4`, `mrl_margin = 1`, and `fifo_ps = RX_PIPE_PS_HYPOTHESIS`
+    /// (`600` ps, a measurement hypothesis — see [`RX_PIPE_PS_HYPOTHESIS`]).
     pub const PSTATE1: TrainConfig = TrainConfig {
         next: ModeMrs::NEXT_PSTATE1,
         // The reference's; the bt0 read training sets EXIT_MRS() (A7A_RD_EXIT).
@@ -290,7 +309,7 @@ impl TrainConfig {
         mrl_max: 7,
         dficlk_ui: 8,
         fifo_ui: 4,
-        fifo_ps: 600,
+        fifo_ps: RX_PIPE_PS_HYPOTHESIS,
         mrl_margin: 1,
         mrl_override: None,
         apply: false,
@@ -349,18 +368,21 @@ pub static APPLIED_MRL: core::sync::atomic::AtomicU16 = core::sync::atomic::Atom
 
 /// Derive the read latency (`DFIMRL` / `HwtMRL`, in `DfiClk` cycles) from
 /// the trained receive-enable delay `rx_en` (11-bit CSR in 1/64 UI,
-/// `0x40 = 1 UI`) and the pstate's clock/FIFO geometry:
+/// `0x40 = 1 UI`) and the pstate's clock/FIFO parameters:
 ///
 ///   DFIMRL = ceil((rx_en/64 UI + fifo_ui UI + fifo_ps ps) / dficlk_ui UI) + mrl_margin
 ///
-/// Public basis:
-/// - DFI 1:4 ratio (`DfiFreqRatio = 2'b10`, LPDDR5 WCK:CK 4:1): 1 DfiClk =
-///   4 WCK = 8 UI (`dficlk_ui = 8`).
-/// - Fixed PHY receive-path terms from the public BSD-3 STM32MP2
-///   `ddrphy_phyinit_progcsrskiptrain.c` (`dfimrl_program`):
-///   `phy_tx_insertion_dly` (200 ps) + `phy_rx_insertion_dly` (200 ps) +
-///   `phy_rx_fifo_dly` (4 UI + 200 ps) = `4 UI + 600 ps`, plus
-///   `dfimrlmargin = 1`.
+/// Basis and limits:
+/// - Established: DFI 1:4 ratio (`DfiFreqRatio = 2'b10`, LPDDR5 WCK:CK 4:1,
+///   public EIC7700X TRM plus A7A clocks): `1 DfiClk = 4 WCK = 8 UI`
+///   (`dficlk_ui = 8`).
+/// - Measurement hypothesis ([`RX_PIPE_PS_HYPOTHESIS`] = 600 ps, with
+///   `fifo_ui = 4`, `mrl_margin = 1`): inspired by the public BSD-3 STM32MP2
+///   skip-training `dfimrl_program`, which differs (4 UI per DFI clock,
+///   separate `ARdPtrInitVal`, different receive-gate encoding). Host test
+///   `pstate_config_tests::rx_pipe_ps_hypothesis_fit_range` shows `342..=1777`
+///   ps all reproduce the four test-only vendor pairs; the board run decides
+///   the A733 value.
 ///
 /// Returns `None` on inconsistent inputs (zero or out-of-CSR `rx_en`,
 /// invalid clock/range config, or a derived value outside
@@ -1667,7 +1689,7 @@ mod pstate_config_tests {
         let c1 = TrainConfig::PSTATE1;
         assert_eq!(c1.dficlk_ui, 8);
         assert_eq!(c1.fifo_ui, 4);
-        assert_eq!(c1.fifo_ps, 600);
+        assert_eq!(c1.fifo_ps, RX_PIPE_PS_HYPOTHESIS);
         assert_eq!(c1.mrl_margin, 1);
         for ps in 0..4u32 {
             let c = cfg_for(ps);
@@ -1698,13 +1720,49 @@ mod pstate_config_tests {
     }
 
     #[test]
+    fn rx_pipe_ps_hypothesis_fit_range() {
+        // With dficlk_ui = 8, fifo_ui = 4, and mrl_margin = 1 fixed, compute
+        // the exact contiguous integer range of fifo_ps (in ps) for which
+        // derive_mrl() reproduces all four test-only vendor (RxEnDly, DFIMRL)
+        // regression pairs.
+        let fits = |ps_term: u16| {
+            VENDOR_ORACLES.iter().all(|&(ps, rx_en, want_mrl)| {
+                let c = TrainConfig {
+                    fifo_ps: ps_term,
+                    ..cfg_for(ps)
+                };
+                derive_mrl(rx_en, &c) == Some(want_mrl)
+            })
+        };
+        let mut min_ps = None;
+        let mut max_ps = None;
+        let mut count = 0u32;
+        for ps_term in 0..=4000u16 {
+            if fits(ps_term) {
+                if min_ps.is_none() {
+                    min_ps = Some(ps_term);
+                }
+                max_ps = Some(ps_term);
+                count += 1;
+            }
+        }
+        assert_eq!(min_ps, Some(342));
+        assert_eq!(max_ps, Some(1777));
+        assert_eq!(count, 1777 - 342 + 1);
+        assert!(!fits(341));
+        assert!(!fits(1778));
+        assert!((342..=1777).contains(&RX_PIPE_PS_HYPOTHESIS));
+    }
+
+    #[test]
     fn derive_mrl_matches_all_four_pstates_from_first_principles() {
-        // Formula: ceil((rx_en + 4*64 + ceil(600*64 / ui_ps)) / (8*64)) + 1
+        // Formula: ceil((rx_en + 4*64 + ceil(RX_PIPE_PS_HYPOTHESIS*64 / ui_ps)) / (8*64)) + 1
         // where 1 DfiClk = 4 WCK = 8 UI = 512 (1/64 UI) at DFI 1:4 ratio,
-        // 4 UI + 600 ps = phy_tx_insertion (200 ps) + phy_rx_insertion (200 ps)
-        // + phy_rx_fifo (4 UI + 200 ps), and margin = 1 DfiClk.
+        // fifo_ui = 4, mrl_margin = 1, and RX_PIPE_PS_HYPOTHESIS = 600 ps is a
+        // measurement hypothesis (342..=1777 ps all match the four regression
+        // pairs; see rx_pipe_ps_hypothesis_fit_range).
         //
-        // Test-only vendor oracles at all four pstates:
+        // Test-only vendor regression oracles at all four pstates:
         // - ps0 (208 ps):  0x497 (1175) + 256 + 185 = 1616; ceil(1616/512) + 1 = 4 + 1 = 5
         // - ps1 (417 ps):  0x369 ( 873) + 256 +  93 = 1222; ceil(1222/512) + 1 = 3 + 1 = 4
         // - ps2 (625 ps):  0x307 ( 775) + 256 +  62 = 1093; ceil(1093/512) + 1 = 3 + 1 = 4
@@ -1721,25 +1779,23 @@ mod pstate_config_tests {
             );
         }
 
-        // Our own board-measured RxEnDly values (2 UI earlier than vendor due
-        // to WL TxWckDly phase):
+        // Predictions for our own board-measured RxEnDly values (2 UI earlier
+        // than vendor due to WL TxWckDly phase):
         // - ps0 (208 ps, 049/rl0 max 0x420 = 1056): 1056 + 256 + 185 = 1497;
-        //   ceil(1497/512) + 1 = 3 + 1 = 4 (centre of 049 sweep 2..=6; +1 at
-        //   handover gives mission 5, inside the 2026-11-18 clean window 5..=6).
+        //   ceil(1497/512) + 1 = 3 + 1 = 4 (predicts mission 5 with +1; search
+        //   pivot is 4, so board verification decides).
         assert_eq!(derive_mrl(0x420, &TrainConfig::PSTATE0), Some(4));
         assert_eq!(derive_mrl(0x40c, &TrainConfig::PSTATE0), Some(4));
         // - ps1 (417 ps, 052 A0 max 0x2f8 = 760): 760 + 256 + 93 = 1109;
-        //   ceil(1109/512) + 1 = 3 + 1 = 4 (inside sweep 1..=6; +1 at handover
-        //   gives mission 5, proven on Fedora soaks).
+        //   ceil(1109/512) + 1 = 3 + 1 = 4 (mission 5 with +1).
         assert_eq!(derive_mrl(0x2f8, &TrainConfig::PSTATE1), Some(4));
         assert_eq!(derive_mrl(0x2ec, &TrainConfig::PSTATE1), Some(4));
         // - ps2 (625 ps, 052 A1 max 0x28c = 652): 652 + 256 + 62 = 970;
-        //   ceil(970/512) + 1 = 2 + 1 = 3 (inside sweep 1..=7; +1 at handover
-        //   gives mission 4).
+        //   ceil(970/512) + 1 = 2 + 1 = 3 (mission 4 with +1, unmeasured).
         assert_eq!(derive_mrl(0x28c, &PSTATE2), Some(3));
         assert_eq!(derive_mrl(0x280, &PSTATE2), Some(3));
-        // - ps3 (1250 ps, estimated ~0x225 = 549): 549 + 256 + 31 = 836;
-        //   ceil(836/512) + 1 = 2 + 1 = 3.
+        // - ps3 (1250 ps, estimated gate ~0x225 = 549): 549 + 256 + 31 = 836;
+        //   ceil(836/512) + 1 = 2 + 1 = 3 (mission 4 with +1, unmeasured).
         assert_eq!(derive_mrl(0x225, &PSTATE3), Some(3));
     }
 
