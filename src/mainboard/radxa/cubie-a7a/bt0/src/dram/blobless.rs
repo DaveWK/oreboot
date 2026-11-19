@@ -416,16 +416,24 @@ fn wck_level(p: &mut Para) {
                 stages = stages.handover_result(r.is_ok());
                 if r.is_ok() {
                     let clean = mission_stages();
-                    stages = stages.write_stage_result(clean);
                     #[cfg(dram_mission)]
-                    // SAFETY: bt0 is single-threaded.
-                    unsafe {
-                        MISSION_OK = stages.mission_ok();
+                    {
+                        stages = stages.write_stage_result(clean);
+                        // SAFETY: bt0 is single-threaded.
+                        unsafe {
+                            MISSION_OK = stages.mission_ok();
+                        }
                     }
+                    #[cfg(not(dram_mission))]
+                    let _ = clean;
                 }
+                #[cfg(not(dram_mission))]
+                let _ = stages.mission_ok();
             } else {
                 println!("[dram] MISSION: skipped, a required mode-register or read-training step failed");
             }
+            #[cfg(not(any(dram_mission, feature = "hybrid")))]
+            let _ = stages;
             #[cfg(feature = "handover")]
             if applied {
                 handover_stage(p);
