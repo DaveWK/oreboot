@@ -1039,6 +1039,15 @@ fn print_ho_knobs() {
             blobless::HO_RXEN_ADD
         );
     }
+    if let Some(s) = option_env!("A7A_HO_CSRS") {
+        println!(
+            "[dram] HO knobs: {} PHY CSR writes before the hand-over",
+            s.split(',').count()
+        );
+    }
+    if let Some(s) = option_env!("A7A_HO_MRS") {
+        println!("[dram] HO knobs: operating-set MRWs after the hand-over {s}");
+    }
 }
 
 /// Feature `bl-mission`, FEL lab knob `A7A_BL_BOOT`: when the lean

@@ -144,6 +144,25 @@ pub enum WlFailure {
 }
 
 /// Runs [`wcklevel::Step`]s on the PHY with bounded, time-limited launches.
+/// FEL lab `A7A_EXEC_HOLD_US` (decimal): every executor write is held this
+/// long (0 normally). ForceInternalUpdate (0x200a3) must stay asserted 32
+/// DFICLKs or the PHY update may be incomplete (EIC7700X TRM Part 2); our
+/// update pulses are written 1 then 0 back to back.
+pub const EXEC_HOLD_US: u32 = match option_env!("A7A_EXEC_HOLD_US") {
+    Some(s) => {
+        let b = s.as_bytes();
+        let mut v = 0u32;
+        let mut i = 0;
+        while i < b.len() {
+            assert!(b[i].is_ascii_digit(), "A7A_EXEC_HOLD_US is decimal");
+            v = v * 10 + (b[i] - b'0') as u32;
+            i += 1;
+        }
+        v
+    }
+    None => 0,
+};
+
 pub struct WlExec<'a, H: Hw> {
     pub hw: &'a mut H,
     pub launches: u16,
@@ -169,7 +188,7 @@ impl<'a, H: Hw> WlExec<'a, H> {
             max_polls: 0,
             failure: None,
             mem_reset_want: 3,
-            hold_us: 0,
+            hold_us: EXEC_HOLD_US,
         }
     }
 

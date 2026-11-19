@@ -1077,6 +1077,27 @@ pub fn mission_handover_relock<H: Hw>(
             }
         }
     }
+    if let Some(spec) = option_env!("A7A_HO_CSRS") {
+        // FEL lab A7A_HO_CSRS="csr=hex,...": PHY CSR writes before the
+        // mission CSRs and the DFI init (measurement: transplant of a
+        // working state's values while CSR writes still take effect).
+        for pair in spec.split(',') {
+            let mut it = pair.split('=');
+            if let (Some(a), Some(v)) = (it.next(), it.next()) {
+                if let (Ok(a), Ok(v)) = (u32::from_str_radix(a, 16), u16::from_str_radix(v, 16)) {
+                    hw.write16(csr(a), v);
+                }
+            }
+        }
+    }
+    if option_env!("A7A_HO_FIU").is_some() {
+        // FEL lab: ForceInternalUpdate with the DFI still offline, held
+        // well over 32 DFICLKs (TRM), so every delay CSR is applied.
+        hw.write16(csr(0x200a3), 1);
+        hw.udelay(5);
+        hw.write16(csr(0x200a3), 0);
+        hw.udelay(5);
+    }
     for (c, v) in [(0x2006e, 0u16), (0x20060, 1), (0x20054, 1), (0x2002a, 0)] {
         hw.write16(csr(c), v);
     }
@@ -1127,6 +1148,26 @@ pub fn mission_handover_relock<H: Hw>(
     }
     crate::post::dfi_init_cpu(hw, channels)?;
     crate::post::controller_after_phy(hw, p)?;
+    if let Some(spec) = option_env!("A7A_HO_MRS") {
+        // FEL lab A7A_HO_MRS="ma=hex,...": operating-set MRWs through the
+        // controller after the hand-over, before any read (FSP window
+        // MR16 0x05 .. 0x04), e.g. "3=06,18=00": the PMU's operating MR3
+        // (DBI off) and MR18; our training needs MR18 0x0c.
+        for ch in 0..channels {
+            for rank in 0..2 {
+                crate::mr::write_rank(hw, ch, rank, 16, 0x05)?;
+                for pair in spec.split(',') {
+                    let mut it = pair.split('=');
+                    if let (Some(a), Some(v)) = (it.next(), it.next()) {
+                        if let (Ok(a), Ok(v)) = (a.parse::<u32>(), u32::from_str_radix(v, 16)) {
+                            crate::mr::write_rank(hw, ch, rank, a, v & 0xff)?;
+                        }
+                    }
+                }
+                crate::mr::write_rank(hw, ch, rank, 16, 0x04)?;
+            }
+        }
+    }
     if let Some(mr2) = HO_MR2 {
         // FEL lab: MR2 of the operating set-point through the controller,
         // inside an FSP-WR = FSP-OP window (MR16 0x05 .. 0x04: the state
